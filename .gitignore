@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.log
+*.known-hosts
+.DS_Store
+.cache/
+*.tgz
