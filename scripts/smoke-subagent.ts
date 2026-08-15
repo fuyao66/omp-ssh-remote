@@ -1,4 +1,4 @@
-import type { AgentToolResult, ToolDefinition } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -11,8 +11,9 @@ import type {
   SessionStartEvent,
   ToolCallEvent,
   ToolCallEventResult,
+  ToolDefinition,
   ToolInfo,
-} from "@oh-my-pi/pi-coding-agent";
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { REMOTE_TOOL_NAMES } from "../src/protocol.ts";
 
 const target = Bun.env.REMOTE_TARGET;
@@ -148,10 +149,14 @@ async function within<T>(
 }
 
 // OMP cache-busts each session's extension entry. Dynamic imports here intentionally verify that process-global broker state survives distinct module instances.
-const ownerExtension = (await import("../src/extension.ts?session=owner"))
-  .default;
-const childExtension = (await import("../src/extension.ts?session=child"))
-  .default;
+const ownerExtensionUrl = "../src/extension.ts?session=owner";
+const childExtensionUrl = "../src/extension.ts?session=child";
+const ownerExtension = (
+  (await import(ownerExtensionUrl)) as typeof import("../src/extension.ts")
+).default;
+const childExtension = (
+  (await import(childExtensionUrl)) as typeof import("../src/extension.ts")
+).default;
 
 const owner = harness(ownerSession);
 const child = harness(childSession);
@@ -292,9 +297,9 @@ try {
 } finally {
   if (childConnected) {
     for (const handler of child.handlers.session_shutdown ?? []) {
-      await handler({ type: "session_shutdown" }, child.context).catch(
-        () => undefined,
-      );
+      await Promise.resolve(
+        handler({ type: "session_shutdown" }, child.context),
+      ).catch(() => undefined);
     }
   }
   if (ownerConnected)

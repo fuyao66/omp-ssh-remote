@@ -1,10 +1,11 @@
-import type { AgentToolResult, ToolDefinition } from "@oh-my-pi/pi-agent-core";
+import type { AgentMessage, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  ToolDefinition,
   ToolInfo,
-} from "@oh-my-pi/pi-coding-agent";
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import remoteRuntimeExtension from "../src/extension.ts";
 import { REMOTE_TOOL_NAMES } from "../src/protocol.ts";
 
@@ -38,16 +39,29 @@ type CapturedCommand = {
 const commands = new Map<string, CapturedCommand>();
 const tools = new Map<string, ToolDefinition>();
 
-type WorkspaceStateMessage = {
-  message: {
-    customType?: string;
-    content?: unknown;
-    display?: boolean;
-    details?: { target?: string };
-  };
-  options?: { deliverAs?: string };
+type ContextHandler = (event: {
+  type: "context";
+  messages: AgentMessage[];
+}) => { messages?: AgentMessage[] } | undefined;
+type WorkspaceStateDetails = {
+  target?: "local" | "remote" | "unavailable";
 };
-const workspaceStateMessages: WorkspaceStateMessage[] = [];
+type WorkspaceStateMessage = Extract<AgentMessage, { role: "custom" }> & {
+  details?: WorkspaceStateDetails;
+};
+
+function workspaceState(
+  message: AgentMessage | undefined,
+): WorkspaceStateMessage | undefined {
+  if (
+    message?.role !== "custom" ||
+    message.customType !== "omp-ssh-remote/workspace-state"
+  ) {
+    return undefined;
+  }
+  return message as WorkspaceStateMessage;
+}
+let contextHandler: ContextHandler | undefined;
 const nativeTools = REMOTE_TOOL_NAMES.map((name) => ({
   name,
   description: `native ${name}`,
@@ -72,13 +86,9 @@ const apiHarness = {
   getAllTools() {
     return nativeTools;
   },
-  sendMessage(
-    message: WorkspaceStateMessage["message"],
-    options?: WorkspaceStateMessage["options"],
-  ) {
-    workspaceStateMessages.push({ message, options });
+  on(event: string, handler: unknown) {
+    if (event === "context") contextHandler = handler as ContextHandler;
   },
-  on() {},
 };
 await remoteRuntimeExtension(apiHarness as unknown as ExtensionAPI);
 
@@ -102,17 +112,32 @@ const connectArgs =
   alias ??
   `${target} ${cwd} --port ${port} --identity ${identityFile} --known-hosts ${knownHostsFile}`;
 await connect.handler(connectArgs, commandContext);
-const connectedState = workspaceStateMessages.at(-1);
+if (!contextHandler)
+  throw new Error("workspace context handler was not registered");
+const activeContextHandler = contextHandler;
+const legacyState: AgentMessage = {
+  role: "custom",
+  customType: "omp-ssh-remote/workspace-state",
+  content: "stale state",
+  display: false,
+  timestamp: 1,
+};
+const connectedMessages = activeContextHandler({
+  type: "context",
+  messages: [legacyState],
+})?.messages;
+const connectedState = workspaceState(connectedMessages?.at(-1));
 if (
+  !connectedMessages ||
+  connectedMessages.length !== 1 ||
   !connectedState ||
-  connectedState.message.customType !== "omp-ssh-remote/workspace-state" ||
-  connectedState.message.display !== false ||
-  connectedState.message.details?.target !== "remote" ||
-  connectedState.options?.deliverAs !== "nextTurn" ||
-  typeof connectedState.message.content !== "string" ||
-  !connectedState.message.content.includes("Remote workspace execution is active")
+  connectedState.details?.target !== "remote" ||
+  typeof connectedState.content !== "string" ||
+  !connectedState.content.includes('mode: "remote"')
 ) {
-  throw new Error("Remote connect did not queue a hidden remote workspace state");
+  throw new Error(
+    "Remote connect did not inject one live remote workspace state",
+  );
 }
 const exit = commands.get("remote-exit");
 if (!exit) throw new Error("remote-exit was not registered");
@@ -338,17 +363,22 @@ try {
 
   await exit.handler("", commandContext);
   disconnected = true;
-  const disconnectedState = workspaceStateMessages.at(-1);
+  const disconnectedMessages = activeContextHandler({
+    type: "context",
+    messages: [legacyState],
+  })?.messages;
+  const disconnectedState = workspaceState(disconnectedMessages?.at(-1));
   if (
+    !disconnectedMessages ||
+    disconnectedMessages.length !== 1 ||
     !disconnectedState ||
-    disconnectedState.message.details?.target !== "local" ||
-    disconnectedState.options?.deliverAs !== "nextTurn" ||
-    typeof disconnectedState.message.content !== "string" ||
-    !disconnectedState.message.content.includes(
-      "Remote workspace execution is inactive",
-    )
+    disconnectedState.details?.target !== "local" ||
+    typeof disconnectedState.content !== "string" ||
+    !disconnectedState.content.includes('mode: "local"')
   ) {
-    throw new Error("Remote exit did not queue a hidden local workspace state");
+    throw new Error(
+      "Remote exit did not inject one live local workspace state",
+    );
   }
   const localResult = await read.execute(
     "local-read",
@@ -372,9 +402,10 @@ try {
       remoteDebug: "ok",
       localFallback: "ok",
       notices,
-      workspaceStateTargets: workspaceStateMessages.map(
-        (state) => state.message.details?.target,
-      ),
+      workspaceStateTargets: [
+        connectedState.details?.target,
+        disconnectedState.details?.target,
+      ],
     }),
   );
 } finally {

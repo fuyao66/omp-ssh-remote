@@ -209,7 +209,7 @@ omp plugin link "$PWD"
 omp plugin list
 ```
 
-`plugin link` 不会下载或复制项目，它只会让 OMP 链接当前 checkout，因此必须保留仓库目录。`omp plugin list` 应显示 `omp-ssh-remote` 版本 `0.5.0`。
+`plugin link` 不会下载或复制项目，它只会让 OMP 链接当前 checkout，因此必须保留仓库目录。`omp plugin list` 应显示 `omp-ssh-remote` 版本 `0.6.0`。
 
 完全退出所有正在运行的 OMP 进程并重新启动。在重新启动的 OMP session 中执行：
 
@@ -372,7 +372,7 @@ SSH 主机注册表不会绕过 host-key 校验。使用简洁命令前，经过
 
 此时工作区路径、命令、Git 状态、语言服务器、依赖、eval kernel 和 debugger adapter 都属于远端主机。对话、模型请求、凭据、记忆和控制面工具仍保留在本机。
 
-每次 `/remote-connect` 或 `/remote-exit` 成功后，extension 会为下一条用户请求排队一条隐藏且持久化的工作区状态消息。它会告诉 agent 普通工作区路径当前属于远端还是本机；在远端模式下还会携带当前远端工作目录，以避免切换后沿用陈旧的对话假设。该消息不会主动发起模型请求、不会改写 system prompt，也不能替代 `/remote-status` 对实时连接状态的检查。
+每次模型请求前，extension 都只会为该次请求临时注入一条工作区状态消息。它报告 `local`、`remote` 或 fail-closed 的 `unavailable`；远端模式下还会携带当前远端工作目录。该消息不会写入 session transcript、不会主动发起模型请求、也不会改写 system prompt。模型请求中的旧版本历史状态消息会被移除。`remote` 表示当前已知的 SSH transport 状态，不会为每次模型请求额外探测网络；SSH keepalive 会在约 90 秒内发现静默断线，之后下一次请求会显示 `unavailable`。`/remote-status` 显示同一份当前已知状态。
 
 ### 断开连接
 

@@ -209,7 +209,7 @@ omp plugin link "$PWD"
 omp plugin list
 ```
 
-`plugin link` does not download or copy the project. It creates an OMP plugin link to this checkout, so keep the repository directory in place. `omp plugin list` should show `omp-ssh-remote` version `0.5.0`.
+`plugin link` does not download or copy the project. It creates an OMP plugin link to this checkout, so keep the repository directory in place. `omp plugin list` should show `omp-ssh-remote` version `0.6.0`.
 
 Exit every running OMP process and start OMP again. Inside the restarted OMP session, run:
 
@@ -372,7 +372,7 @@ Update src/server.ts and show the remote Git diff.
 
 Workspace paths, commands, Git state, language servers, dependencies, eval kernels, and debugger adapters now belong to the remote host. Conversations, model requests, credentials, memory, and control-plane tools remain local.
 
-After a successful `/remote-connect` or `/remote-exit`, the extension queues one hidden, persisted workspace-state message for the next user turn. It tells the agent whether ordinary workspace paths are remote or local and, when remote, the active remote working directory. This avoids stale conversational assumptions after a transition. It does not start a model turn, alter the system prompt, or replace `/remote-status` as the live connection check.
+Before every model request, the extension injects one transient workspace-state message into that request only. It reports `local`, `remote`, or fail-closed `unavailable`; in remote mode it includes the active remote working directory. The message is not stored in the session transcript, does not start a model turn, and does not alter the system prompt. Historic state messages left by older versions are removed from the model request. `remote` reflects the current known SSH transport state; it is not an extra network probe. SSH keepalives detect a silent transport loss within roughly 90 seconds, after which the next request reports `unavailable`. `/remote-status` shows the same current known state.
 
 ### Disconnect
 

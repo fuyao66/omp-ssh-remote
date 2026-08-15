@@ -1,11 +1,14 @@
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { describe, expect, test } from "bun:test";
 import {
+  injectWorkspaceState,
   pathShouldStayLocal,
   remoteControlPlaneBlockReason,
   remoteWorkspaceStateMessage,
   sessionBelongsToFamily,
   stagedProposal,
   taskRequestsIsolation,
+  workspaceExecutionTarget,
 } from "../src/extension.ts";
 
 describe("workspace path routing", () => {
@@ -158,20 +161,73 @@ describe("remote session boundaries", () => {
   });
 });
 
-describe("workspace state notices", () => {
-  test("describes the latest local, remote, and fail-closed state", () => {
+describe("workspace state context", () => {
+  test("describes the local, remote, and fail-closed state", () => {
     expect(remoteWorkspaceStateMessage("remote", "/srv/project")).toContain(
-      'remote working directory is "/srv/project"',
+      'remote working directory: "/srv/project"',
     );
-    expect(remoteWorkspaceStateMessage("local")).toContain(
-      "operate on the local machine",
-    );
+    expect(remoteWorkspaceStateMessage("local")).toContain('mode: "local"');
     expect(remoteWorkspaceStateMessage("unavailable")).toContain(
-      "must fail closed",
+      'mode: "unavailable"',
     );
-    expect(remoteWorkspaceStateMessage("local", undefined, true)).toContain(
-      "shutdown could not be confirmed",
+    expect(remoteWorkspaceStateMessage("remote")).toContain(
+      "current known SSH transport state",
     );
+    expect(remoteWorkspaceStateMessage("remote")).toContain(
+      "native xd:// workspace devices",
+    );
+  });
+
+  test("derives live state from the selection and transport", () => {
+    const live = { isClosed: false };
+    expect(workspaceExecutionTarget(false, undefined, live)).toBe("local");
+    expect(workspaceExecutionTarget(true, undefined, live)).toBe("remote");
+    expect(workspaceExecutionTarget(true, "connection failed", live)).toBe(
+      "unavailable",
+    );
+    expect(workspaceExecutionTarget(true, undefined, { isClosed: true })).toBe(
+      "unavailable",
+    );
+    expect(workspaceExecutionTarget(true)).toBe("unavailable");
+  });
+
+  test("replaces all persisted legacy state without mutating the transcript", () => {
+    const legacy: AgentMessage = {
+      role: "custom",
+      customType: "omp-ssh-remote/workspace-state",
+      content: "stale remote state",
+      display: false,
+      timestamp: 1,
+    };
+    const olderLegacy: AgentMessage = {
+      ...legacy,
+      content: "older local state",
+      timestamp: 0,
+    };
+    const retained: AgentMessage = {
+      role: "custom",
+      customType: "another-extension/state",
+      content: "retain this",
+      display: false,
+      timestamp: 2,
+    };
+    const messages = [olderLegacy, legacy, retained];
+    const injected = injectWorkspaceState(messages, "unavailable");
+    const states = injected.filter(
+      (message) =>
+        message.role === "custom" &&
+        message.customType === "omp-ssh-remote/workspace-state",
+    );
+    const state = states[0];
+
+    expect(messages).toEqual([olderLegacy, legacy, retained]);
+    expect(injected).toHaveLength(2);
+    expect(states).toHaveLength(1);
+    expect(state?.role).toBe("custom");
+    if (!state || state.role !== "custom")
+      throw new Error("workspace state was not injected");
+    expect(state.content).toContain('mode: "unavailable"');
+    expect(injected[0]).toEqual(retained);
   });
 });
 
