@@ -209,7 +209,7 @@ omp plugin link "$PWD"
 omp plugin list
 ```
 
-`plugin link` does not download or copy the project. It creates an OMP plugin link to this checkout, so keep the repository directory in place. `omp plugin list` should show `omp-ssh-remote` version `0.3.0`.
+`plugin link` does not download or copy the project. It creates an OMP plugin link to this checkout, so keep the repository directory in place. `omp plugin list` should show `omp-ssh-remote` version `0.4.0`.
 
 Exit every running OMP process and start OMP again. Inside the restarted OMP session, run:
 
@@ -295,27 +295,54 @@ ssh -p 2222 -i ~/.ssh/remote_workspace_ed25519 \
   'git clone https://example.com/organization/project.git /home/developer/project'
 ```
 
-Use an existing, absolute remote path for `/remote-connect`. Shell shortcuts such as `~` are not expanded in the remote working-directory argument. By contrast, `~` in the local `--identity` and `--known-hosts` paths is expanded by the extension.
+When a remote working directory is provided, it must be an existing absolute path. Shell shortcuts such as `~` are not expanded in that argument. When the directory is omitted, the extension uses the remote account's `$HOME`. By contrast, `~` in local identity and known-hosts paths is expanded by the extension.
 
 ## Connect and Use
 
-### Explicit connection command
+### Save a server name once
 
-Start OMP locally and enter this command in OMP, not in the system shell:
+Use OMP's built-in SSH host registry to save the address, user, port, and private-key path. Run this in a system terminal:
+
+```bash
+omp ssh add modelarts \
+  --host remote.example.com \
+  --user developer \
+  --port 2222 \
+  --key ~/.ssh/remote_workspace_ed25519 \
+  --scope user
+```
+
+`--scope user` makes the name available from every local project. Use `--scope project` instead to keep it in the current project. Inspect saved names with:
+
+```bash
+omp ssh list
+```
+
+The SSH registry does not bypass host-key verification. The verified key must already be present in the normal `~/.ssh/known_hosts` file before using the concise command.
+
+### Connect by name
+
+Start OMP locally and enter this in the OMP input box, not in the system shell:
+
+```text
+/remote-connect modelarts
+```
+
+With only a server name, the remote workspace defaults to that account's `$HOME`. To use an existing project directory instead:
+
+```text
+/remote-connect modelarts /home/developer/project
+```
+
+### Explicit one-time connection
+
+The full form remains available when no OMP SSH name is configured:
 
 ```text
 /remote-connect developer@remote.example.com /home/developer/project --port 2222 --identity ~/.ssh/remote_workspace_ed25519 --known-hosts ~/.ssh/known_hosts
 ```
 
-Replace all example values with your SSH account, host, absolute remote project path, port, private-key path, and known-hosts path.
-
-If port, identity, and known-hosts settings are already correct in OpenSSH configuration, the shorter form is sufficient:
-
-```text
-/remote-connect developer@remote.example.com /home/developer/project
-```
-
-The extension uses `BatchMode=yes`, `IdentitiesOnly=yes`, disables agent and port forwarding, and does not prompt for passwords or key passphrases. The batch-mode test above must pass before connecting from OMP.
+Explicit `--port` and `--identity` values override saved settings. The extension uses `BatchMode=yes`, `IdentitiesOnly=yes`, disables agent and port forwarding, and does not prompt for passwords or key passphrases. The batch-mode test above must pass before connecting from OMP.
 
 ### First connection
 

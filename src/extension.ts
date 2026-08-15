@@ -5,8 +5,16 @@ import type {
   ExtensionContext,
   ToolInfo,
 } from "@oh-my-pi/pi-coding-agent";
+import {
+  loadConfiguredSshHosts,
+  parseConnectArgs,
+  type RemoteConnectRequest,
+} from "./connect-options.ts";
 import { RemoteRuntimeClient } from "./client.ts";
-import { ensureRemoteWorker } from "./deploy.ts";
+import {
+  prepareRemoteWorker,
+  resolveRemoteHome,
+} from "./deploy.ts";
 import { REMOTE_TOOL_NAMES, type RemoteToolName } from "./protocol.ts";
 import {
   isInternalUri,
@@ -61,13 +69,8 @@ const TOOL_LABELS: Record<RemoteToolName, string> = {
 };
 
 type ExecutionTarget = "local" | "remote";
-type RemoteConnectOptions = {
-  target: string;
+type RemoteConnectOptions = Omit<RemoteConnectRequest, "cwd"> & {
   cwd: string;
-  port?: number;
-  identityFile?: string;
-  knownHostsFile?: string;
-  workerPath?: string;
 };
 type RemoteExtensionState = {
   client?: RemoteRuntimeClient;
@@ -99,40 +102,6 @@ const remoteFamilyGlobal = globalThis as RemoteFamilyBrokerGlobal;
 const REMOTE_FAMILIES = (remoteFamilyGlobal[REMOTE_FAMILY_BROKER_KEY] ??=
   new Map<string, RemoteFamily>());
 
-function parseConnectArgs(args: string): RemoteConnectOptions {
-  const tokens =
-    args
-      .match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)
-      ?.map((token) => token.replace(/^(?:"(.*)"|'(.*)')$/, "$1$2")) ?? [];
-  const target = tokens.shift();
-  const cwd = tokens.shift();
-  if (!target || !cwd) {
-    throw new Error(
-      "Usage: /remote-connect <user@host> <remote-cwd> [--port N] [--identity path] [--known-hosts path] [--worker path]",
-    );
-  }
-  let port: number | undefined;
-  let identityFile: string | undefined;
-  let knownHostsFile: string | undefined;
-  let workerPath: string | undefined;
-  while (tokens.length > 0) {
-    const flag = tokens.shift();
-    const value = tokens.shift();
-    if (!value) throw new Error(`Missing value for ${flag}`);
-    if (flag === "--port") port = Number(value);
-    else if (flag === "--identity") identityFile = value;
-    else if (flag === "--known-hosts") knownHostsFile = value;
-    else if (flag === "--worker") workerPath = value;
-    else throw new Error(`Unknown option: ${flag}`);
-  }
-  if (
-    port !== undefined &&
-    (!Number.isInteger(port) || port < 1 || port > 65535)
-  ) {
-    throw new Error(`Invalid SSH port: ${port}`);
-  }
-  return { target, cwd, port, identityFile, knownHostsFile, workerPath };
-}
 
 function sessionFamilyRoot(sessionFile: string): string {
   const normalized = resolvePath(sessionFile);
@@ -569,12 +538,21 @@ export default async function remoteRuntimeExtension(
       const normalizedSessionFile = resolvePath(sessionFile);
       if (REMOTE_FAMILIES.has(normalizedSessionFile))
         throw new Error("This session already owns a remote runtime family");
-      const options = parseConnectArgs(args);
+      const configuredHosts = await loadConfiguredSshHosts(ctx.cwd);
+      const request = parseConnectArgs(args, configuredHosts);
       ctx.ui.setWorkingMessage("Deploying remote OMP runtime");
       let next: RemoteRuntimeClient | undefined;
       try {
-        const workerPath = await ensureRemoteWorker(options);
-        const connection = { ...options, workerPath };
+        const prepared = await prepareRemoteWorker(request);
+        const remoteCwd =
+          request.cwd ??
+          prepared.home ??
+          (await resolveRemoteHome(request));
+        const options: RemoteConnectOptions = { ...request, cwd: remoteCwd };
+        const connection = {
+          ...options,
+          workerPath: prepared.workerPath,
+        };
         next = new RemoteRuntimeClient({
           command: buildSshWorkerCommand(connection),
         });
@@ -600,10 +578,10 @@ export default async function remoteRuntimeExtension(
         registerActiveWrappers(pi, state);
         ctx.ui.setStatus(
           "remote-runtime",
-          `ssh ${options.target}:${ready.cwd}`,
+          `ssh ${request.displayTarget}:${ready.cwd}`,
         );
         ctx.ui.notify(
-          `Remote runtime connected: ${options.target}:${ready.cwd}`,
+          `Remote runtime connected: ${request.displayTarget}:${ready.cwd}`,
           "info",
         );
       } catch (error) {

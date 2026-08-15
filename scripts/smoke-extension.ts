@@ -8,13 +8,17 @@ import type {
 import remoteRuntimeExtension from "../src/extension.ts";
 import { REMOTE_TOOL_NAMES } from "../src/protocol.ts";
 
+const alias = Bun.env.REMOTE_ALIAS;
 const target = Bun.env.REMOTE_TARGET;
 const cwd = Bun.env.REMOTE_CWD;
 const identityFile = Bun.env.REMOTE_IDENTITY;
 const knownHostsFile = Bun.env.REMOTE_KNOWN_HOSTS;
 const port = Bun.env.REMOTE_PORT ?? "22";
-if (!target || !cwd || !identityFile || !knownHostsFile)
-  throw new Error("Remote smoke environment is incomplete");
+if (!cwd || (!alias && (!target || !identityFile || !knownHostsFile))) {
+  throw new Error(
+    "REMOTE_CWD plus either REMOTE_ALIAS or explicit remote connection variables are required",
+  );
+}
 
 const activeTools = [
   "read",
@@ -77,10 +81,10 @@ const commandContext = {
 } as unknown as ExtensionCommandContext;
 const connect = commands.get("remote-connect");
 if (!connect) throw new Error("remote-connect was not registered");
-await connect.handler(
-  `${target} ${cwd} --port ${port} --identity ${identityFile} --known-hosts ${knownHostsFile}`,
-  commandContext,
-);
+const connectArgs =
+  alias ??
+  `${target} ${cwd} --port ${port} --identity ${identityFile} --known-hosts ${knownHostsFile}`;
+await connect.handler(connectArgs, commandContext);
 const exit = commands.get("remote-exit");
 if (!exit) throw new Error("remote-exit was not registered");
 let disconnected = false;

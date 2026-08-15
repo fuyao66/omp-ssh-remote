@@ -109,10 +109,32 @@ function parseProbe(output: string): { platform: string; home: string } {
   return { platform: `${os}/${arch}`, home };
 }
 
-export async function ensureRemoteWorker(
+export type PreparedRemoteWorker = {
+  workerPath: string;
+  home?: string;
+};
+
+export async function resolveRemoteHome(
   options: WorkerDeploymentOptions,
 ): Promise<string> {
-  if (options.workerPath) return options.workerPath;
+  const output = await run(
+    [
+      ...buildSshBaseCommand(options),
+      options.target,
+      `printf '%s\\n' "$HOME"`,
+    ],
+    "Remote home probe",
+  );
+  if (!output.startsWith("/") || output.includes("\n")) {
+    throw new Error(`Invalid remote home response: ${JSON.stringify(output)}`);
+  }
+  return output;
+}
+
+export async function prepareRemoteWorker(
+  options: WorkerDeploymentOptions,
+): Promise<PreparedRemoteWorker> {
+  if (options.workerPath) return { workerPath: options.workerPath };
   const probe = await run(
     [
       ...buildSshBaseCommand(options),
@@ -143,7 +165,7 @@ export async function ensureRemoteWorker(
     ],
     "Remote worker check",
   );
-  if (exists === "present") return remoteWorker;
+  if (exists === "present") return { workerPath: remoteWorker, home };
   if (exists !== "missing")
     throw new Error(`Unexpected remote worker check response: ${exists}`);
 
@@ -171,5 +193,11 @@ export async function ensureRemoteWorker(
     ],
     "Worker activation",
   );
-  return remoteWorker;
+  return { workerPath: remoteWorker, home };
+}
+
+export async function ensureRemoteWorker(
+  options: WorkerDeploymentOptions,
+): Promise<string> {
+  return (await prepareRemoteWorker(options)).workerPath;
 }

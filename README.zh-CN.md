@@ -209,7 +209,7 @@ omp plugin link "$PWD"
 omp plugin list
 ```
 
-`plugin link` 不会下载或复制项目，它只会让 OMP 链接当前 checkout，因此必须保留仓库目录。`omp plugin list` 应显示 `omp-ssh-remote` 版本 `0.3.0`。
+`plugin link` 不会下载或复制项目，它只会让 OMP 链接当前 checkout，因此必须保留仓库目录。`omp plugin list` 应显示 `omp-ssh-remote` 版本 `0.4.0`。
 
 完全退出所有正在运行的 OMP 进程并重新启动。在重新启动的 OMP session 中执行：
 
@@ -295,27 +295,54 @@ ssh -p 2222 -i ~/.ssh/remote_workspace_ed25519 \
   'git clone https://example.com/organization/project.git /home/developer/project'
 ```
 
-`/remote-connect` 必须使用已经存在的远端绝对路径。远端工作目录参数中的 `~` 不会进行 shell 展开；本机 `--identity` 和 `--known-hosts` 路径中的 `~` 则会由 extension 展开。
+如果传入远端工作目录，它必须是已经存在的绝对路径；其中的 `~` 不会进行 shell 展开。省略目录时，extension 使用远端账号的 `$HOME`。本机 identity 和 known-hosts 路径中的 `~` 则会由 extension 展开。
 
 ## 连接和使用
 
-### 完整连接命令
+### 一次保存服务器名称
 
-在本机启动 OMP，然后在 OMP 输入框中执行以下命令，而不是在系统终端中执行：
+使用 OMP 内置 SSH 主机注册表保存地址、用户、端口和私钥路径。以下命令在系统终端中执行：
+
+```bash
+omp ssh add modelarts \
+  --host remote.example.com \
+  --user developer \
+  --port 2222 \
+  --key ~/.ssh/remote_workspace_ed25519 \
+  --scope user
+```
+
+`--scope user` 让该名称可用于本机所有项目；如只希望当前项目使用，改为 `--scope project`。查看已保存名称：
+
+```bash
+omp ssh list
+```
+
+SSH 主机注册表不会绕过 host-key 校验。使用简洁命令前，经过核验的 key 必须已经位于标准 `~/.ssh/known_hosts` 文件中。
+
+### 按名称连接
+
+在本机启动 OMP，然后在 OMP 输入框中执行，而不是在系统终端中执行：
+
+```text
+/remote-connect modelarts
+```
+
+只给服务器名称时，远端工作区默认为该账号的 `$HOME`。如需进入已经存在的项目目录：
+
+```text
+/remote-connect modelarts /home/developer/project
+```
+
+### 一次性完整连接
+
+未配置 OMP SSH 名称时，仍可使用完整形式：
 
 ```text
 /remote-connect developer@remote.example.com /home/developer/project --port 2222 --identity ~/.ssh/remote_workspace_ed25519 --known-hosts ~/.ssh/known_hosts
 ```
 
-请将示例值替换为自己的 SSH 用户、主机、远端项目绝对路径、端口、私钥路径和 known-hosts 文件。
-
-如果 OpenSSH 配置中已经正确设置端口、identity 和 known-hosts，可以使用简化形式：
-
-```text
-/remote-connect developer@remote.example.com /home/developer/project
-```
-
-extension 强制使用 `BatchMode=yes`、`IdentitiesOnly=yes`，禁用 agent forwarding 和 port forwarding，并且不会交互式询问密码或私钥 passphrase。使用 OMP 连接前，上面的 batch-mode 自检必须通过。
+显式 `--port` 和 `--identity` 会覆盖已保存设置。extension 强制使用 `BatchMode=yes`、`IdentitiesOnly=yes`，禁用 agent forwarding 和 port forwarding，并且不会交互式询问密码或私钥 passphrase。使用 OMP 连接前，上面的 batch-mode 自检必须通过。
 
 ### 第一次连接
 

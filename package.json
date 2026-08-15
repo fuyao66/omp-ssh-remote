@@ -1,6 +1,6 @@
 {
   "name": "omp-ssh-remote",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Native remote OMP workspace tools over a persistent SSH runtime",
