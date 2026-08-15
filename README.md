@@ -209,7 +209,7 @@ omp plugin link "$PWD"
 omp plugin list
 ```
 
-`plugin link` does not download or copy the project. It creates an OMP plugin link to this checkout, so keep the repository directory in place. `omp plugin list` should show `omp-ssh-remote` version `0.4.0`.
+`plugin link` does not download or copy the project. It creates an OMP plugin link to this checkout, so keep the repository directory in place. `omp plugin list` should show `omp-ssh-remote` version `0.5.0`.
 
 Exit every running OMP process and start OMP again. Inside the restarted OMP session, run:
 
@@ -371,6 +371,8 @@ Update src/server.ts and show the remote Git diff.
 ```
 
 Workspace paths, commands, Git state, language servers, dependencies, eval kernels, and debugger adapters now belong to the remote host. Conversations, model requests, credentials, memory, and control-plane tools remain local.
+
+After a successful `/remote-connect` or `/remote-exit`, the extension queues one hidden, persisted workspace-state message for the next user turn. It tells the agent whether ordinary workspace paths are remote or local and, when remote, the active remote working directory. This avoids stale conversational assumptions after a transition. It does not start a model turn, alter the system prompt, or replace `/remote-status` as the live connection check.
 
 ### Disconnect
 

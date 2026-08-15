@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   pathShouldStayLocal,
   remoteControlPlaneBlockReason,
+  remoteWorkspaceStateMessage,
   sessionBelongsToFamily,
   stagedProposal,
   taskRequestsIsolation,
@@ -154,6 +155,23 @@ describe("remote session boundaries", () => {
     expect(
       remoteControlPlaneBlockReason("task", { task: "read", isolated: false }),
     ).toBeUndefined();
+  });
+});
+
+describe("workspace state notices", () => {
+  test("describes the latest local, remote, and fail-closed state", () => {
+    expect(remoteWorkspaceStateMessage("remote", "/srv/project")).toContain(
+      'remote working directory is "/srv/project"',
+    );
+    expect(remoteWorkspaceStateMessage("local")).toContain(
+      "operate on the local machine",
+    );
+    expect(remoteWorkspaceStateMessage("unavailable")).toContain(
+      "must fail closed",
+    );
+    expect(remoteWorkspaceStateMessage("local", undefined, true)).toContain(
+      "shutdown could not be confirmed",
+    );
   });
 });
 

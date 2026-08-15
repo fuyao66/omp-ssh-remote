@@ -37,6 +37,17 @@ type CapturedCommand = {
 };
 const commands = new Map<string, CapturedCommand>();
 const tools = new Map<string, ToolDefinition>();
+
+type WorkspaceStateMessage = {
+  message: {
+    customType?: string;
+    content?: unknown;
+    display?: boolean;
+    details?: { target?: string };
+  };
+  options?: { deliverAs?: string };
+};
+const workspaceStateMessages: WorkspaceStateMessage[] = [];
 const nativeTools = REMOTE_TOOL_NAMES.map((name) => ({
   name,
   description: `native ${name}`,
@@ -60,6 +71,12 @@ const apiHarness = {
   },
   getAllTools() {
     return nativeTools;
+  },
+  sendMessage(
+    message: WorkspaceStateMessage["message"],
+    options?: WorkspaceStateMessage["options"],
+  ) {
+    workspaceStateMessages.push({ message, options });
   },
   on() {},
 };
@@ -85,6 +102,18 @@ const connectArgs =
   alias ??
   `${target} ${cwd} --port ${port} --identity ${identityFile} --known-hosts ${knownHostsFile}`;
 await connect.handler(connectArgs, commandContext);
+const connectedState = workspaceStateMessages.at(-1);
+if (
+  !connectedState ||
+  connectedState.message.customType !== "omp-ssh-remote/workspace-state" ||
+  connectedState.message.display !== false ||
+  connectedState.message.details?.target !== "remote" ||
+  connectedState.options?.deliverAs !== "nextTurn" ||
+  typeof connectedState.message.content !== "string" ||
+  !connectedState.message.content.includes("Remote workspace execution is active")
+) {
+  throw new Error("Remote connect did not queue a hidden remote workspace state");
+}
 const exit = commands.get("remote-exit");
 if (!exit) throw new Error("remote-exit was not registered");
 let disconnected = false;
@@ -309,6 +338,18 @@ try {
 
   await exit.handler("", commandContext);
   disconnected = true;
+  const disconnectedState = workspaceStateMessages.at(-1);
+  if (
+    !disconnectedState ||
+    disconnectedState.message.details?.target !== "local" ||
+    disconnectedState.options?.deliverAs !== "nextTurn" ||
+    typeof disconnectedState.message.content !== "string" ||
+    !disconnectedState.message.content.includes(
+      "Remote workspace execution is inactive",
+    )
+  ) {
+    throw new Error("Remote exit did not queue a hidden local workspace state");
+  }
   const localResult = await read.execute(
     "local-read",
     { path: "anything" },
@@ -331,6 +372,9 @@ try {
       remoteDebug: "ok",
       localFallback: "ok",
       notices,
+      workspaceStateTargets: workspaceStateMessages.map(
+        (state) => state.message.details?.target,
+      ),
     }),
   );
 } finally {
