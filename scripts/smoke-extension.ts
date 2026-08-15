@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -38,30 +38,8 @@ type CapturedCommand = {
 };
 const commands = new Map<string, CapturedCommand>();
 const tools = new Map<string, ToolDefinition>();
+const events = new Set<string>();
 
-type ContextHandler = (event: {
-  type: "context";
-  messages: AgentMessage[];
-}) => { messages?: AgentMessage[] } | undefined;
-type WorkspaceStateDetails = {
-  target?: "local" | "remote" | "unavailable";
-};
-type WorkspaceStateMessage = Extract<AgentMessage, { role: "custom" }> & {
-  details?: WorkspaceStateDetails;
-};
-
-function workspaceState(
-  message: AgentMessage | undefined,
-): WorkspaceStateMessage | undefined {
-  if (
-    message?.role !== "custom" ||
-    message.customType !== "omp-ssh-remote/workspace-state"
-  ) {
-    return undefined;
-  }
-  return message as WorkspaceStateMessage;
-}
-let contextHandler: ContextHandler | undefined;
 const nativeTools = REMOTE_TOOL_NAMES.map((name) => ({
   name,
   description: `native ${name}`,
@@ -86,8 +64,8 @@ const apiHarness = {
   getAllTools() {
     return nativeTools;
   },
-  on(event: string, handler: unknown) {
-    if (event === "context") contextHandler = handler as ContextHandler;
+  on(event: string) {
+    events.add(event);
   },
 };
 await remoteRuntimeExtension(apiHarness as unknown as ExtensionAPI);
@@ -112,33 +90,8 @@ const connectArgs =
   alias ??
   `${target} ${cwd} --port ${port} --identity ${identityFile} --known-hosts ${knownHostsFile}`;
 await connect.handler(connectArgs, commandContext);
-if (!contextHandler)
-  throw new Error("workspace context handler was not registered");
-const activeContextHandler = contextHandler;
-const legacyState: AgentMessage = {
-  role: "custom",
-  customType: "omp-ssh-remote/workspace-state",
-  content: "stale state",
-  display: false,
-  timestamp: 1,
-};
-const connectedMessages = activeContextHandler({
-  type: "context",
-  messages: [legacyState],
-})?.messages;
-const connectedState = workspaceState(connectedMessages?.at(-1));
-if (
-  !connectedMessages ||
-  connectedMessages.length !== 1 ||
-  !connectedState ||
-  connectedState.details?.target !== "remote" ||
-  typeof connectedState.content !== "string" ||
-  !connectedState.content.includes('mode: "remote"')
-) {
-  throw new Error(
-    "Remote connect did not inject one live remote workspace state",
-  );
-}
+if (events.has("context"))
+  throw new Error("Extension registered a model-visible workspace-state handler");
 const exit = commands.get("remote-exit");
 if (!exit) throw new Error("remote-exit was not registered");
 let disconnected = false;
@@ -363,23 +316,6 @@ try {
 
   await exit.handler("", commandContext);
   disconnected = true;
-  const disconnectedMessages = activeContextHandler({
-    type: "context",
-    messages: [legacyState],
-  })?.messages;
-  const disconnectedState = workspaceState(disconnectedMessages?.at(-1));
-  if (
-    !disconnectedMessages ||
-    disconnectedMessages.length !== 1 ||
-    !disconnectedState ||
-    disconnectedState.details?.target !== "local" ||
-    typeof disconnectedState.content !== "string" ||
-    !disconnectedState.content.includes('mode: "local"')
-  ) {
-    throw new Error(
-      "Remote exit did not inject one live local workspace state",
-    );
-  }
   const localResult = await read.execute(
     "local-read",
     { path: "anything" },
@@ -402,10 +338,6 @@ try {
       remoteDebug: "ok",
       localFallback: "ok",
       notices,
-      workspaceStateTargets: [
-        connectedState.details?.target,
-        disconnectedState.details?.target,
-      ],
     }),
   );
 } finally {

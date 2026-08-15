@@ -372,7 +372,7 @@ Update src/server.ts and show the remote Git diff.
 
 Workspace paths, commands, Git state, language servers, dependencies, eval kernels, and debugger adapters now belong to the remote host. Conversations, model requests, credentials, memory, and control-plane tools remain local.
 
-Before every model request, the extension injects one transient workspace-state message into that request only. It reports `local`, `remote`, or fail-closed `unavailable`; in remote mode it includes the active remote working directory. The message is not stored in the session transcript, does not start a model turn, and does not alter the system prompt. Historic state messages left by older versions are removed from the model request. `remote` reflects the current known SSH transport state; it is not an extra network probe. SSH keepalives detect a silent transport loss within roughly 90 seconds, after which the next request reports `unavailable`. `/remote-status` shows the same current known state.
+The extension does not inject workspace-state prompts into model requests. Its adapter, rather than the model, routes workspace calls and enforces fail-closed behavior. Use `/remote-status` to inspect the current known SSH transport state; SSH keepalives detect a silent transport loss within roughly 90 seconds.
 
 ### Disconnect
 

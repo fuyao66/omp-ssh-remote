@@ -372,7 +372,7 @@ SSH 主机注册表不会绕过 host-key 校验。使用简洁命令前，经过
 
 此时工作区路径、命令、Git 状态、语言服务器、依赖、eval kernel 和 debugger adapter 都属于远端主机。对话、模型请求、凭据、记忆和控制面工具仍保留在本机。
 
-每次模型请求前，extension 都只会为该次请求临时注入一条工作区状态消息。它报告 `local`、`remote` 或 fail-closed 的 `unavailable`；远端模式下还会携带当前远端工作目录。该消息不会写入 session transcript、不会主动发起模型请求、也不会改写 system prompt。模型请求中的旧版本历史状态消息会被移除。`remote` 表示当前已知的 SSH transport 状态，不会为每次模型请求额外探测网络；SSH keepalive 会在约 90 秒内发现静默断线，之后下一次请求会显示 `unavailable`。`/remote-status` 显示同一份当前已知状态。
+extension 不会向模型请求注入工作区状态提示。工具 adapter 而非模型负责工作区路由和 fail-closed 行为。使用 `/remote-status` 查看当前已知的 SSH transport 状态；SSH keepalive 会在约 90 秒内发现静默断线。
 
 ### 断开连接
 

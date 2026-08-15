@@ -1,9 +1,5 @@
 import { resolve as resolvePath, sep } from "node:path";
-import type {
-  AgentMessage,
-  AgentToolResult,
-  ToolApproval,
-} from "@oh-my-pi/pi-agent-core";
+import type { AgentToolResult, ToolApproval } from "@oh-my-pi/pi-agent-core";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -25,8 +21,6 @@ import {
 export { pathShouldStayLocal } from "./path-domain.ts";
 import { buildSshWorkerCommand } from "./ssh.ts";
 
-const REMOTE_WORKSPACE_STATE_TYPE = "omp-ssh-remote/workspace-state";
-type WorkspaceExecutionTarget = "local" | "remote" | "unavailable";
 
 const REMOTE_TOOL_SET = new Set<string>(REMOTE_TOOL_NAMES);
 const REMOTE_XDEV_TOOLS = new Set<RemoteToolName>([
@@ -104,76 +98,6 @@ type RemoteFamilyBrokerGlobal = typeof globalThis & {
 };
 const remoteFamilyGlobal = globalThis as RemoteFamilyBrokerGlobal;
 
-export function remoteWorkspaceStateMessage(
-  target: WorkspaceExecutionTarget,
-  remoteCwd?: string,
-): string {
-  const execution =
-    target === "remote"
-      ? [
-          'mode: "remote"',
-          'ordinary filesystem paths and workspace tools: "remote"',
-          `remote working directory: ${JSON.stringify(remoteCwd ?? "")}`,
-          'transport failure: "fail closed; do not fall back to local workspace tools"',
-        ]
-      : target === "unavailable"
-        ? [
-            'mode: "unavailable"',
-            'ordinary filesystem paths and workspace tools: "fail closed"',
-            'local fallback: "disabled"',
-            'required action: "/remote-exit to restore local workspace tools"',
-          ]
-        : [
-            'mode: "local"',
-            'ordinary filesystem paths and workspace tools: "local"',
-          ];
-  return [
-    "[OMP SSH Remote workspace state]",
-    "Extension-generated operational context, not a user request.",
-    ...execution,
-    'control-plane tools and internal URI resources: "local"',
-    'native xd:// workspace devices: "route according to underlying file arguments or AST proposal origin"',
-    'connection state: "current known SSH transport state; inspect with /remote-status"',
-  ].join("\n");
-}
-
-export function workspaceExecutionTarget(
-  selected: boolean,
-  connectionError?: string,
-  client?: Pick<RemoteRuntimeClient, "isClosed">,
-): WorkspaceExecutionTarget {
-  if (!selected) return "local";
-  return connectionError || !client || client.isClosed
-    ? "unavailable"
-    : "remote";
-}
-
-export function injectWorkspaceState(
-  messages: AgentMessage[],
-  target: WorkspaceExecutionTarget,
-  remoteCwd?: string,
-): AgentMessage[] {
-  const stateMessage: AgentMessage = {
-    role: "custom",
-    customType: REMOTE_WORKSPACE_STATE_TYPE,
-    content: remoteWorkspaceStateMessage(target, remoteCwd),
-    display: false,
-    attribution: "agent",
-    details: {
-      target,
-      remoteCwd: target === "remote" ? remoteCwd : undefined,
-    },
-    timestamp: Date.now(),
-  };
-  return [
-    ...messages.filter(
-      (message) =>
-        message.role !== "custom" ||
-        message.customType !== REMOTE_WORKSPACE_STATE_TYPE,
-    ),
-    stateMessage,
-  ];
-}
 const REMOTE_FAMILIES = (remoteFamilyGlobal[REMOTE_FAMILY_BROKER_KEY] ??=
   new Map<string, RemoteFamily>());
 
@@ -724,20 +648,6 @@ export default async function remoteRuntimeExtension(
     },
   });
 
-  pi.on("context", (event) => {
-    const target = workspaceExecutionTarget(
-      state.selected,
-      state.connectionError,
-      state.client,
-    );
-    return {
-      messages: injectWorkspaceState(
-        event.messages,
-        target,
-        target === "remote" ? state.remoteCwd : undefined,
-      ),
-    };
-  });
 
   pi.on("session_start", async (_event, ctx) => {
     state.localCwd = ctx.cwd;
