@@ -113,6 +113,16 @@ Routing rules:
 - an `ast_edit` proposal and its later resolve or reject action always return to the same `ToolSession`;
 - remote eval exposes only constrained remote workspace helpers, not local control-plane tools.
 
+### Agent workspace status
+
+`remote_workspace_status` is a zero-argument, read-only tool available to the agent. It reports the extension's current known state without a network request:
+
+- `local`: ordinary filesystem paths use local native tools;
+- `remote`: ordinary filesystem paths use the named remote cwd and native remote tools;
+- `unavailable`: remote mode remains selected, but ordinary filesystem paths are rejected rather than falling back locally.
+
+The result also lists the currently wrapped remote tools, the session role, pending remote AST proposals, and the fixed local boundary for URI resources and control-plane tools. The agent can call it when execution location is unclear, after a remote error, or when asked where a tool will run. It is not called automatically and does not ping SSH; `/remote-status` remains the user-facing view of the current known transport state.
+
 ## Current Support
 
 ### Verified
@@ -209,7 +219,7 @@ omp plugin link "$PWD"
 omp plugin list
 ```
 
-`plugin link` does not download or copy the project. It creates an OMP plugin link to this checkout, so keep the repository directory in place. `omp plugin list` should show `omp-ssh-remote` version `0.6.0`.
+`plugin link` does not download or copy the project. It creates an OMP plugin link to this checkout, so keep the repository directory in place. `omp plugin list` should show `omp-ssh-remote` version `0.7.0`.
 
 Exit every running OMP process and start OMP again. Inside the restarted OMP session, run:
 

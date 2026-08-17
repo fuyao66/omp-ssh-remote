@@ -157,6 +157,87 @@ describe("remote session boundaries", () => {
   });
 });
 
+describe("remote workspace status", () => {
+  test("reports local mode without a selected remote runtime", async () => {
+    const { workspaceStatus } = await import("../src/extension.ts");
+    expect(
+      workspaceStatus({
+        selected: false,
+        clientPresent: false,
+        clientClosed: false,
+        owner: false,
+        wrappedTools: [],
+        proposalSources: [],
+      }),
+    ).toMatchObject({
+      mode: "local",
+      transport: "not-selected",
+      remoteCwd: null,
+      sessionRole: null,
+      connectionError: null,
+      remoteWorkspaceTools: [],
+      pendingRemoteAstProposals: 0,
+      routing: {
+        ordinaryFilesystemPaths: "local native tools",
+        asyncBash: "local OMP policy",
+      },
+    });
+  });
+
+  test("reports a connected remote session and its tool boundary", async () => {
+    const { workspaceStatus } = await import("../src/extension.ts");
+    expect(
+      workspaceStatus({
+        selected: true,
+        clientPresent: true,
+        clientClosed: false,
+        remoteCwd: "/srv/project",
+        owner: true,
+        wrappedTools: ["bash", "read", "write"],
+        proposalSources: ["remote", "local", "remote"],
+      }),
+    ).toMatchObject({
+      mode: "remote",
+      transport: "connected",
+      remoteCwd: "/srv/project",
+      sessionRole: "owner",
+      connectionError: null,
+      remoteWorkspaceTools: ["bash", "read", "write"],
+      pendingRemoteAstProposals: 2,
+      routing: {
+        ordinaryFilesystemPaths: "remote native runtime",
+        internalUris: "local control plane",
+        controlPlane: "local control plane",
+        asyncBash: "rejected; remote job bridge is not available",
+        isolatedTasks: "rejected; remote isolated worktrees are not available",
+      },
+    });
+  });
+
+  test("reports a selected disconnected runtime as unavailable and fail-closed", async () => {
+    const { workspaceStatus } = await import("../src/extension.ts");
+    expect(
+      workspaceStatus({
+        selected: true,
+        clientPresent: true,
+        clientClosed: true,
+        remoteCwd: "/srv/project",
+        owner: false,
+        wrappedTools: ["read"],
+        proposalSources: [],
+      }),
+    ).toMatchObject({
+      mode: "unavailable",
+      transport: "unavailable",
+      remoteCwd: "/srv/project",
+      sessionRole: "subagent",
+      connectionError: "Remote runtime transport is unavailable",
+      routing: {
+        ordinaryFilesystemPaths: "rejected (fail closed)",
+      },
+    });
+  });
+});
 
 describe("AST proposal tracking", () => {
   test("recognizes top-level and xdev-wrapped native AST previews", () => {

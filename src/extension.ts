@@ -1,5 +1,6 @@
 import { resolve as resolvePath, sep } from "node:path";
 import type { AgentToolResult, ToolApproval } from "@oh-my-pi/pi-agent-core";
+import { z } from "@oh-my-pi/omptype/zod";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -20,7 +21,6 @@ import {
 } from "./path-domain.ts";
 export { pathShouldStayLocal } from "./path-domain.ts";
 import { buildSshWorkerCommand } from "./ssh.ts";
-
 
 const REMOTE_TOOL_SET = new Set<string>(REMOTE_TOOL_NAMES);
 const REMOTE_XDEV_TOOLS = new Set<RemoteToolName>([
@@ -65,6 +65,88 @@ const TOOL_LABELS: Record<RemoteToolName, string> = {
   eval: "Eval",
   debug: "Debug",
 };
+
+const REMOTE_WORKSPACE_STATUS_TOOL = "remote_workspace_status";
+
+export type RemoteWorkspaceStatus = {
+  mode: "local" | "remote" | "unavailable";
+  transport: "not-selected" | "connected" | "unavailable";
+  remoteCwd: string | null;
+  sessionRole: "owner" | "subagent" | null;
+  connectionError: string | null;
+  remoteWorkspaceTools: RemoteToolName[];
+  pendingRemoteAstProposals: number;
+  routing: {
+    ordinaryFilesystemPaths: string;
+    internalUris: string;
+    controlPlane: string;
+    asyncBash: string;
+    isolatedTasks: string;
+  };
+  note: string;
+};
+
+type RemoteWorkspaceStatusInput = {
+  selected: boolean;
+  clientPresent: boolean;
+  clientClosed: boolean;
+  connectionError?: string;
+  remoteCwd?: string;
+  owner: boolean;
+  wrappedTools: Iterable<RemoteToolName>;
+  proposalSources: Iterable<ExecutionTarget>;
+};
+
+export function workspaceStatus(
+  input: RemoteWorkspaceStatusInput,
+): RemoteWorkspaceStatus {
+  const mode = !input.selected
+    ? "local"
+    : input.connectionError || !input.clientPresent || input.clientClosed
+      ? "unavailable"
+      : "remote";
+  const selected = mode !== "local";
+  return {
+    mode,
+    transport:
+      mode === "local"
+        ? "not-selected"
+        : mode === "remote"
+          ? "connected"
+          : "unavailable",
+    remoteCwd: selected ? (input.remoteCwd ?? null) : null,
+    sessionRole: selected ? (input.owner ? "owner" : "subagent") : null,
+    connectionError:
+      mode === "unavailable"
+        ? (input.connectionError ?? "Remote runtime transport is unavailable")
+        : null,
+    remoteWorkspaceTools: selected
+      ? [...new Set(input.wrappedTools)].sort()
+      : [],
+    pendingRemoteAstProposals: [...input.proposalSources].filter(
+      (source) => source === "remote",
+    ).length,
+    routing: {
+      ordinaryFilesystemPaths:
+        mode === "remote"
+          ? "remote native runtime"
+          : mode === "unavailable"
+            ? "rejected (fail closed)"
+            : "local native tools",
+      internalUris: "local control plane",
+      controlPlane: "local control plane",
+      asyncBash:
+        mode === "local"
+          ? "local OMP policy"
+          : "rejected; remote job bridge is not available",
+      isolatedTasks:
+        mode === "local"
+          ? "local OMP policy"
+          : "rejected; remote isolated worktrees are not available",
+    },
+    note: "Current in-process SSH transport state only; this tool does not send an SSH health probe.",
+  };
+}
 
 type ExecutionTarget = "local" | "remote";
 type RemoteConnectOptions = Omit<RemoteConnectRequest, "cwd"> & {
@@ -521,6 +603,33 @@ export default async function remoteRuntimeExtension(
     owner: false,
   };
 
+  pi.registerTool({
+    name: REMOTE_WORKSPACE_STATUS_TOOL,
+    label: "Remote Workspace Status",
+    description:
+      "Report the current known remote workspace mode and routing boundary. Use before workspace work when the execution location is unclear, after a remote tool error, or when asked whether paths run locally or remotely. This reads extension state only; it does not send an SSH health probe.",
+    parameters: z.object({}),
+    loadMode: "essential",
+    approval: "read",
+    async execute() {
+      const snapshot = workspaceStatus({
+        selected: state.selected,
+        clientPresent: state.client !== undefined,
+        clientClosed: state.client?.isClosed ?? false,
+        connectionError: state.connectionError,
+        remoteCwd: state.remoteCwd,
+        owner: state.owner,
+        wrappedTools: state.wrappedTools,
+        proposalSources: state.proposalSources,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
+        details: snapshot,
+        useless: true,
+      };
+    },
+  });
+
   pi.registerCommand("remote-connect", {
     description: "Connect native workspace tools to a remote OMP runtime",
     async handler(args, ctx) {
@@ -537,6 +646,7 @@ export default async function remoteRuntimeExtension(
       if (REMOTE_FAMILIES.has(normalizedSessionFile))
         throw new Error("This session already owns a remote runtime family");
       const configuredHosts = await loadConfiguredSshHosts(ctx.cwd);
+
       const request = parseConnectArgs(args, configuredHosts);
       ctx.ui.setWorkingMessage("Deploying remote OMP runtime");
       let next: RemoteRuntimeClient | undefined;
@@ -647,7 +757,6 @@ export default async function remoteRuntimeExtension(
       );
     },
   });
-
 
   pi.on("session_start", async (_event, ctx) => {
     state.localCwd = ctx.cwd;

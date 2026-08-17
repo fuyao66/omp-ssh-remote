@@ -113,6 +113,16 @@ extension 只替换宿主 OMP session 中原本已启用的工具，不会暴露
 - `ast_edit` proposal 及其之后的 resolve/reject 始终返回同一个 `ToolSession`；
 - 远端 eval 只能调用受限的远端工作区 helper，不能访问本机控制面工具。
 
+### Agent 工作区状态
+
+`remote_workspace_status` 是 agent 可按需调用的零参数只读工具。它不发网络请求，只报告 extension 当前已知的状态：
+
+- `local`：普通文件路径使用本机原生工具；
+- `remote`：普通文件路径在指定的远端 cwd 中使用远端原生工具；
+- `unavailable`：远端模式仍被选中，但普通文件路径会被拒绝，绝不回退到本机。
+
+结果还会列出当前被包装的远端工具、session 角色、待处理的远端 AST proposal，以及 URI resource 和控制面工具始终留在本机的边界。agent 可在执行位置不明确、远端工具报错后，或被问及某工具在哪里执行时调用它。它不会自动调用，也不会 ping SSH；`/remote-status` 仍是用户查看当前已知 transport 状态的命令。
+
 ## 当前支持范围
 
 ### 已验证
@@ -209,7 +219,7 @@ omp plugin link "$PWD"
 omp plugin list
 ```
 
-`plugin link` 不会下载或复制项目，它只会让 OMP 链接当前 checkout，因此必须保留仓库目录。`omp plugin list` 应显示 `omp-ssh-remote` 版本 `0.6.0`。
+`plugin link` 不会下载或复制项目，它只会让 OMP 链接当前 checkout，因此必须保留仓库目录。`omp plugin list` 应显示 `omp-ssh-remote` 版本 `0.7.0`。
 
 完全退出所有正在运行的 OMP 进程并重新启动。在重新启动的 OMP session 中执行：
 

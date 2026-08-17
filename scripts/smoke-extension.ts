@@ -70,6 +70,29 @@ const apiHarness = {
 };
 await remoteRuntimeExtension(apiHarness as unknown as ExtensionAPI);
 
+const workspaceStatus = tools.get("remote_workspace_status");
+if (!workspaceStatus)
+  throw new Error("remote_workspace_status was not registered");
+const beforeConnectStatus = await workspaceStatus.execute(
+  "status-before-connect",
+  {},
+  undefined,
+  undefined,
+  {} as never,
+);
+const beforeConnectDetails = beforeConnectStatus.details as {
+  mode?: string;
+  transport?: string;
+};
+if (
+  beforeConnectDetails.mode !== "local" ||
+  beforeConnectDetails.transport !== "not-selected"
+) {
+  throw new Error(
+    "Workspace status did not report local mode before remote connection",
+  );
+}
+
 const notices: string[] = [];
 const commandContext = {
   cwd: process.cwd(),
@@ -91,14 +114,16 @@ const connectArgs =
   `${target} ${cwd} --port ${port} --identity ${identityFile} --known-hosts ${knownHostsFile}`;
 await connect.handler(connectArgs, commandContext);
 if (events.has("context"))
-  throw new Error("Extension registered a model-visible workspace-state handler");
+  throw new Error(
+    "Extension registered a model-visible workspace-state handler",
+  );
 const exit = commands.get("remote-exit");
 if (!exit) throw new Error("remote-exit was not registered");
 let disconnected = false;
 try {
-  if (tools.size !== activeTools.length)
+  if (tools.size !== activeTools.length + 1)
     throw new Error(
-      `Expected ${activeTools.length} active wrappers, got ${tools.size}`,
+      `Expected ${activeTools.length} remote wrappers plus workspace status, got ${tools.size}`,
     );
   if (tools.has("ast_grep"))
     throw new Error("ast_grep was incorrectly exposed as a top-level tool");
@@ -131,6 +156,26 @@ try {
   const debug = tools.get("debug");
   if (!write || !read || !bash || !astEdit || !lsp || !evalTool || !debug) {
     throw new Error("Active remote wrappers were not registered");
+  }
+
+  const connectedStatus = await workspaceStatus.execute(
+    "status-connected",
+    {},
+    undefined,
+    undefined,
+    invokeContext,
+  );
+  const connectedDetails = connectedStatus.details as {
+    mode?: string;
+    remoteCwd?: string | null;
+  };
+  if (
+    connectedDetails.mode !== "remote" ||
+    connectedDetails.remoteCwd !== cwd
+  ) {
+    throw new Error(
+      "Workspace status did not report the connected remote runtime",
+    );
   }
 
   const content = `adapter-${Date.now()}`;
@@ -316,6 +361,18 @@ try {
 
   await exit.handler("", commandContext);
   disconnected = true;
+  const localStatus = await workspaceStatus.execute(
+    "status-after-exit",
+    {},
+    undefined,
+    undefined,
+    invokeContext,
+  );
+  const localDetails = localStatus.details as { mode?: string };
+  if (localDetails.mode !== "local")
+    throw new Error(
+      "Workspace status did not restore local mode after remote-exit",
+    );
   const localResult = await read.execute(
     "local-read",
     { path: "anything" },
