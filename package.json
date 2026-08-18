@@ -11,8 +11,9 @@
     "README.zh-CN.md"
   ],
   "scripts": {
-    "build": "bun scripts/build.ts",
-    "build:worker:arm64": "bun scripts/compile-worker.ts",
+    "build:worker:arm64": "bun scripts/compile-worker.ts arm64",
+    "build:worker:x64": "bun scripts/compile-worker.ts x64",
+    "build:worker:all": "bun scripts/compile-worker.ts arm64 && bun scripts/compile-worker.ts x64",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "check": "bun run typecheck && bun run build && bun test"

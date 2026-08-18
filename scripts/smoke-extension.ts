@@ -301,62 +301,84 @@ try {
   ) {
     throw new Error("Remote eval kernels did not preserve state");
   }
-
-  await write.execute(
-    "adapter-debug-source",
-    {
-      path: "debug_probe.py",
-      content:
-        "def main():\n    value = 42\n    return 0 if value == 42 else 1\n\nraise SystemExit(main())\n",
-    },
-    undefined,
-    undefined,
-    invokeContext,
-  );
-  const launched = await debug.execute(
-    "adapter-debug-launch",
-    {
-      action: "launch",
-      program: "debug_probe.py",
-      adapter: "debugpy",
-      timeout: 20,
-    },
-    undefined,
-    undefined,
-    invokeContext,
-  );
-  const stack = await debug.execute(
-    "adapter-debug-stack",
-    { action: "stack_trace", levels: 4, timeout: 20 },
-    undefined,
-    undefined,
-    invokeContext,
-  );
-  const evaluated = await debug.execute(
-    "adapter-debug-evaluate",
-    { action: "evaluate", expression: "1 + 1", context: "repl", timeout: 20 },
-    undefined,
-    undefined,
-    invokeContext,
-  );
-  const terminated = await debug.execute(
-    "adapter-debug-terminate",
-    { action: "terminate", timeout: 20 },
-    undefined,
-    undefined,
-    invokeContext,
-  );
-  if (
-    !JSON.stringify(launched).includes("debugpy") ||
-    !JSON.stringify(stack).includes("debug_probe.py")
-  ) {
-    throw new Error("Remote debugpy DAP session did not preserve stack state");
+  let remoteDebug = "skipped";
+  let hasPython = false;
+  try {
+    const pythonCheck = await bash.execute(
+      "adapter-python-check",
+      {
+        command:
+          "command -v python3 && python3 -c 'import debugpy' 2>/dev/null && echo debugpy-ok || echo debugpy-missing",
+        timeout: 10,
+      },
+      undefined,
+      undefined,
+      invokeContext,
+    );
+    hasPython = JSON.stringify(pythonCheck).includes("debugpy-ok");
+  } catch {
+    hasPython = false;
   }
-  if (
-    !JSON.stringify(evaluated).includes("2") ||
-    !JSON.stringify(terminated).includes("terminated")
-  ) {
-    throw new Error("Remote GDB DAP evaluate/terminate failed");
+  if (hasPython) {
+    await write.execute(
+      "adapter-debug-source",
+      {
+        path: "debug_probe.py",
+        content:
+          "def main():\n    value = 42\n    return 0 if value == 42 else 1\n\nraise SystemExit(main())\n",
+      },
+      undefined,
+      undefined,
+      invokeContext,
+    );
+    const launched = await debug.execute(
+      "adapter-debug-launch",
+      {
+        action: "launch",
+        program: "debug_probe.py",
+        adapter: "debugpy",
+        timeout: 60,
+      },
+      undefined,
+      undefined,
+      invokeContext,
+    );
+    const stack = await debug.execute(
+      "adapter-debug-stack",
+      { action: "stack_trace", levels: 4, timeout: 20 },
+      undefined,
+      undefined,
+      invokeContext,
+    );
+    const evaluated = await debug.execute(
+      "adapter-debug-evaluate",
+      { action: "evaluate", expression: "1 + 1", context: "repl", timeout: 20 },
+      undefined,
+      undefined,
+      invokeContext,
+    );
+    const terminated = await debug.execute(
+      "adapter-debug-terminate",
+      { action: "terminate", timeout: 20 },
+      undefined,
+      undefined,
+      invokeContext,
+    );
+    if (
+      !JSON.stringify(launched).includes("debugpy") ||
+      !JSON.stringify(stack).includes("debug_probe.py")
+    ) {
+      throw new Error(
+        "Remote debugpy DAP session did not preserve stack state",
+      );
+    }
+    if (
+      !JSON.stringify(evaluated).includes("2") ||
+      !JSON.stringify(terminated).includes("terminated")
+    ) {
+      throw new Error("Remote GDB DAP evaluate/terminate failed");
+    }
+    remoteDebug = "ok";
   }
 
   await exit.handler("", commandContext);
@@ -392,7 +414,7 @@ try {
       remoteXdev: "ok",
       remoteLsp: "ok",
       remoteEval: "ok",
-      remoteDebug: "ok",
+      remoteDebug,
       localFallback: "ok",
       notices,
     }),

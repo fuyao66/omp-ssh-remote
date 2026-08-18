@@ -61,28 +61,40 @@ async function run(
   }
 }
 
-async function resolveLocalWorker(explicitPath?: string): Promise<string> {
-  const candidates = explicitPath
-    ? [explicitPath]
-    : [
-        join(import.meta.dir, "worker-linux-arm64"),
-        join(import.meta.dir, "../dist/worker-linux-arm64"),
-      ];
+export const SUPPORTED_PLATFORMS: Record<string, "arm64" | "x64"> = {
+  "Linux/aarch64": "arm64",
+  "Linux/x86_64": "x64",
+};
+
+function resolveLocalWorkerPath(arch: "arm64" | "x64"): string[] {
+  return [
+    join(import.meta.dir, `worker-linux-${arch}`),
+    join(import.meta.dir, `../dist/worker-linux-${arch}`),
+  ];
+}
+
+async function resolveLocalWorker(
+  arch: "arm64" | "x64",
+  explicitPath?: string,
+): Promise<string> {
+  const candidates = explicitPath ? [explicitPath] : resolveLocalWorkerPath(arch);
   for (const candidate of candidates) {
     try {
       await access(candidate);
       return candidate;
     } catch (error) {
-      if (!(
-        error instanceof Error &&
-        "code" in error &&
-        error.code === "ENOENT"
-      ))
+      if (
+        !(
+          error instanceof Error &&
+          "code" in error &&
+          error.code === "ENOENT"
+        )
+      )
         throw error;
     }
   }
   throw new Error(
-    `ARM64 worker binary not found; checked: ${candidates.join(", ")}`,
+    `${arch} worker binary not found; checked: ${candidates.join(", ")}`,
   );
 }
 
@@ -144,13 +156,14 @@ export async function prepareRemoteWorker(
     "Remote platform probe",
   );
   const { platform, home } = parseProbe(probe);
-  if (platform !== "Linux/aarch64") {
+  const arch = SUPPORTED_PLATFORMS[platform];
+  if (!arch) {
     throw new Error(
-      `No bundled worker for remote platform ${JSON.stringify(platform)}; expected Linux/aarch64`,
+      `No bundled worker for remote platform ${JSON.stringify(platform)}; supported: Linux/aarch64, Linux/x86_64`,
     );
   }
 
-  const localWorker = await resolveLocalWorker(options.localWorkerPath);
+  const localWorker = await resolveLocalWorker(arch, options.localWorkerPath);
   const hash = await readWorkerHash(localWorker);
   const remoteDir = `${home}/.cache/omp-ssh-remote/${OMP_VERSION}/${hash}`;
   const remoteWorker = `${remoteDir}/worker`;
