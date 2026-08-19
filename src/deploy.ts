@@ -1,4 +1,6 @@
 import { access, readFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { OMP_VERSION } from "./protocol.ts";
 import {
@@ -40,27 +42,61 @@ async function run(
   description: string,
   timeoutMs = 120_000,
 ): Promise<string> {
-  const process = Bun.spawn(command, { stdout: "pipe", stderr: "pipe" });
-  const timeout = setTimeout(() => process.kill(), timeoutMs);
-  try {
-    const [stdout, stderr, exitCode] = await Promise.all([
-      collectBounded(process.stdout, `${description} stdout`),
-      collectBounded(process.stderr, `${description} stderr`),
-      process.exited,
-    ]);
-    if (exitCode !== 0)
-      throw new Error(
-        `${description} failed (${exitCode}): ${stderr.trim() || stdout.trim()}`,
-      );
-    return stdout.trim();
-  } catch (error) {
-    process.kill();
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
+  return new Promise<string>((resolvePromise, rejectPromise) => {
+    const [file, ...args] = command;
+    const proc = spawn(file, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
 
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_COMMAND_OUTPUT_BYTES) {
+        proc.kill();
+        rejectPromise(new Error(`${description} stdout exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes`));
+        return;
+      }
+      stdoutChunks.push(chunk);
+    });
+
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > MAX_COMMAND_OUTPUT_BYTES) {
+        proc.kill();
+        rejectPromise(new Error(`${description} stderr exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes`));
+        return;
+      }
+      stderrChunks.push(chunk);
+    });
+
+    const timer = setTimeout(() => {
+      proc.kill();
+      rejectPromise(new Error(`${description} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    proc.on("error", (err: Error) => {
+      clearTimeout(timer);
+      rejectPromise(err);
+    });
+
+    proc.on("close", (code: number | null) => {
+      clearTimeout(timer);
+      const stdoutText = Buffer.concat(stdoutChunks).toString("utf-8").trim();
+      const stderrText = Buffer.concat(stderrChunks).toString("utf-8").trim();
+      if (code !== 0) {
+        rejectPromise(
+          new Error(`${description} failed (${code}): ${stderrText || stdoutText}`),
+        );
+      } else {
+        resolvePromise(stdoutText);
+      }
+    });
+  });
+}
 export const SUPPORTED_PLATFORMS: Record<string, "arm64" | "x64"> = {
   "Linux/aarch64": "arm64",
   "Linux/x86_64": "x64",
@@ -119,7 +155,6 @@ async function resolveLocalWorker(
     `${arch} worker binary not found; checked: ${candidates.join(", ")}`,
   );
 }
-
 async function readWorkerHash(workerPath: string): Promise<string> {
   try {
     const sidecar = (await readFile(`${workerPath}.sha256`, "utf8")).trim();
@@ -128,11 +163,9 @@ async function readWorkerHash(workerPath: string): Promise<string> {
     if (!(error instanceof Error && "code" in error && error.code === "ENOENT"))
       throw error;
   }
-  return new Bun.CryptoHasher("sha256")
-    .update(await Bun.file(workerPath).arrayBuffer())
-    .digest("hex");
+  const data = await readFile(workerPath);
+  return createHash("sha256").update(data).digest("hex");
 }
-
 function parseProbe(output: string): { platform: string; home: string } {
   const [os, arch, home, ...extra] = output.split("\n");
   if (extra.length > 0 || !os || !arch || !home || !home.startsWith("/")) {

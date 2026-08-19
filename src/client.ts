@@ -1,3 +1,4 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import {
   OMP_VERSION,
   PI_VERSION,
@@ -22,9 +23,8 @@ type PendingCall = {
   reject(error: Error): void;
   onUpdate?: (update: unknown) => void;
 };
-
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timer: NodeJS.Timeout | undefined;
   try {
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => reject(new Error(message)), timeoutMs);
@@ -37,32 +37,35 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 }
 
 export class RemoteRuntimeClient {
-  readonly #process: Bun.Subprocess<"pipe", "pipe", "pipe">;
+  readonly #process: ChildProcess;
   readonly #pending = new Map<string, PendingCall>();
   readonly #ready: Promise<ReadyMessage>;
   #resolveReady?: (message: ReadyMessage) => void;
   #rejectReady?: (error: Error) => void;
   #closed = false;
   #nextId = 1;
+  readonly #exitPromise: Promise<number | null>;
 
   get isClosed(): boolean {
     return this.#closed;
   }
 
   constructor(spec: SpawnSpec) {
-    this.#process = Bun.spawn(spec.command, {
+    const [file, ...args] = spec.command;
+    this.#process = spawn(file, args, {
       cwd: spec.cwd,
       env: { ...process.env, ...spec.env },
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
+      stdio: ["pipe", "pipe", "pipe"],
     });
     this.#ready = new Promise<ReadyMessage>((resolve, reject) => {
       this.#resolveReady = resolve;
       this.#rejectReady = reject;
     });
-    void this.#readStdout().catch(error => this.#terminate(error));
-    void this.#readStderr().catch(error => this.#terminate(error));
+    this.#exitPromise = new Promise<number | null>((resolve) => {
+      this.#process.on("close", (code) => resolve(code));
+    });
+    void this.#readStdout().catch((error) => this.#terminate(error));
+    void this.#readStderr().catch((error) => this.#terminate(error));
     void this.#watchExit();
   }
 
@@ -104,13 +107,13 @@ export class RemoteRuntimeClient {
             `Remote runtime version mismatch: protocol=${ready.protocolVersion}, OMP=${ready.ompVersion}, runtime=${ready.runtimeVersion}`,
           );
         }
-        const available = new Set(ready.tools.map(tool => tool.name));
-        const missing = REMOTE_TOOL_NAMES.filter(name => !available.has(name));
+        const available = new Set(ready.tools.map((tool) => tool.name));
+        const missing = REMOTE_TOOL_NAMES.filter((name) => !available.has(name));
         if (missing.length > 0) throw new Error(`Remote runtime is missing tools: ${missing.join(", ")}`);
       } else {
         const piTools = ["read", "write", "edit", "bash", "grep", "find", "ls"];
-        const available = new Set(ready.tools.map(tool => tool.name));
-        const missing = piTools.filter(name => !available.has(name));
+        const available = new Set(ready.tools.map((tool) => tool.name));
+        const missing = piTools.filter((name) => !available.has(name));
         if (missing.length > 0) throw new Error(`Remote Pi runtime is missing tools: ${missing.join(", ")}`);
       }
       return ready;
@@ -128,32 +131,34 @@ export class RemoteRuntimeClient {
     onUpdate?: (update: unknown) => void,
   ): Promise<unknown> {
     if (this.#closed) throw new Error("Remote runtime is disconnected");
-    if (signal?.aborted) throw (signal.reason instanceof Error ? signal.reason : new Error("Remote tool call cancelled"));
-    const id = String(this.#nextId++);
-    let abort: (() => void) | undefined;
+    if (signal?.aborted) {
+      const reason = signal.reason;
+      throw reason instanceof Error ? reason : new Error("Operation aborted");
+    }
+    const id = `req_${this.#nextId++}`;
     const promise = new Promise<unknown>((resolve, reject) => {
       this.#pending.set(id, { resolve, reject, onUpdate });
-      abort = () => {
+    });
+    const abortHandler = () => {
+      if (this.#pending.has(id)) {
         try {
           this.#send({ type: "cancel", id });
-        } catch {
-          // Disconnect handling rejects every pending call.
-        }
-        this.#pending.delete(id);
-        reject(signal?.reason instanceof Error ? signal.reason : new Error("Remote tool call cancelled"));
-      };
-      signal?.addEventListener("abort", abort, { once: true });
-      try {
-        this.#send({ type: "execute", id, toolCallId, tool, args });
-      } catch (error) {
-        this.#pending.delete(id);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        } catch {}
       }
-    });
+    };
+    signal?.addEventListener("abort", abortHandler, { once: true });
     try {
+      this.#send({
+        type: "execute",
+        id,
+        toolCallId,
+        tool,
+        args,
+      });
       return await promise;
     } finally {
-      if (abort) signal?.removeEventListener("abort", abort);
+      signal?.removeEventListener("abort", abortHandler);
+      this.#pending.delete(id);
     }
   }
 
@@ -161,9 +166,9 @@ export class RemoteRuntimeClient {
     if (this.#closed) return;
     try {
       this.#send({ type: "shutdown" });
-      this.#process.stdin.end();
+      this.#process.stdin?.end();
       await withTimeout(
-        this.#process.exited,
+        this.#exitPromise,
         timeoutMs,
         `Remote runtime shutdown timed out after ${timeoutMs}ms`,
       );
@@ -180,31 +185,33 @@ export class RemoteRuntimeClient {
 
   #send(message: Request): void {
     if (this.#closed) throw new Error("Remote runtime is disconnected");
-    this.#process.stdin.write(encodeMessage(message));
-    this.#process.stdin.flush();
+    this.#process.stdin?.write(encodeMessage(message));
   }
 
   async #readStdout(): Promise<void> {
+    if (!this.#process.stdout) return;
     for await (const line of decodeFrames(this.#process.stdout)) {
       if (line.trim()) this.#handle(parseMessage(line));
     }
   }
 
   async #readStderr(): Promise<void> {
+    if (!this.#process.stderr) return;
     const decoder = new TextDecoder("utf-8", { fatal: true });
     let text = "";
     let bytes = 0;
     for await (const chunk of this.#process.stderr) {
-      bytes += chunk.byteLength;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buf.byteLength;
       if (bytes > 1024 * 1024) throw new Error("Remote runtime stderr exceeded 1 MiB");
-      text += decoder.decode(chunk, { stream: true });
+      text += decoder.decode(buf, { stream: true });
     }
     text += decoder.decode();
     if (text.trim()) process.stderr.write(`[omp-remote-worker] ${text}`);
   }
 
   async #watchExit(): Promise<void> {
-    const code = await this.#process.exited;
+    const code = await this.#exitPromise;
     this.#close(new Error(`Remote runtime exited with code ${code}`));
   }
 
