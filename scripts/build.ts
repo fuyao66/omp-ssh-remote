@@ -33,15 +33,20 @@ const piExtension = await Bun.build({
   entrypoints: [resolve(root, "src/pi-extension.ts")],
   outdir,
   naming: "pi-extension.js",
-  target: "bun",
+  target: "node",
   format: "esm",
   minify: false,
+  external: [
+    "@earendil-works/pi-coding-agent",
+    "@earendil-works/pi-agent-core",
+    "@cortexkit/aft-pi",
+    "@cortexkit/pi-magic-context",
+  ],
 });
 if (!piExtension.success)
   throw new AggregateError(piExtension.logs, "Pi Extension build failed");
 const worker = await Bun.build({
   entrypoints: [resolve(root, "src/worker.ts")],
-  outdir,
   naming: "worker.js",
   target: "bun",
   format: "esm",

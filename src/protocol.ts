@@ -42,6 +42,22 @@ export type AftRemoteToolName =
   | "ast_grep_search"
   | "ast_grep_replace";
 export type AnyRemoteToolName = RemoteToolName | "find" | "ls" | AftRemoteToolName;
+
+export const AFT_EXTENDED_TOOLS: readonly string[] = [
+  "aft_inspect",
+  "aft_outline",
+  "aft_zoom",
+  "aft_callgraph",
+  "aft_semantic",
+  "aft_conflicts",
+  "aft_navigate",
+  "aft_import",
+  "aft_safety",
+  "aft_undo",
+  "ast_grep_search",
+  "ast_grep_replace",
+];
+
 export type InitializeRequest = {
   type: "initialize";
   protocolVersion: number;

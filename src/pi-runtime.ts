@@ -11,6 +11,7 @@ import {
   PROTOCOL_VERSION,
   PI_VERSION,
   PI_TOOL_RUNTIME_VERSION,
+  AFT_EXTENDED_TOOLS,
   type ExecuteRequest,
   type ReadyMessage,
   type ToolManifest,
@@ -23,21 +24,7 @@ export interface PiNativeWorkerRuntime {
   close(): Promise<void>;
 }
 
-export const AFT_EXTENDED_TOOLS: readonly string[] = [
-  "aft_inspect",
-  "aft_outline",
-  "aft_zoom",
-  "aft_callgraph",
-  "aft_semantic",
-  "aft_conflicts",
-  "aft_navigate",
-  "aft_import",
-  "aft_safety",
-  "aft_undo",
-  "ast_grep_search",
-  "ast_grep_replace",
-];
-
+export { AFT_EXTENDED_TOOLS };
 export function createPiNativeWorkerRuntime(
   cwd: string,
   _settings: Record<string, unknown> = {},

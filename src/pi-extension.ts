@@ -13,9 +13,7 @@ import {
 } from "./connect-options.ts";
 import { isInternalUri } from "./path-domain.ts";
 import { buildSshWorkerCommand } from "./ssh.ts";
-import type { AnyRemoteToolName } from "./protocol.ts";
-import { AFT_EXTENDED_TOOLS } from "./pi-runtime.ts";
-
+import { AFT_EXTENDED_TOOLS, type AnyRemoteToolName } from "./protocol.ts";
 export const PI_REMOTE_CORE_TOOLS: readonly string[] = [
   "read",
   "write",
