@@ -5,30 +5,28 @@ import {
   type ConfiguredSshHost,
 } from "../src/connect-options.ts";
 
-const modelarts: ConfiguredSshHost = {
-  name: "modelarts",
+const gpuBox: ConfiguredSshHost = {
+  name: "gpu-box",
   host: "remote.example.com",
   username: "developer",
   port: 2222,
-  keyPath: "~/.ssh/modelarts.pem",
+  keyPath: "~/.ssh/gpu-box.pem",
 };
 
 describe("remote connection aliases", () => {
   test("connects by OMP SSH host name and defaults cwd later", () => {
-    expect(parseConnectArgs("modelarts", [modelarts])).toEqual({
+    expect(parseConnectArgs("gpu-box", [gpuBox])).toEqual({
       target: "developer@remote.example.com",
-      displayTarget: "modelarts",
+      displayTarget: "gpu-box",
       port: 2222,
-      identityFile: "~/.ssh/modelarts.pem",
+      identityFile: "~/.ssh/gpu-box.pem",
     });
   });
 
   test("accepts a project directory after the host name", () => {
-    expect(
-      parseConnectArgs("modelarts /srv/project", [modelarts]),
-    ).toMatchObject({
+    expect(parseConnectArgs("gpu-box /srv/project", [gpuBox])).toMatchObject({
       target: "developer@remote.example.com",
-      displayTarget: "modelarts",
+      displayTarget: "gpu-box",
       cwd: "/srv/project",
     });
   });
@@ -36,12 +34,12 @@ describe("remote connection aliases", () => {
   test("explicit flags override saved host settings", () => {
     expect(
       parseConnectArgs(
-        "modelarts /srv/project --port 2200 --identity ~/.ssh/override --known-hosts ~/.ssh/project_hosts",
-        [modelarts],
+        "gpu-box /srv/project --port 2200 --identity ~/.ssh/override --known-hosts ~/.ssh/project_hosts",
+        [gpuBox],
       ),
     ).toEqual({
       target: "developer@remote.example.com",
-      displayTarget: "modelarts",
+      displayTarget: "gpu-box",
       cwd: "/srv/project",
       port: 2200,
       identityFile: "~/.ssh/override",
@@ -64,19 +62,15 @@ describe("remote connection aliases", () => {
   });
 
   test("project aliases override same-name user aliases", () => {
-    const project = { ...modelarts, host: "project.example.com" };
-    const user = { ...modelarts, host: "user.example.com" };
+    const project = { ...gpuBox, host: "project.example.com" };
+    const user = { ...gpuBox, host: "user.example.com" };
     expect(mergeConfiguredSshHosts([project], [user])).toEqual([project]);
   });
 
   test("rejects invalid positional and option shapes", () => {
     expect(() => parseConnectArgs("")).toThrow("Usage:");
     expect(() => parseConnectArgs("host /a /b")).toThrow("Usage:");
-    expect(() => parseConnectArgs("host --port 0")).toThrow(
-      "Invalid SSH port",
-    );
-    expect(() => parseConnectArgs("host --identity")).toThrow(
-      "Missing value",
-    );
+    expect(() => parseConnectArgs("host --port 0")).toThrow("Invalid SSH port");
+    expect(() => parseConnectArgs("host --identity")).toThrow("Missing value");
   });
 });

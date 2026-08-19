@@ -1,0 +1,21 @@
+{
+  "name": "omp-ssh-remote",
+  "version": "0.8.0",
+  "private": true,
+  "type": "module",
+  "description": "Native remote OMP workspace tools over a persistent SSH runtime",
+  "license": "MIT",
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": "17.3.3"
+  },
+  "omp": {
+    "extensions": [
+      "./dist/extension.js"
+    ]
+  }
+}

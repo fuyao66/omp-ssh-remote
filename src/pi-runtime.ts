@@ -1,70 +1,133 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
-  createReadTool,
-  createWriteTool,
-  createEditTool,
-  createBashTool,
-  createGrepTool,
-  createFindTool,
-  createLsTool,
-} from "@earendil-works/pi-coding-agent";
-import {
-  PROTOCOL_VERSION,
-  PI_VERSION,
+  AFT_REMOTE_TOOLS,
+  PI_NATIVE_TOOLS,
   PI_TOOL_RUNTIME_VERSION,
-  AFT_EXTENDED_TOOLS,
+  PI_VERSION,
+  PROTOCOL_VERSION,
   type ExecuteRequest,
   type ReadyMessage,
   type ToolManifest,
 } from "./protocol.ts";
-import { createAftBridgeClient, type AftBridgeClient } from "./aft-bridge-client.ts";
+import {
+  DefaultResourceLoader,
+  SessionManager,
+  SettingsManager,
+  createAgentSession,
+  createBashTool,
+  createEditTool,
+  createFindTool,
+  createGrepTool,
+  createLsTool,
+  createReadTool,
+  createWriteTool,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import aftExtension from "@cortexkit/aft-pi";
+export { AFT_EXTENDED_TOOLS } from "./protocol.ts";
 
 export interface PiNativeWorkerRuntime {
   manifest: ReadyMessage;
-  execute(request: ExecuteRequest): Promise<unknown>;
+  execute(
+    request: ExecuteRequest,
+    signal?: AbortSignal,
+    onUpdate?: (update: unknown) => void,
+  ): Promise<unknown>;
   close(): Promise<void>;
 }
+type ExecutableTool = Pick<
+  ToolDefinition,
+  "description" | "parameters" | "execute"
+>;
 
-export { AFT_EXTENDED_TOOLS };
-export function createPiNativeWorkerRuntime(
+function nativeToolMap(cwd: string): Map<string, ExecutableTool> {
+  const tools = new Map<string, ExecutableTool>();
+  tools.set("read", createReadTool(cwd) as unknown as ExecutableTool);
+  tools.set("write", createWriteTool(cwd) as unknown as ExecutableTool);
+  tools.set("edit", createEditTool(cwd) as unknown as ExecutableTool);
+  tools.set("bash", createBashTool(cwd) as unknown as ExecutableTool);
+  tools.set("grep", createGrepTool(cwd) as unknown as ExecutableTool);
+  tools.set("find", createFindTool(cwd) as unknown as ExecutableTool);
+  tools.set("ls", createLsTool(cwd) as unknown as ExecutableTool);
+  return tools;
+}
+
+export async function createPiNativeWorkerRuntime(
   cwd: string,
   _settings: Record<string, unknown> = {},
-): PiNativeWorkerRuntime {
-  const aftBridge: AftBridgeClient = createAftBridgeClient(cwd);
-
-  const nativeTools: Record<string, { description: string; parameters?: unknown; execute: (...args: any[]) => Promise<unknown> }> = {
-    read: createReadTool(cwd),
-    write: createWriteTool(cwd),
-    edit: createEditTool(cwd),
-    bash: createBashTool(cwd),
-    grep: createGrepTool(cwd),
-    find: createFindTool(cwd),
-    ls: createLsTool(cwd),
-  };
-
-  const toolNames = [...Object.keys(nativeTools), ...AFT_EXTENDED_TOOLS];
-
-  const manifestTools: ToolManifest[] = toolNames.map((name) => {
-    const native = nativeTools[name];
-    if (native) {
-      return {
-        name,
-        description: native.description,
-        parameters: native.parameters as Record<string, unknown> | undefined,
-      };
+): Promise<PiNativeWorkerRuntime> {
+  const previousCwd = process.cwd();
+  let agentDir: string | undefined;
+  let session:
+    Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+  try {
+    process.chdir(cwd);
+    agentDir = await mkdtemp(join(tmpdir(), "pi-ssh-remote-worker-"));
+    const settingsManager = SettingsManager.create(cwd, agentDir);
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager,
+      extensionFactories: [
+        { name: "aft", factory: aftExtension, hidden: true },
+      ],
+      noExtensions: true,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+    });
+    await resourceLoader.reload();
+    const sessionManager = SessionManager.inMemory(cwd);
+    ({ session } = await createAgentSession({
+      cwd,
+      agentDir,
+      settingsManager,
+      resourceLoader,
+      sessionManager,
+      tools: [...new Set<string>([...PI_NATIVE_TOOLS, ...AFT_REMOTE_TOOLS])],
+    }));
+    await session.bindExtensions({ mode: "print" });
+  } catch (error) {
+    if (session) {
+      await session.extensionRunner
+        .emit({ type: "session_shutdown", reason: "quit" })
+        .catch(() => {});
+      session.dispose();
     }
-    return {
-      name,
-      description: `[AFT Remote Native] ${name} executed on remote AFT engine`,
-      parameters: {} as Record<string, unknown>,
-    };
-  });
+    process.chdir(previousCwd);
+    if (agentDir) await rm(agentDir, { recursive: true, force: true });
+    throw error;
+  }
+  const initializedSession = session;
+  const initializedAgentDir = agentDir;
 
+  const nativeTools = nativeToolMap(cwd);
+  const tools = new Map<string, ExecutableTool>();
+  for (const name of PI_NATIVE_TOOLS) {
+    const tool =
+      initializedSession.getToolDefinition(name) ?? nativeTools.get(name);
+    if (tool) tools.set(name, tool);
+  }
+  for (const name of AFT_REMOTE_TOOLS) {
+    const tool = initializedSession.getToolDefinition(name);
+    if (tool) tools.set(name, tool);
+  }
+
+  const manifestTools: ToolManifest[] = [...tools].map(([name, tool]) => ({
+    name,
+    description: tool.description,
+    parameters: tool.parameters,
+  }));
   const manifest: ReadyMessage = {
     type: "ready",
     protocolVersion: PROTOCOL_VERSION,
     toolRuntimeVersion: PI_TOOL_RUNTIME_VERSION,
     host: "pi",
     hostVersion: PI_VERSION,
+    cwd,
     tools: manifestTools,
     capabilities: {
       artifacts: false,
@@ -73,53 +136,44 @@ export function createPiNativeWorkerRuntime(
       eval: false,
       debug: false,
       sessionSpawns: "disabled",
-      asyncBash: "disabled",
+      asyncBash: tools.has("bash_status"),
       remoteWorktrees: "disabled",
+      aftHostRuntime: "@cortexkit/aft-pi@0.51.2",
     },
   };
 
-  async function execute(request: ExecuteRequest): Promise<unknown> {
-    const nativeTool = nativeTools[request.tool];
-    if (nativeTool) {
-      const abortController = new AbortController();
-      const result = await nativeTool.execute(
-        request.id,
-        request.args,
-        abortController.signal,
-        undefined,
-      );
-      return result;
-    }
-
-    // AFT Extended Tools -> Dispatch to remote AFT bridge engine
-    if (AFT_EXTENDED_TOOLS.includes(request.tool)) {
-      try {
-        const aftCommand = request.tool;
-        const res = await aftBridge.send(aftCommand, request.args);
-        return {
-          content: [
-            {
-              type: "text",
-              text: typeof res === "string" ? res : JSON.stringify(res, null, 2),
-            },
-          ],
-          details: res,
-        };
-      } catch (error) {
-        throw new Error(`Remote AFT engine error on ${request.tool}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-
-    throw new Error(`Unknown Pi tool: ${request.tool}`);
+  async function execute(
+    request: ExecuteRequest,
+    signal?: AbortSignal,
+    onUpdate?: (update: unknown) => void,
+  ): Promise<unknown> {
+    const tool = tools.get(request.tool);
+    if (!tool) throw new Error(`Unknown Pi tool: ${request.tool}`);
+    const prepared =
+      "prepareArguments" in tool && typeof tool.prepareArguments === "function"
+        ? tool.prepareArguments(request.args)
+        : request.args;
+    return tool.execute(
+      request.toolCallId,
+      prepared,
+      signal,
+      onUpdate as never,
+      initializedSession.extensionRunner.createContext(),
+    );
   }
 
   async function close(): Promise<void> {
-    await aftBridge.close();
+    try {
+      await initializedSession.extensionRunner.emit({
+        type: "session_shutdown",
+        reason: "quit",
+      });
+    } finally {
+      initializedSession.dispose();
+      process.chdir(previousCwd);
+      await rm(initializedAgentDir, { recursive: true, force: true });
+    }
   }
 
-  return {
-    manifest,
-    execute,
-    close,
-  };
+  return { manifest, execute, close };
 }

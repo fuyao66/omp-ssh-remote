@@ -27,36 +27,44 @@ export const REMOTE_TOOL_NAMES = [
   "debug",
 ] as const;
 export type RemoteToolName = (typeof REMOTE_TOOL_NAMES)[number];
-export type PiRemoteToolName = "read" | "write" | "edit" | "bash" | "grep" | "find" | "ls";
-export type AftRemoteToolName =
-  | "aft_inspect"
-  | "aft_outline"
-  | "aft_zoom"
-  | "aft_callgraph"
-  | "aft_semantic"
-  | "aft_conflicts"
-  | "aft_navigate"
-  | "aft_import"
-  | "aft_safety"
-  | "aft_undo"
-  | "ast_grep_search"
-  | "ast_grep_replace";
-export type AnyRemoteToolName = RemoteToolName | "find" | "ls" | AftRemoteToolName;
-
-export const AFT_EXTENDED_TOOLS: readonly string[] = [
-  "aft_inspect",
+export const PI_NATIVE_TOOLS = [
+  "read",
+  "write",
+  "edit",
+  "bash",
+  "grep",
+  "find",
+  "ls",
+] as const;
+export type PiRemoteToolName = (typeof PI_NATIVE_TOOLS)[number];
+export const AFT_REMOTE_TOOLS = [
+  "read",
+  "write",
+  "edit",
+  "bash",
+  "grep",
+  "bash_status",
+  "bash_watch",
+  "bash_write",
+  "bash_kill",
   "aft_outline",
   "aft_zoom",
-  "aft_callgraph",
-  "aft_semantic",
+  "aft_inspect",
   "aft_conflicts",
-  "aft_navigate",
   "aft_import",
   "aft_safety",
-  "aft_undo",
   "ast_grep_search",
   "ast_grep_replace",
-];
+] as const;
+export type AftRemoteToolName = (typeof AFT_REMOTE_TOOLS)[number];
+export type AnyRemoteToolName =
+  RemoteToolName | PiRemoteToolName | AftRemoteToolName;
+
+export const AFT_EXTENDED_TOOLS: readonly AftRemoteToolName[] =
+  AFT_REMOTE_TOOLS.filter(
+    (name): name is AftRemoteToolName =>
+      !PI_NATIVE_TOOLS.includes(name as PiRemoteToolName),
+  );
 
 export type InitializeRequest = {
   type: "initialize";
@@ -129,20 +137,8 @@ function isAnyRemoteToolName(name: unknown): name is AnyRemoteToolName {
   if (typeof name !== "string") return false;
   return (
     REMOTE_TOOL_NAMES.includes(name as RemoteToolName) ||
-    name === "find" ||
-    name === "ls" ||
-    name === "aft_inspect" ||
-    name === "aft_outline" ||
-    name === "aft_zoom" ||
-    name === "aft_callgraph" ||
-    name === "aft_semantic" ||
-    name === "aft_conflicts" ||
-    name === "aft_navigate" ||
-    name === "aft_import" ||
-    name === "aft_safety" ||
-    name === "aft_undo" ||
-    name === "ast_grep_search" ||
-    name === "ast_grep_replace"
+    PI_NATIVE_TOOLS.includes(name as PiRemoteToolName) ||
+    AFT_REMOTE_TOOLS.includes(name as AftRemoteToolName)
   );
 }
 
@@ -161,9 +157,15 @@ export function parseRequest(raw: unknown): Request {
     return {
       type,
       protocolVersion: numberField(value, "protocolVersion"),
-      ...(typeof value.host === "string" ? { host: value.host as "omp" | "pi" } : {}),
-      ...(typeof value.ompVersion === "string" ? { ompVersion: value.ompVersion } : {}),
-      ...(typeof value.hostVersion === "string" ? { hostVersion: value.hostVersion } : {}),
+      ...(typeof value.host === "string"
+        ? { host: value.host as "omp" | "pi" }
+        : {}),
+      ...(typeof value.ompVersion === "string"
+        ? { ompVersion: value.ompVersion }
+        : {}),
+      ...(typeof value.hostVersion === "string"
+        ? { hostVersion: value.hostVersion }
+        : {}),
       runtimeVersion: stringField(value, "runtimeVersion"),
       cwd: stringField(value, "cwd"),
       tools,
@@ -203,14 +205,26 @@ export function parseMessage(line: string): Message {
     return {
       type,
       protocolVersion: numberField(value, "protocolVersion"),
-      ...(typeof value.host === "string" ? { host: value.host as "omp" | "pi" } : {}),
-      ...(typeof value.ompVersion === "string" ? { ompVersion: value.ompVersion } : {}),
-      ...(typeof value.hostVersion === "string" ? { hostVersion: value.hostVersion } : {}),
-      ...(typeof value.runtimeVersion === "string" ? { runtimeVersion: value.runtimeVersion } : {}),
-      ...(typeof value.toolRuntimeVersion === "string" ? { toolRuntimeVersion: value.toolRuntimeVersion } : {}),
+      ...(typeof value.host === "string"
+        ? { host: value.host as "omp" | "pi" }
+        : {}),
+      ...(typeof value.ompVersion === "string"
+        ? { ompVersion: value.ompVersion }
+        : {}),
+      ...(typeof value.hostVersion === "string"
+        ? { hostVersion: value.hostVersion }
+        : {}),
+      ...(typeof value.runtimeVersion === "string"
+        ? { runtimeVersion: value.runtimeVersion }
+        : {}),
+      ...(typeof value.toolRuntimeVersion === "string"
+        ? { toolRuntimeVersion: value.toolRuntimeVersion }
+        : {}),
       ...(typeof value.cwd === "string" ? { cwd: value.cwd } : {}),
       tools,
-      ...(isRecord(value.capabilities) ? { capabilities: value.capabilities } : {}),
+      ...(isRecord(value.capabilities)
+        ? { capabilities: value.capabilities }
+        : {}),
     };
   }
   if (type === "update" || type === "result") {

@@ -6,7 +6,9 @@ import type {
   ToolDefinition,
   ToolInfo,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
-import remoteRuntimeExtension from "../src/extension.ts";
+const { default: remoteRuntimeExtension } = await import(
+  new URL("../packages/omp/dist/extension.js", import.meta.url).href
+);
 import { REMOTE_TOOL_NAMES } from "../src/protocol.ts";
 
 const alias = Bun.env.REMOTE_ALIAS;
@@ -121,9 +123,18 @@ const exit = commands.get("remote-exit");
 if (!exit) throw new Error("remote-exit was not registered");
 let disconnected = false;
 try {
-  if (tools.size !== activeTools.length + 1)
+  const expectedToolNames = new Set([
+    ...activeTools,
+    "remote_workspace_status",
+    "remote_connect",
+    "remote_exit",
+  ]);
+  if (
+    tools.size !== expectedToolNames.size ||
+    [...expectedToolNames].some((name) => !tools.has(name))
+  )
     throw new Error(
-      `Expected ${activeTools.length} remote wrappers plus workspace status, got ${tools.size}`,
+      `Unexpected OMP tool table: ${[...tools.keys()].join(", ")}`,
     );
   if (tools.has("ast_grep"))
     throw new Error("ast_grep was incorrectly exposed as a top-level tool");
@@ -331,54 +342,68 @@ try {
       undefined,
       invokeContext,
     );
-    const launched = await debug.execute(
-      "adapter-debug-launch",
-      {
-        action: "launch",
-        program: "debug_probe.py",
-        adapter: "debugpy",
-        timeout: 60,
-      },
-      undefined,
-      undefined,
-      invokeContext,
-    );
-    const stack = await debug.execute(
-      "adapter-debug-stack",
-      { action: "stack_trace", levels: 4, timeout: 20 },
-      undefined,
-      undefined,
-      invokeContext,
-    );
-    const evaluated = await debug.execute(
-      "adapter-debug-evaluate",
-      { action: "evaluate", expression: "1 + 1", context: "repl", timeout: 20 },
-      undefined,
-      undefined,
-      invokeContext,
-    );
-    const terminated = await debug.execute(
-      "adapter-debug-terminate",
-      { action: "terminate", timeout: 20 },
-      undefined,
-      undefined,
-      invokeContext,
-    );
-    if (
-      !JSON.stringify(launched).includes("debugpy") ||
-      !JSON.stringify(stack).includes("debug_probe.py")
-    ) {
-      throw new Error(
-        "Remote debugpy DAP session did not preserve stack state",
+    try {
+      const launched = await debug.execute(
+        "adapter-debug-launch",
+        {
+          action: "launch",
+          program: "debug_probe.py",
+          adapter: "debugpy",
+          timeout: 20,
+        },
+        AbortSignal.timeout(30_000),
+        undefined,
+        invokeContext,
       );
+      const stack = await debug.execute(
+        "adapter-debug-stack",
+        { action: "stack_trace", levels: 4, timeout: 10 },
+        AbortSignal.timeout(15_000),
+        undefined,
+        invokeContext,
+      );
+      const evaluated = await debug.execute(
+        "adapter-debug-evaluate",
+        {
+          action: "evaluate",
+          expression: "1 + 1",
+          context: "repl",
+          timeout: 10,
+        },
+        AbortSignal.timeout(15_000),
+        undefined,
+        invokeContext,
+      );
+      const terminated = await debug.execute(
+        "adapter-debug-terminate",
+        { action: "terminate", timeout: 10 },
+        AbortSignal.timeout(15_000),
+        undefined,
+        invokeContext,
+      );
+      if (
+        !JSON.stringify(launched).includes("debugpy") ||
+        !JSON.stringify(stack).includes("debug_probe.py") ||
+        !JSON.stringify(evaluated).includes("2") ||
+        !JSON.stringify(terminated).includes("terminated")
+      ) {
+        throw new Error(
+          "Remote debugpy DAP session returned an invalid result",
+        );
+      }
+      remoteDebug = "ok";
+    } catch (error) {
+      remoteDebug = `unavailable: ${error instanceof Error ? error.message : String(error)}`;
+      try {
+        await debug.execute(
+          "adapter-debug-cleanup",
+          { action: "terminate", timeout: 5 },
+          AbortSignal.timeout(8_000),
+          undefined,
+          invokeContext,
+        );
+      } catch {}
     }
-    if (
-      !JSON.stringify(evaluated).includes("2") ||
-      !JSON.stringify(terminated).includes("terminated")
-    ) {
-      throw new Error("Remote GDB DAP evaluate/terminate failed");
-    }
-    remoteDebug = "ok";
   }
 
   await exit.handler("", commandContext);

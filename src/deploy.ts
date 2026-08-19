@@ -17,6 +17,7 @@ export interface WorkerDeploymentOptions extends Omit<
 > {
   workerPath?: string;
   localWorkerPath?: string;
+  localArtifactDir?: string;
 }
 
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
@@ -58,7 +59,11 @@ async function run(
       stdoutBytes += chunk.length;
       if (stdoutBytes > MAX_COMMAND_OUTPUT_BYTES) {
         proc.kill();
-        rejectPromise(new Error(`${description} stdout exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes`));
+        rejectPromise(
+          new Error(
+            `${description} stdout exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes`,
+          ),
+        );
         return;
       }
       stdoutChunks.push(chunk);
@@ -68,7 +73,11 @@ async function run(
       stderrBytes += chunk.length;
       if (stderrBytes > MAX_COMMAND_OUTPUT_BYTES) {
         proc.kill();
-        rejectPromise(new Error(`${description} stderr exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes`));
+        rejectPromise(
+          new Error(
+            `${description} stderr exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes`,
+          ),
+        );
         return;
       }
       stderrChunks.push(chunk);
@@ -90,7 +99,9 @@ async function run(
       const stderrText = Buffer.concat(stderrChunks).toString("utf-8").trim();
       if (code !== 0) {
         rejectPromise(
-          new Error(`${description} failed (${code}): ${stderrText || stdoutText}`),
+          new Error(
+            `${description} failed (${code}): ${stderrText || stdoutText}`,
+          ),
         );
       } else {
         resolvePromise(stdoutText);
@@ -107,52 +118,54 @@ const MODULE_DIR =
     ? import.meta.dir
     : dirname(fileURLToPath(import.meta.url));
 
-function resolveLocalWorkerPath(arch: "arm64" | "x64", host: "omp" | "pi" = "omp"): string[] {
-  const prefix = host === "pi" ? "pi-worker-linux-" : "worker-linux-";
-  return [
-    join(MODULE_DIR, `${prefix}${arch}`),
-    join(MODULE_DIR, `../dist/${prefix}${arch}`),
-  ];
-}
-export function resolveLocalAftPath(arch: "arm64" | "x64"): string[] {
-  const dirName = arch === "arm64" ? "aft-arm64" : "aft";
-  const userHome = process.env.HOME || "/root";
-  return [
-    join(MODULE_DIR, `../vendor/${dirName}/bin/aft`),
-    join(userHome, `.pi/agent/npm/node_modules/@cortexkit/aft-linux-${arch}/bin/aft`),
-    join(userHome, `.omp/node_modules/@cortexkit/aft-linux-${arch}/bin/aft`),
-  ];
+function resolveLocalWorkerPath(
+  arch: "arm64" | "x64",
+  artifactDir = MODULE_DIR,
+): string[] {
+  return [join(artifactDir, `worker-linux-${arch}`)];
 }
 
-export async function resolveLocalAftBinary(arch: "arm64" | "x64"): Promise<string | undefined> {
-  const candidates = resolveLocalAftPath(arch);
+export function resolveLocalAftPath(
+  arch: "arm64" | "x64",
+  artifactDir = MODULE_DIR,
+): string[] {
+  return [join(artifactDir, `aft-linux-${arch}`)];
+}
+
+export async function resolveLocalAftBinary(
+  arch: "arm64" | "x64",
+  artifactDir?: string,
+): Promise<string> {
+  const candidates = resolveLocalAftPath(arch, artifactDir);
   for (const candidate of candidates) {
     try {
       await access(candidate);
       return candidate;
     } catch {}
   }
-  return undefined;
+  throw new Error(
+    `${arch} AFT binary not found in the Pi plugin package; checked: ${candidates.join(", ")}`,
+  );
 }
 
 async function resolveLocalWorker(
   arch: "arm64" | "x64",
   explicitPath?: string,
-  host: "omp" | "pi" = "omp",
+  artifactDir?: string,
 ): Promise<string> {
-  const candidates = explicitPath ? [explicitPath] : resolveLocalWorkerPath(arch, host);
+  const candidates = explicitPath
+    ? [explicitPath]
+    : resolveLocalWorkerPath(arch, artifactDir);
   for (const candidate of candidates) {
     try {
       await access(candidate);
       return candidate;
     } catch (error) {
-      if (
-        !(
-          error instanceof Error &&
-          "code" in error &&
-          error.code === "ENOENT"
-        )
-      )
+      if (!(
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ))
         throw error;
     }
   }
@@ -190,11 +203,7 @@ export async function resolveRemoteHome(
   options: WorkerDeploymentOptions,
 ): Promise<string> {
   const output = await run(
-    [
-      ...buildSshBaseCommand(options),
-      options.target,
-      `printf '%s\\n' "$HOME"`,
-    ],
+    [...buildSshBaseCommand(options), options.target, `printf '%s\\n' "$HOME"`],
     "Remote home probe",
   );
   if (!output.startsWith("/") || output.includes("\n")) {
@@ -209,11 +218,11 @@ export async function prepareRemoteWorker(
 ): Promise<PreparedRemoteWorker> {
   const probe = parseProbe(
     await run(
-    [
-      ...buildSshBaseCommand(options),
-      options.target,
-      "uname -s && uname -m && printf '%s' \"$HOME\"",
-    ],
+      [
+        ...buildSshBaseCommand(options),
+        options.target,
+        "uname -s && uname -m && printf '%s' \"$HOME\"",
+      ],
       "Probe remote host platform and home",
     ),
   );
@@ -223,10 +232,14 @@ export async function prepareRemoteWorker(
       `Unsupported remote platform ${probe.platform}; supported: ${Object.keys(SUPPORTED_PLATFORMS).join(", ")}`,
     );
   }
-  const localWorker = await resolveLocalWorker(arch, options.localWorkerPath, host);
+  const localWorker = await resolveLocalWorker(
+    arch,
+    options.localWorkerPath,
+    options.localArtifactDir,
+  );
   const hash = await readWorkerHash(localWorker);
   const cacheDir = `${probe.home}/.cache/omp-ssh-remote`;
-  const workerFile = host === "pi" ? `pi-worker-linux-${arch}` : `worker-linux-${arch}`;
+  const workerFile = `worker-linux-${arch}`;
   const remoteDir = `${cacheDir}/${host === "pi" ? "pi" : OMP_VERSION}/${hash}`;
   const remoteWorker = `${remoteDir}/${workerFile}`;
   const marker = `${remoteDir}/${workerFile}.sha256`;
@@ -241,9 +254,8 @@ export async function prepareRemoteWorker(
     "Remote worker check",
   );
   if (exists === "present") {
-    // Check if AFT binary also needs deployment for Pi
     if (host === "pi") {
-      await deployRemoteAftIfAvailable(options, probe.home, arch, remoteDir);
+      await deployRemoteAft(options, probe.home, arch, remoteDir);
     }
     return { workerPath: remoteWorker, home: probe.home };
   }
@@ -275,31 +287,32 @@ export async function prepareRemoteWorker(
     "Worker activation",
   );
   if (host === "pi") {
-    await deployRemoteAftIfAvailable(options, probe.home, arch, remoteDir);
+    await deployRemoteAft(options, probe.home, arch, remoteDir);
   }
   return { workerPath: remoteWorker, home: probe.home };
 }
 
-async function deployRemoteAftIfAvailable(
+async function deployRemoteAft(
   options: WorkerDeploymentOptions,
   home: string,
   arch: "arm64" | "x64",
   workerRemoteDir: string,
 ): Promise<void> {
-  const localAft = await resolveLocalAftBinary(arch);
-  if (!localAft) return;
+  const localAft = await resolveLocalAftBinary(arch, options.localArtifactDir);
 
   const aftHash = await readWorkerHash(localAft);
-  const remoteAftDir = `${home}/.cache/omp-ssh-remote/aft/${arch}/${aftHash}`;
+  const remoteAftDir = `${home}/.cache/omp-ssh-remote/pi/aft/${arch}/${aftHash}`;
   const remoteAftBin = `${remoteAftDir}/aft`;
+  const marker = `${remoteAftBin}.sha256`;
   const quotedRemoteAftBin = quoteRemoteArgument(remoteAftBin);
+  const quotedMarker = quoteRemoteArgument(marker);
   const quotedWorkerDir = quoteRemoteArgument(workerRemoteDir);
 
   const exists = await run(
     [
       ...buildSshBaseCommand(options),
       options.target,
-      `test -x ${quotedRemoteAftBin} && printf present || printf missing`,
+      `test -x ${quotedRemoteAftBin} && test "$(cat ${quotedMarker} 2>/dev/null)" = '${aftHash}' && printf present || printf missing`,
     ],
     "AFT binary check",
   );
@@ -315,6 +328,7 @@ async function deployRemoteAftIfAvailable(
     );
     const nonce = crypto.randomUUID();
     const tempUpload = `${remoteAftBin}.upload-${nonce}`;
+    const tempMarker = `${marker}.upload-${nonce}`;
     const scp = buildScpBaseCommand(options);
     scp.push(localAft, `${options.target}:${quoteRemoteArgument(tempUpload)}`);
     await run(scp, "AFT binary upload");
@@ -322,20 +336,19 @@ async function deployRemoteAftIfAvailable(
       [
         ...buildSshBaseCommand(options),
         options.target,
-        `set -eu; chmod 700 ${quoteRemoteArgument(tempUpload)}; mv -f ${quoteRemoteArgument(tempUpload)} ${quotedRemoteAftBin}`,
+        `set -eu; actual=$(sha256sum ${quoteRemoteArgument(tempUpload)} | cut -d ' ' -f 1); test "$actual" = '${aftHash}'; chmod 700 ${quoteRemoteArgument(tempUpload)}; mv -f ${quoteRemoteArgument(tempUpload)} ${quotedRemoteAftBin}; printf '%s\n' '${aftHash}' > ${quoteRemoteArgument(tempMarker)}; chmod 600 ${quoteRemoteArgument(tempMarker)}; mv -f ${quoteRemoteArgument(tempMarker)} ${quotedMarker}`,
       ],
       "AFT binary activation",
     );
   }
 
-  // Symlink into the worker directory so Pi worker can find it as ./aft
   await run(
     [
       ...buildSshBaseCommand(options),
       options.target,
       `ln -sf ${quotedRemoteAftBin} ${quotedWorkerDir}/aft`,
     ],
-    "Link AFT binary to worker directory",
+    "Link AFT binary to Pi worker directory",
   );
 }
 

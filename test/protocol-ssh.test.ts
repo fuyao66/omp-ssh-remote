@@ -1,10 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
+  AFT_REMOTE_TOOLS,
   MAX_FRAME_BYTES,
+  PI_NATIVE_TOOLS,
+  PI_TOOL_RUNTIME_VERSION,
+  PI_VERSION,
+  PROTOCOL_VERSION,
   decodeFrames,
   parseMessage,
   parseRequest,
+  type ReadyMessage,
 } from "../src/protocol.ts";
+import { validatePiReadyMessage } from "../src/client.ts";
 import {
   buildScpBaseCommand,
   buildSshWorkerCommand,
@@ -44,6 +51,52 @@ describe("protocol boundaries", () => {
     expect(() => parseRequest('{"type":"execute","id":1}')).toThrow();
     expect(() => parseMessage('{"type":"result","id":"1"}')).toThrow(
       "missing result",
+    );
+  });
+});
+
+describe("Pi runtime manifest boundary", () => {
+  const validReady = (): ReadyMessage => ({
+    type: "ready",
+    protocolVersion: PROTOCOL_VERSION,
+    host: "pi",
+    hostVersion: PI_VERSION,
+    toolRuntimeVersion: PI_TOOL_RUNTIME_VERSION,
+    tools: [...new Set([...PI_NATIVE_TOOLS, ...AFT_REMOTE_TOOLS])].map(
+      (name) => ({
+        name,
+        description: `${name} parameters`,
+        parameters: { type: "object", properties: {} },
+      }),
+    ),
+    capabilities: { aftHostRuntime: "@cortexkit/aft-pi@0.51.2" },
+  });
+
+  test("accepts only the complete version-locked Pi and AFT surface", () => {
+    expect(() => validatePiReadyMessage(validReady())).not.toThrow();
+  });
+
+  test("rejects missing, unknown, duplicate, and invalid-schema tools", () => {
+    const missing = validReady();
+    missing.tools = missing.tools.filter((tool) => tool.name !== "aft_outline");
+    expect(() => validatePiReadyMessage(missing)).toThrow("missing tools");
+
+    const unknown = validReady();
+    unknown.tools.push({
+      name: "remote_shell_root",
+      description: "unexpected",
+      parameters: { type: "object" },
+    });
+    expect(() => validatePiReadyMessage(unknown)).toThrow("unsupported tool");
+
+    const duplicate = validReady();
+    duplicate.tools.push(duplicate.tools[0]!);
+    expect(() => validatePiReadyMessage(duplicate)).toThrow("duplicate tool");
+
+    const invalidSchema = validReady();
+    invalidSchema.tools[0] = { ...invalidSchema.tools[0]!, parameters: {} };
+    expect(() => validatePiReadyMessage(invalidSchema)).toThrow(
+      "invalid parameter schema",
     );
   });
 });

@@ -1,9 +1,37 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, readdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 
+type BuildTarget = "all" | "omp" | "pi";
+const target = (process.argv[2] ?? "all") as BuildTarget;
+if (target !== "all" && target !== "omp" && target !== "pi") {
+  throw new Error(
+    `Usage: bun scripts/build.ts <all|omp|pi>; got ${JSON.stringify(target)}`,
+  );
+}
+
 const root = resolve(import.meta.dir, "..");
-const outdir = resolve(root, "dist");
-await mkdir(outdir, { recursive: true });
+const ompOutdir = resolve(root, "packages/omp/dist");
+const piOutdir = resolve(root, "packages/pi/dist");
+await Promise.all([
+  mkdir(ompOutdir, { recursive: true }),
+  mkdir(piOutdir, { recursive: true }),
+]);
+if (target === "all" || target === "omp") {
+  await rm(resolve(ompOutdir, "pi-extension.js"), { force: true });
+  for (const entry of await readdir(ompOutdir)) {
+    if (
+      entry === "worker.js" ||
+      entry.startsWith("CHANGELOG-") ||
+      entry.startsWith("template-") ||
+      entry.startsWith("tool-views.generated-")
+    ) {
+      await rm(resolve(ompOutdir, entry), { force: true });
+    }
+  }
+}
+if (target === "all" || target === "pi") {
+  await rm(resolve(piOutdir, "extension.js"), { force: true });
+}
 
 const legacyModulePlugin: Bun.BunPlugin = {
   name: "omp-ssh-remote:legacy-pi-disabled",
@@ -19,39 +47,31 @@ const legacyModulePlugin: Bun.BunPlugin = {
   },
 };
 
-const extension = await Bun.build({
-  entrypoints: [resolve(root, "src/extension.ts")],
-  outdir,
-  target: "bun",
-  format: "esm",
-  minify: false,
-});
-if (!extension.success)
-  throw new AggregateError(extension.logs, "Extension build failed");
+if (target === "all" || target === "omp") {
+  const extension = await Bun.build({
+    entrypoints: [resolve(root, "src/extension.ts")],
+    outdir: ompOutdir,
+    target: "bun",
+    format: "esm",
+    minify: false,
+  });
+  if (!extension.success)
+    throw new AggregateError(extension.logs, "OMP extension build failed");
+}
 
-const piExtension = await Bun.build({
-  entrypoints: [resolve(root, "src/pi-extension.ts")],
-  outdir,
-  naming: "pi-extension.js",
-  target: "node",
-  format: "esm",
-  minify: false,
-  external: [
-    "@earendil-works/pi-coding-agent",
-    "@earendil-works/pi-agent-core",
-    "@cortexkit/aft-pi",
-    "@cortexkit/pi-magic-context",
-  ],
-});
-if (!piExtension.success)
-  throw new AggregateError(piExtension.logs, "Pi Extension build failed");
-const worker = await Bun.build({
-  entrypoints: [resolve(root, "src/worker.ts")],
-  naming: "worker.js",
-  target: "bun",
-  format: "esm",
-  minify: false,
-  plugins: [legacyModulePlugin],
-});
-if (!worker.success)
-  throw new AggregateError(worker.logs, "Worker build failed");
+if (target === "all" || target === "pi") {
+  const extension = await Bun.build({
+    entrypoints: [resolve(root, "src/pi-extension.ts")],
+    outdir: piOutdir,
+    naming: "pi-extension.js",
+    target: "node",
+    format: "esm",
+    minify: false,
+    external: [
+      "@earendil-works/pi-coding-agent",
+      "@earendil-works/pi-agent-core",
+    ],
+  });
+  if (!extension.success)
+    throw new AggregateError(extension.logs, "Pi extension build failed");
+}

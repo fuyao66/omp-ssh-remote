@@ -1,5 +1,8 @@
 #!/usr/bin/env bun
-import { createPiNativeWorkerRuntime, type PiNativeWorkerRuntime } from "./pi-runtime.ts";
+import {
+  createPiNativeWorkerRuntime,
+  type PiNativeWorkerRuntime,
+} from "./pi-runtime.ts";
 import {
   PI_VERSION,
   PROTOCOL_VERSION,
@@ -12,27 +15,40 @@ import {
   type Message,
   type Request,
 } from "./protocol.ts";
+import { delimiter, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const workerDir =
+  process.env.PI_COMPILED === "true"
+    ? dirname(process.execPath)
+    : dirname(fileURLToPath(import.meta.url));
+process.env.PATH = `${workerDir}${delimiter}${process.env.PATH ?? ""}`;
 
 let runtime: PiNativeWorkerRuntime | undefined;
-const active = new Map<string, { controller: AbortController; done: Promise<void> }>();
+const active = new Map<
+  string,
+  { controller: AbortController; done: Promise<void> }
+>();
 let cleanupPromise: Promise<void> | undefined;
+let shuttingDown = false;
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
 async function cleanupWorker(reason: Error): Promise<void> {
   if (cleanupPromise) return cleanupPromise;
+  shuttingDown = true;
   cleanupPromise = (async () => {
-    for (const [id, entry] of active) {
-      entry.controller.abort(reason);
-      send({
-        type: "error",
-        id,
-        error: serializeError(reason),
-      });
-    }
+    for (const entry of active.values()) entry.controller.abort(reason);
+    await Promise.race([
+      Promise.allSettled([...active.values()].map((entry) => entry.done)),
+      sleep(5_000),
+    ]);
     active.clear();
     if (runtime) {
-      try {
-        await runtime.close();
-      } catch {}
+      await Promise.race([runtime.close().catch(() => {}), sleep(5_000)]);
+      runtime = undefined;
     }
   })();
   return cleanupPromise;
@@ -42,7 +58,11 @@ function send(message: Message): void {
   process.stdout.write(encodeMessage(message));
 }
 
-function serializeError(error: unknown): { name: string; message: string; stack?: string } {
+function serializeError(error: unknown): {
+  name: string;
+  message: string;
+  stack?: string;
+} {
   if (error instanceof Error) {
     return {
       name: error.name || "Error",
@@ -59,7 +79,7 @@ async function initialize(request: InitializeRequest): Promise<void> {
       `Unsupported protocol version: ${request.protocolVersion} (expected ${PROTOCOL_VERSION})`,
     );
   }
-  runtime = createPiNativeWorkerRuntime(request.cwd, {});
+  runtime = await createPiNativeWorkerRuntime(request.cwd, {});
   send(runtime.manifest);
 }
 
@@ -68,19 +88,30 @@ function startExecute(request: ExecuteRequest): void {
     send({
       type: "error",
       id: request.id,
-      error: { name: "NotInitialized", message: "Worker runtime is not initialized" },
+      error: {
+        name: "NotInitialized",
+        message: "Worker runtime is not initialized",
+      },
     });
     return;
   }
   const controller = new AbortController();
   const executePromise = (async () => {
     try {
-      const result = await runtime.execute(request);
-      active.delete(request.id);
-      send({ type: "result", id: request.id, result });
+      const result = await runtime.execute(
+        request,
+        controller.signal,
+        (update) => {
+          if (!shuttingDown)
+            send({ type: "update", id: request.id, result: update });
+        },
+      );
+      if (!shuttingDown) send({ type: "result", id: request.id, result });
     } catch (error) {
+      if (!shuttingDown)
+        send({ type: "error", id: request.id, error: serializeError(error) });
+    } finally {
       active.delete(request.id);
-      send({ type: "error", id: request.id, error: serializeError(error) });
     }
   })();
   active.set(request.id, { controller, done: executePromise });
@@ -110,7 +141,9 @@ async function dispatch(request: Request): Promise<boolean> {
 }
 
 const stopForSignal = (signal: string): void => {
-  void cleanupWorker(new Error(`Remote worker received ${signal}`)).finally(() => process.exit(0));
+  void cleanupWorker(new Error(`Remote worker received ${signal}`)).finally(
+    () => process.exit(0),
+  );
 };
 process.once("SIGHUP", () => stopForSignal("SIGHUP"));
 process.once("SIGTERM", () => stopForSignal("SIGTERM"));

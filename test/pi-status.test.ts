@@ -1,84 +1,122 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   buildPiWorkspaceStatus,
-  ALL_PI_REMOTE_TOOLS,
+  getPiRemoteState,
   type PiRemoteExtensionState,
 } from "../src/pi-extension.ts";
-import { AFT_EXTENDED_TOOLS } from "../src/pi-runtime.ts";
+import type { ReadyMessage } from "../src/protocol.ts";
 
-describe("Pi Remote Workspace Status & AFT Remote Forwarding", () => {
-  test("builds local workspace status when disconnected", () => {
-    const state: PiRemoteExtensionState = {
-      selected: false,
-    };
-    const status = buildPiWorkspaceStatus(state);
+function readyWithTools(...names: string[]): ReadyMessage {
+  return {
+    type: "ready",
+    protocolVersion: 1,
+    host: "pi",
+    hostVersion: "0.84.2",
+    toolRuntimeVersion: "0.1.0",
+    cwd: "/remote/project",
+    tools: names.map((name) => ({
+      name,
+      description: `${name} description`,
+      parameters: { type: "object", properties: {} },
+    })),
+  };
+}
+
+afterEach(() => {
+  const state = getPiRemoteState();
+  state.selected = false;
+  state.client = undefined;
+  state.cwd = undefined;
+  state.connectOptions = undefined;
+  state.connectionError = undefined;
+  state.ownershipVerified = undefined;
+  state.ready = undefined;
+  state.localActiveTools = undefined;
+});
+
+describe("Pi remote workspace status", () => {
+  test("reports the local profile when disconnected", () => {
+    const status = buildPiWorkspaceStatus({ selected: false });
     expect(status.mode).toBe("local");
     expect(status.transport).toBe("not-selected");
-    expect(status.remoteCwd).toBeNull();
     expect(status.remoteWorkspaceTools).toEqual([]);
-    expect(status.aftTools).toEqual([]);
-    expect(status.routing.ordinaryFilesystemPaths).toContain("local native tools");
   });
 
-  test("builds remote workspace status with ALL Pi and AFT tools when connected", () => {
-    const mockClient = {
-      isClosed: false,
-    } as any;
+  test("derives the remote surface from the verified ready manifest", () => {
     const state: PiRemoteExtensionState = {
       selected: true,
-      cwd: "/root/work/project",
-      client: mockClient,
-      connectOptions: {
-        target: "root@trialsfinder",
-        displayTarget: "trialsfinder",
-      },
+      cwd: "/remote/project",
+      client: { isClosed: false } as never,
+      ownershipVerified: true,
+      ready: readyWithTools("read", "find", "aft_outline", "bash_status"),
     };
     const status = buildPiWorkspaceStatus(state);
     expect(status.mode).toBe("remote");
-    expect(status.transport).toBe("connected");
-    expect(status.remoteCwd).toBe("/root/work/project");
-    expect(status.remoteWorkspaceTools).toEqual([...ALL_PI_REMOTE_TOOLS]);
-    expect(status.aftTools).toEqual([...AFT_EXTENDED_TOOLS]);
-    expect(status.routing.aftEngine).toContain("remote AFT daemon bridge");
-    expect(status.routing.ordinaryFilesystemPaths).toContain("remote native runtime");
-    expect(status.routing.subagents).toContain("automatic remote connection inheritance");
+    expect(status.remoteWorkspaceTools).toEqual([
+      "read",
+      "find",
+      "aft_outline",
+      "bash_status",
+    ]);
+    expect(status.aftTools).toEqual(["read", "aft_outline", "bash_status"]);
+    expect(status.routing.aftEngine).toContain("headless Pi Agent");
   });
 
-  test("builds unavailable status on transport failure", () => {
-    const state: PiRemoteExtensionState = {
+  test("fails closed until both transport and tool ownership are verified", () => {
+    const status = buildPiWorkspaceStatus({
       selected: true,
-      cwd: "/root/work/project",
-      client: undefined,
-      connectionError: "SSH connection timed out",
-    };
-    const status = buildPiWorkspaceStatus(state);
+      cwd: "/remote/project",
+      client: { isClosed: false } as never,
+      ownershipVerified: false,
+      ready: readyWithTools("read"),
+      connectionError: "read is owned by AFT before Pi SSH Remote",
+    });
     expect(status.mode).toBe("unavailable");
-    expect(status.transport).toBe("unavailable");
-    expect(status.connectionError).toBe("SSH connection timed out");
-    expect(status.routing.ordinaryFilesystemPaths).toContain("fail-closed");
+    expect(status.connectionError).toContain("owned by AFT");
+    expect(status.remoteWorkspaceTools).toEqual([]);
   });
 
-  test("Pi extension registers remote_connect, remote_exit, and remote_workspace_status tools", async () => {
-    const { default: piRemoteExtension } = await import("../src/pi-extension.ts");
+  test("registers the three control tools and commands without remote wrappers locally", async () => {
+    const { default: extension } = await import("../src/pi-extension.ts");
     const tools = new Map<string, any>();
     const commands = new Map<string, any>();
+    const handlers = new Map<string, any[]>();
     const mockPi = {
       registerTool(tool: any) {
         tools.set(tool.name, tool);
       },
-      registerCommand(name: string, cmd: any) {
-        commands.set(name, cmd);
+      registerCommand(name: string, command: any) {
+        commands.set(name, command);
       },
+      on(name: string, handler: any) {
+        const list = handlers.get(name) ?? [];
+        list.push(handler);
+        handlers.set(name, list);
+      },
+      getAllTools() {
+        return [...tools.values()].map((tool) => ({
+          ...tool,
+          sourceInfo: { source: "extension", path: "pi-ssh-remote" },
+        }));
+      },
+      getActiveTools() {
+        return [...tools.keys()];
+      },
+      setActiveTools() {},
+      sendUserMessage() {},
     };
-    await piRemoteExtension(mockPi as any);
-    expect(tools.has("remote_workspace_status")).toBe(true);
-    expect(tools.has("remote_connect")).toBe(true);
-    expect(tools.has("remote_exit")).toBe(true);
-    expect(commands.has("remote-connect")).toBe(true);
-    expect(commands.has("remote-exit")).toBe(true);
-    expect(commands.has("remote-status")).toBe(true);
-
-    const exitRes = await tools.get("remote_exit").execute("id-1", {}, undefined, undefined, {});
-    expect(exitRes.details).toEqual({ success: true, mode: "local" });
+    await extension(mockPi as never);
+    expect([...tools.keys()].sort()).toEqual([
+      "remote_connect",
+      "remote_exit",
+      "remote_workspace_status",
+    ]);
+    expect([...commands.keys()].sort()).toEqual([
+      "remote-connect",
+      "remote-exit",
+      "remote-status",
+    ]);
+    expect(handlers.has("tool_call")).toBe(true);
+    expect(handlers.has("session_shutdown")).toBe(true);
   });
 });

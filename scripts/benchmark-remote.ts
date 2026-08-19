@@ -1,27 +1,47 @@
 import { RemoteRuntimeClient } from "../src/client.ts";
-import { ensureRemoteWorker } from "../src/deploy.ts";
+import {
+  loadConfiguredSshHosts,
+  parseConnectArgs,
+} from "../src/connect-options.ts";
+import { prepareRemoteWorker } from "../src/deploy.ts";
 import { buildSshWorkerCommand } from "../src/ssh.ts";
 
-const target = Bun.env.REMOTE_TARGET;
-const cwd = Bun.env.REMOTE_CWD;
-const identityFile = Bun.env.REMOTE_IDENTITY;
-const knownHostsFile = Bun.env.REMOTE_KNOWN_HOSTS;
-const port = Number(Bun.env.REMOTE_PORT ?? "22");
-if (!target || !cwd || !identityFile || !knownHostsFile) throw new Error("Remote benchmark environment is incomplete");
+type Host = "omp" | "pi";
 
-const options = {
-  target,
-  port,
-  identityFile,
-  knownHostsFile,
-  localWorkerPath: new URL("../dist/worker-linux-arm64", import.meta.url).pathname,
-};
-const milliseconds = (start: number): number => Math.round((performance.now() - start) * 100) / 100;
+const host = process.argv[2] as Host | undefined;
+if (host !== "omp" && host !== "pi") {
+  throw new Error(`Usage: bun scripts/benchmark-remote.ts <omp|pi>`);
+}
+const target = process.env.REMOTE_ALIAS ?? process.env.REMOTE_TARGET;
+const requestedCwd = process.env.REMOTE_CWD;
+if (!target) throw new Error("REMOTE_ALIAS or REMOTE_TARGET is required");
+
+function quote(value: string): string {
+  return `'${value.replaceAll("'", `'\"'\"'`)}'`;
+}
+
+const configuredHosts = await loadConfiguredSshHosts(process.cwd());
+const args = [quote(target)];
+if (requestedCwd) args.push(quote(requestedCwd));
+if (process.env.REMOTE_PORT) args.push("--port", process.env.REMOTE_PORT);
+if (process.env.REMOTE_IDENTITY)
+  args.push("--identity", quote(process.env.REMOTE_IDENTITY));
+if (process.env.REMOTE_KNOWN_HOSTS)
+  args.push("--known-hosts", quote(process.env.REMOTE_KNOWN_HOSTS));
+const connection = parseConnectArgs(args.join(" "), configuredHosts);
+
+const milliseconds = (started: number): number =>
+  Math.round((performance.now() - started) * 100) / 100;
 const percentile = (samples: number[], ratio: number): number => {
   const sorted = [...samples].sort((left, right) => left - right);
-  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))] ?? 0;
+  return (
+    sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * ratio))] ?? 0
+  );
 };
-const sample = async (count: number, call: (index: number) => Promise<unknown>): Promise<number[]> => {
+const sample = async (
+  count: number,
+  call: (index: number) => Promise<unknown>,
+): Promise<number[]> => {
   const timings: number[] = [];
   for (let index = 0; index < count; index += 1) {
     const started = performance.now();
@@ -30,32 +50,86 @@ const sample = async (count: number, call: (index: number) => Promise<unknown>):
   }
   return timings;
 };
+const summary = (samples: number[]) => ({
+  p50: percentile(samples, 0.5),
+  p95: percentile(samples, 0.95),
+  samples,
+});
 
+const localArtifactDir = new URL(`../packages/${host}/dist/`, import.meta.url)
+  .pathname;
 let started = performance.now();
-const workerPath = await ensureRemoteWorker(options);
+const prepared = await prepareRemoteWorker(
+  { ...connection, localArtifactDir },
+  host,
+);
 const deployCacheMs = milliseconds(started);
-const client = new RemoteRuntimeClient({ command: buildSshWorkerCommand({ ...options, workerPath }) });
+const cwd = requestedCwd ?? prepared.home;
+if (!cwd) throw new Error("Remote cwd and probed remote home are unavailable");
+const client = new RemoteRuntimeClient({
+  command: buildSshWorkerCommand({
+    ...connection,
+    workerPath: prepared.workerPath,
+  }),
+});
+const benchmarkFile = `.ssh-remote-benchmark-${host}-${process.pid}.ts`;
 try {
   started = performance.now();
-  await client.initialize(cwd);
+  const ready = await client.initialize(cwd, 30_000, host);
   const initializeMs = milliseconds(started);
-  await client.execute("write", "benchmark-write", { path: "benchmark.txt", content: "benchmark\n" });
+  await client.execute("write", "benchmark-write", {
+    path: benchmarkFile,
+    content: "export interface RemoteBenchmark { id: string }\n",
+  });
 
-  const reads = await sample(12, index => client.execute("read", `benchmark-read-${index}`, { path: "benchmark.txt" }));
-  const shells = await sample(8, index => client.execute("bash", `benchmark-bash-${index}`, { command: ":" }));
-  const lsp = await sample(3, index =>
-    client.execute("write", `benchmark-lsp-${index}`, {
-      path: "xd://lsp",
-      content: JSON.stringify({ action: "status" }),
+  const reads = await sample(12, (index) =>
+    client.execute("read", `benchmark-read-${index}`, { path: benchmarkFile }),
+  );
+  const shells = await sample(8, (index) =>
+    client.execute("bash", `benchmark-bash-${index}`, { command: ":" }),
+  );
+
+  const hostSpecific =
+    host === "omp"
+      ? {
+          lspStatus: summary(
+            await sample(3, (index) =>
+              client.execute("write", `benchmark-lsp-${index}`, {
+                path: "xd://lsp",
+                content: JSON.stringify({ action: "status" }),
+              }),
+            ),
+          ),
+        }
+      : {
+          aftOutline: summary(
+            await sample(8, (index) =>
+              client.execute("aft_outline", `benchmark-aft-${index}`, {
+                target: benchmarkFile,
+              }),
+            ),
+          ),
+        };
+
+  console.log(
+    JSON.stringify({
+      host,
+      remotePlatform: ready.capabilities?.aftHostRuntime ?? ready.ompVersion,
+      toolCount: ready.tools.length,
+      deployCacheMs,
+      initializeMs,
+      read: summary(reads),
+      bash: summary(shells),
+      ...hostSpecific,
     }),
   );
-  console.log(JSON.stringify({
-    deployCacheMs,
-    initializeMs,
-    read: { p50: percentile(reads, 0.5), p95: percentile(reads, 0.95), samples: reads },
-    bash: { p50: percentile(shells, 0.5), p95: percentile(shells, 0.95), samples: shells },
-    lspStatus: { p50: percentile(lsp, 0.5), p95: percentile(lsp, 0.95), samples: lsp },
-  }));
 } finally {
-  await client.close();
+  if (!client.isClosed) {
+    try {
+      await client.execute("bash", "benchmark-cleanup", {
+        command: `rm -f -- ${quote(benchmarkFile)}`,
+      });
+    } catch {}
+    await client.close().catch(() => client.kill());
+  }
 }

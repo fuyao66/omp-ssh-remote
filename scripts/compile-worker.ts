@@ -29,11 +29,11 @@ const addonFiles =
     : [{ variant: "default" as const, filename: `pi_natives.${archTag}.node` }];
 
 const root = resolve(import.meta.dir, "..");
-const dist = resolve(root, "dist");
 const cache = resolve(root, `.cache/native-${archTag}`);
 const packageDir = resolve(cache, "package");
 const archivePath = resolve(cache, `embedded-addons.${archTag}.tar.gz`);
 const embeddedModule = resolve(cache, "embedded-addon.ts");
+const dist = resolve(root, "packages/omp/dist");
 const outfile = resolve(dist, `worker-linux-${target}`);
 await mkdir(dist, { recursive: true });
 await mkdir(cache, { recursive: true });

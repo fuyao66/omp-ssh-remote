@@ -1,0 +1,25 @@
+{
+  "name": "pi-ssh-remote",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Native remote Pi Agent and AFT workspace tools over a persistent SSH runtime",
+  "license": "MIT",
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-agent-core": "0.84.2"
+  },
+  "pi": {
+    "extensions": [
+      "./dist/pi-extension.js"
+    ]
+  }
+}

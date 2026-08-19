@@ -18,8 +18,7 @@ const options = {
   port,
   identityFile,
   knownHostsFile,
-  localWorkerPath: new URL("../dist/worker-linux-arm64", import.meta.url)
-    .pathname,
+  localArtifactDir: new URL("../packages/omp/dist/", import.meta.url).pathname,
 };
 const workerPath = await ensureRemoteWorker(options);
 const client = new RemoteRuntimeClient({

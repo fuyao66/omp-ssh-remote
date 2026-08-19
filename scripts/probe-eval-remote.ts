@@ -15,7 +15,7 @@ const options = {
   port,
   identityFile,
   knownHostsFile,
-  localWorkerPath: new URL("../dist/worker-linux-arm64", import.meta.url).pathname,
+  localArtifactDir: new URL("../packages/omp/dist/", import.meta.url).pathname,
 };
 const started = performance.now();
 const log = (phase: string): void => console.error(`${phase} ${Math.round(performance.now() - started)}ms`);

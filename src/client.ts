@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import {
+  AFT_REMOTE_TOOLS,
   OMP_VERSION,
+  PI_NATIVE_TOOLS,
   PI_VERSION,
   PI_TOOL_RUNTIME_VERSION,
   PROTOCOL_VERSION,
@@ -16,14 +18,22 @@ import {
   type Request,
 } from "./protocol.ts";
 
-export type SpawnSpec = { command: string[]; cwd?: string; env?: Record<string, string> };
+export type SpawnSpec = {
+  command: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+};
 
 type PendingCall = {
   resolve(value: unknown): void;
   reject(error: Error): void;
   onUpdate?: (update: unknown) => void;
 };
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
     const timeout = new Promise<never>((_resolve, reject) => {
@@ -33,6 +43,53 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
     return await Promise.race([promise, timeout]);
   } finally {
     clearTimeout(timer);
+  }
+}
+const PI_RUNTIME_TOOLS = new Set<string>([
+  ...PI_NATIVE_TOOLS,
+  ...AFT_REMOTE_TOOLS,
+]);
+
+export function validatePiReadyMessage(ready: ReadyMessage): void {
+  if (
+    ready.host !== "pi" ||
+    ready.hostVersion !== PI_VERSION ||
+    ready.toolRuntimeVersion !== PI_TOOL_RUNTIME_VERSION
+  ) {
+    throw new Error(
+      `Remote Pi runtime version mismatch: host=${ready.hostVersion}, runtime=${ready.toolRuntimeVersion}`,
+    );
+  }
+  if (ready.capabilities?.aftHostRuntime !== "@cortexkit/aft-pi@0.51.2") {
+    throw new Error("Remote Pi runtime did not verify AFT 0.51.2");
+  }
+  const names = new Set<string>();
+  for (const tool of ready.tools) {
+    if (!PI_RUNTIME_TOOLS.has(tool.name)) {
+      throw new Error(
+        `Remote Pi runtime exposed unsupported tool: ${tool.name}`,
+      );
+    }
+    if (names.has(tool.name)) {
+      throw new Error(`Remote Pi runtime exposed duplicate tool: ${tool.name}`);
+    }
+    if (
+      !tool.parameters ||
+      typeof tool.parameters !== "object" ||
+      Array.isArray(tool.parameters) ||
+      (tool.parameters as Record<string, unknown>).type !== "object"
+    ) {
+      throw new Error(
+        `Remote Pi tool ${tool.name} has an invalid parameter schema`,
+      );
+    }
+    names.add(tool.name);
+  }
+  const missing = [...PI_RUNTIME_TOOLS].filter((name) => !names.has(name));
+  if (missing.length > 0) {
+    throw new Error(
+      `Remote Pi runtime is missing tools: ${missing.join(", ")}`,
+    );
   }
 }
 
@@ -74,16 +131,15 @@ export class RemoteRuntimeClient {
     timeoutMs = 15_000,
     host: "omp" | "pi" = "omp",
   ): Promise<ReadyMessage> {
-    const tools = host === "pi"
-      ? ["read", "write", "edit", "bash", "grep", "find", "ls"]
-      : [...REMOTE_TOOL_NAMES];
+    const tools = host === "pi" ? [] : [...REMOTE_TOOL_NAMES];
     this.#send({
       type: "initialize",
       protocolVersion: PROTOCOL_VERSION,
       host,
       ompVersion: host === "omp" ? OMP_VERSION : undefined,
       hostVersion: host === "pi" ? PI_VERSION : OMP_VERSION,
-      runtimeVersion: host === "pi" ? PI_TOOL_RUNTIME_VERSION : TOOL_RUNTIME_VERSION,
+      runtimeVersion:
+        host === "pi" ? PI_TOOL_RUNTIME_VERSION : TOOL_RUNTIME_VERSION,
       cwd,
       tools,
     });
@@ -108,13 +164,15 @@ export class RemoteRuntimeClient {
           );
         }
         const available = new Set(ready.tools.map((tool) => tool.name));
-        const missing = REMOTE_TOOL_NAMES.filter((name) => !available.has(name));
-        if (missing.length > 0) throw new Error(`Remote runtime is missing tools: ${missing.join(", ")}`);
+        const missing = REMOTE_TOOL_NAMES.filter(
+          (name) => !available.has(name),
+        );
+        if (missing.length > 0)
+          throw new Error(
+            `Remote runtime is missing tools: ${missing.join(", ")}`,
+          );
       } else {
-        const piTools = ["read", "write", "edit", "bash", "grep", "find", "ls"];
-        const available = new Set(ready.tools.map((tool) => tool.name));
-        const missing = piTools.filter((name) => !available.has(name));
-        if (missing.length > 0) throw new Error(`Remote Pi runtime is missing tools: ${missing.join(", ")}`);
+        validatePiReadyMessage(ready);
       }
       return ready;
     } catch (error) {
@@ -203,7 +261,8 @@ export class RemoteRuntimeClient {
     for await (const chunk of this.#process.stderr) {
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       bytes += buf.byteLength;
-      if (bytes > 1024 * 1024) throw new Error("Remote runtime stderr exceeded 1 MiB");
+      if (bytes > 1024 * 1024)
+        throw new Error("Remote runtime stderr exceeded 1 MiB");
       text += decoder.decode(buf, { stream: true });
     }
     text += decoder.decode();
