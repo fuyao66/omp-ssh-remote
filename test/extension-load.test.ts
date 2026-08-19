@@ -27,10 +27,17 @@ describe("OMP extension loading", () => {
       "remote-status",
     ]);
     expect(events.has("context")).toBe(false);
-
     const status = tools.get("remote_workspace_status");
+    const connect = tools.get("remote_connect");
+    const exit = tools.get("remote_exit");
+
     expect(status?.approval).toBe("read");
     expect(status?.loadMode).toBe("essential");
+    expect(connect?.approval).toBe("exec");
+    expect(connect?.loadMode).toBe("essential");
+    expect(exit?.approval).toBe("exec");
+    expect(exit?.loadMode).toBe("essential");
+
     expect(
       await status?.execute("status-1", {}, undefined, undefined, {} as never),
     ).toEqual({

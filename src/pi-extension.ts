@@ -173,6 +173,139 @@ export default async function piRemoteExtension(pi: ExtensionAPI): Promise<void>
     },
   });
 
+  pi.registerTool({
+    name: "remote_connect",
+    label: "Remote Connect",
+    description:
+      "Connect Pi Agent and AFT tools to a remote host over SSH. Target can be an SSH alias or user@host. When cwd is omitted, defaults to remote $HOME. Transparently routes all Pi workspace tools and AFT tools to the remote host.",
+    parameters: {} as unknown as Record<string, unknown>,
+    execute: async (_id: string, params: unknown, _signal?: AbortSignal, _onUpdate?: unknown, ctx?: ExtensionContext) => {
+      if (state.selected && state.client && !state.client.isClosed) {
+        throw new Error("Already connected to remote runtime. Call remote_exit first.");
+      }
+      const args = (params && typeof params === "object" ? params : {}) as Record<string, unknown>;
+      const target = typeof args.target === "string" ? args.target : "";
+      if (!target) {
+        throw new Error("Missing required 'target' parameter (SSH alias or user@host)");
+      }
+      const rawArgs = [target];
+      if (typeof args.cwd === "string") rawArgs.push(args.cwd);
+      if (typeof args.identity === "string") rawArgs.push("--identity", args.identity);
+      if (typeof args.port === "number") rawArgs.push("--port", String(args.port));
+
+      try {
+        const localCwd = ctx?.cwd ?? process.cwd();
+        const configuredHosts = await loadConfiguredSshHosts(localCwd);
+        const parsed = parseConnectArgs(rawArgs.join(" "), configuredHosts);
+        state.selected = true;
+        state.connectOptions = parsed;
+        state.connectionError = undefined;
+
+        const remoteHome = await resolveRemoteHome({
+          target: parsed.target,
+          port: parsed.port,
+          identityFile: parsed.identityFile,
+          knownHostsFile: parsed.knownHostsFile,
+        });
+        const cwd = parsed.cwd ?? remoteHome;
+        state.cwd = cwd;
+
+        const prepared = await prepareRemoteWorker(
+          {
+            target: parsed.target,
+            port: parsed.port,
+            identityFile: parsed.identityFile,
+            knownHostsFile: parsed.knownHostsFile,
+            localWorkerPath: parsed.workerPath,
+          },
+          "pi",
+        );
+
+        const command = buildSshWorkerCommand({
+          target: parsed.target,
+          port: parsed.port,
+          identityFile: parsed.identityFile,
+          knownHostsFile: parsed.knownHostsFile,
+          workerPath: prepared.workerPath,
+        });
+
+        const client = new RemoteRuntimeClient({ command });
+        state.client = client;
+        await client.initialize(cwd, 15_000, "pi");
+
+        process.env[PI_REMOTE_INHERIT_ENV] = JSON.stringify({
+          connectOptions: parsed,
+          workerPath: prepared.workerPath,
+          cwd,
+        });
+
+        const reloadFn = (ctx as unknown as { reload?: () => Promise<void> })?.reload;
+        if (typeof reloadFn === "function") {
+          await reloadFn();
+        }
+
+        ctx?.ui?.notify?.(
+          `Connected to remote Pi & AFT runtime on ${parsed.displayTarget} (cwd: ${cwd})`,
+          "info",
+        );
+
+        const details = {
+          success: true,
+          mode: "remote",
+          target: parsed.displayTarget,
+          remoteCwd: cwd,
+          wrappedTools: ALL_PI_REMOTE_TOOLS,
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
+          details,
+        } as any;
+      } catch (err) {
+        state.selected = false;
+        state.connectionError = err instanceof Error ? err.message : String(err);
+        delete process.env[PI_REMOTE_INHERIT_ENV];
+        if (state.client) {
+          state.client.kill();
+          state.client = undefined;
+        }
+        throw err;
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "remote_exit",
+    label: "Remote Exit",
+    description:
+      "Disconnect Pi Agent from the remote runtime and restore local native tools.",
+    parameters: {} as unknown as Record<string, unknown>,
+    execute: async (_id: string, _params: unknown, _signal?: AbortSignal, _onUpdate?: unknown, ctx?: ExtensionContext) => {
+      if (!state.selected && !state.client) {
+        return {
+          content: [{ type: "text", text: "Remote runtime is already disconnected; local tools active." }],
+          details: { success: true, mode: "local" },
+        } as any;
+      }
+      state.selected = false;
+      state.cwd = undefined;
+      state.connectOptions = undefined;
+      state.connectionError = undefined;
+      delete process.env[PI_REMOTE_INHERIT_ENV];
+      if (state.client) {
+        await state.client.close();
+        state.client = undefined;
+      }
+      const reloadFn = (ctx as unknown as { reload?: () => Promise<void> })?.reload;
+      if (typeof reloadFn === "function") {
+        await reloadFn();
+      }
+      ctx?.ui?.notify?.("Disconnected from remote runtime. Local tools restored.", "info");
+      return {
+        content: [{ type: "text", text: "Disconnected from remote runtime. Local tools restored." }],
+        details: { success: true, mode: "local" },
+      } as any;
+    },
+  });
   // Register remote commands
   pi.registerCommand("remote-connect", {
     description: "Connect Pi Agent to a remote host over SSH",

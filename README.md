@@ -179,16 +179,25 @@ Routing rules:
 - an `ast_edit` proposal and its later resolve or reject action always return to the same `ToolSession`;
 - remote eval exposes only constrained remote workspace helpers, not local control-plane tools.
 
-### Agent workspace status
+### Agent Workspace Control Tools
 
-`remote_workspace_status` is a zero-argument, read-only tool available to the agent. It reports the extension's current known state without a network request:
+In addition to user slash commands (`/remote-connect`, `/remote-status`, `/remote-exit`), OMP SSH Remote exposes three callable tools for the agent:
 
-- `local`: ordinary filesystem paths use local native tools;
-- `remote`: ordinary filesystem paths use the named remote cwd and native remote tools;
-- `unavailable`: remote mode remains selected, but ordinary filesystem paths are rejected rather than falling back locally.
+1. **`remote_workspace_status`** (Read-only status):
+   Reports the extension's current known execution domain (`local`, `remote`, or `unavailable`), remote cwd, wrapped tools, and routing boundaries without sending a network probe.
 
-The result also lists the currently wrapped remote tools, the session role, pending remote AST proposals, and the fixed local boundary for URI resources and control-plane tools. The agent can call it when execution location is unclear, after a remote error, or when asked where a tool will run. It is not called automatically and does not ping SSH; `/remote-status` remains the user-facing view of the current known transport state.
+2. **`remote_connect`** (Active connection tool):
+   Enables the model to actively initiate a remote runtime connection over SSH based on natural language instructions.
+   - Parameters:
+     - `target` (string, required): SSH alias or `user@host`;
+     - `cwd` (string, optional): Remote working directory (defaults to remote `$HOME`);
+     - `identity` (string, optional): Private key path;
+     - `port` (number, optional): SSH port.
 
+3. **`remote_exit`** (Active disconnection tool):
+   Enables the model to cleanly disconnect from the remote runtime upon task completion and restore local native tools.
+   - Parameters:
+     - `force` (boolean, optional): Force disconnect even if subagents are active.
 ## Current Support
 
 ### Verified

@@ -630,6 +630,147 @@ export default async function remoteRuntimeExtension(
     },
   });
 
+  pi.registerTool({
+    name: "remote_connect",
+    label: "Remote Connect",
+    description:
+      "Connect native workspace tools to a remote OMP runtime over SSH. Target can be an SSH alias or user@host. When cwd is omitted, defaults to remote $HOME. Transparently routes workspace tools (read, write, edit, bash, grep, glob, lsp, eval, debug) to the remote host.",
+    parameters: z.object({
+      target: z.string().describe("SSH host alias or user@host target"),
+      cwd: z.string().optional().describe("Remote working directory (defaults to remote $HOME if omitted)"),
+      identity: z.string().optional().describe("Private key file path"),
+      port: z.number().int().positive().optional().describe("SSH port number"),
+    }),
+    loadMode: "essential",
+    approval: "exec",
+    async execute(_id, params: unknown, _signal, _onUpdate, ctx) {
+      if (state.selected) {
+        throw new Error("A remote runtime is already selected; call remote_exit first");
+      }
+      const p = asRecord(params);
+      const target = typeof p.target === "string" ? p.target : "";
+      if (!target) {
+        throw new Error("Missing required 'target' parameter (SSH alias or user@host)");
+      }
+      const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+      if (!sessionFile) {
+        throw new Error("Remote runtime requires a persisted OMP session so subagents can inherit safely");
+      }
+      const normalizedSessionFile = resolvePath(sessionFile);
+      if (REMOTE_FAMILIES.has(normalizedSessionFile)) {
+        throw new Error("This session already owns a remote runtime family");
+      }
+      const localCwd = ctx?.cwd ?? process.cwd();
+      const configuredHosts = await loadConfiguredSshHosts(localCwd);
+
+      const rawArgs = [target];
+      if (typeof p.cwd === "string") rawArgs.push(p.cwd);
+      if (typeof p.identity === "string") rawArgs.push("--identity", p.identity);
+      if (typeof p.port === "number") rawArgs.push("--port", String(p.port));
+
+      const request = parseConnectArgs(rawArgs.join(" "), configuredHosts);
+      let next: RemoteRuntimeClient | undefined;
+      try {
+        const prepared = await prepareRemoteWorker(request);
+        const remoteCwd: string =
+          request.cwd ?? prepared.home ?? (await resolveRemoteHome(request));
+        const options: RemoteConnectOptions = { ...request, cwd: remoteCwd };
+        const connection = {
+          ...options,
+          workerPath: prepared.workerPath,
+        };
+        next = new RemoteRuntimeClient({
+          command: buildSshWorkerCommand(connection),
+        });
+        const ready = await next.initialize(options.cwd);
+        const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
+        const family: RemoteFamily = {
+          ownerSessionFile: normalizedSessionFile,
+          root: sessionFamilyRoot(normalizedSessionFile),
+          localCwd,
+          remoteCwd: resolvedRemoteCwd,
+          connection,
+          members: new Set([state]),
+          closing: false,
+        };
+        state.client = next;
+        state.remoteCwd = resolvedRemoteCwd;
+        state.localCwd = localCwd;
+        state.sessionFile = normalizedSessionFile;
+        state.selected = true;
+        state.owner = true;
+        state.family = family;
+        state.connectionError = undefined;
+        REMOTE_FAMILIES.set(normalizedSessionFile, family);
+        registerActiveWrappers(pi, state);
+        ctx?.ui?.setStatus?.("remote-runtime", `ssh ${request.displayTarget}:${ready.cwd}`);
+        ctx?.ui?.notify?.(`Remote runtime connected: ${request.displayTarget}:${ready.cwd}`, "info");
+        const details = {
+          success: true,
+          mode: "remote",
+          target: request.displayTarget,
+          remoteCwd: resolvedRemoteCwd,
+          wrappedTools: [...state.wrappedTools],
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
+          details,
+        };
+      } catch (error) {
+        next?.kill();
+        throw error;
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "remote_exit",
+    label: "Remote Exit",
+    description:
+      "Disconnect the active remote runtime and restore local native tools. Pass force: true to disconnect even if subagents or pending proposals exist.",
+    parameters: z.object({
+      force: z.boolean().optional().describe("Force disconnect even if subagents are active or proposals pending"),
+    }),
+    loadMode: "essential",
+    approval: "exec",
+    async execute(_id, params: unknown, _signal, _onUpdate, ctx) {
+      const p = asRecord(params);
+      const force = p.force === true;
+      if (!state.selected) {
+        return {
+          content: [{ type: "text", text: "Remote runtime is already disconnected; workspace tools are local." }],
+          details: { success: true, mode: "local" },
+        };
+      }
+      if (!state.owner) {
+        throw new Error("Only the owning OMP session can disconnect the remote runtime family");
+      }
+      const family = state.family;
+      if (!family) throw new Error("Remote runtime family state is missing");
+      if (!force) {
+        const remoteProposalCount = [...family.members].reduce(
+          (count, member) =>
+            count +
+            member.proposalSources.filter((source) => source === "remote").length,
+          0,
+        );
+        if (remoteProposalCount > 0) {
+          throw new Error("Remote staged proposals are pending; resolve/reject them first, or pass force: true");
+        }
+        if (family.members.size > 1) {
+          throw new Error("Remote subagent sessions are still active; wait for them or pass force: true");
+        }
+      }
+      await closeRemoteFamily(family);
+      ctx?.ui?.setStatus?.("remote-runtime", undefined);
+      ctx?.ui?.notify?.("Disconnected from remote runtime; workspace tools restored to local", "info");
+      return {
+        content: [{ type: "text", text: "Disconnected from remote runtime; workspace tools restored to local." }],
+        details: { success: true, mode: "local" },
+      };
+    },
+  });
+
   pi.registerCommand("remote-connect", {
     description: "Connect native workspace tools to a remote OMP runtime",
     async handler(args, ctx) {

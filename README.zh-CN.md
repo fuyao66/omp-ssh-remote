@@ -179,16 +179,25 @@ flowchart LR
 - `ast_edit` proposal 及其之后的 resolve/reject 始终返回同一个 `ToolSession`；
 - 远端 eval 只能调用受限的远端工作区 helper，不能访问本机控制面工具。
 
-### Agent 工作区状态
+### Agent 远端工作区控制工具
 
-`remote_workspace_status` 是 agent 可按需调用的零参数只读工具。它不发网络请求，只报告 extension 当前已知的状态：
+除用户的斜杠命令（`/remote-connect`、`/remote-status`、`/remote-exit`）之外，插件还向模型 Agent 暴露了三个可调用的主动控制工具：
 
-- `local`：普通文件路径使用本机原生工具；
-- `remote`：普通文件路径在指定的远端 cwd 中使用远端原生工具；
-- `unavailable`：远端模式仍被选中，但普通文件路径会被拒绝，绝不回退到本机。
+1. **`remote_workspace_status`**（只读状态查询）：
+   报告当前已知的执行域（`local`、`remote`、`unavailable`）、远端工作目录、包装工具表与路由边界，不发送网络探测。
 
-结果还会列出当前被包装的远端工具、session 角色、待处理的远端 AST proposal，以及 URI resource 和控制面工具始终留在本机的边界。agent 可在执行位置不明确、远端工具报错后，或被问及某工具在哪里执行时调用它。它不会自动调用，也不会 ping SSH；`/remote-status` 仍是用户查看当前已知 transport 状态的命令。
+2. **`remote_connect`**（主动连接工具）：
+   允许模型根据用户的自然语言指令（如 *“帮我连上 trialsfinder 跑一下测试”*）主动发起 SSH 远端连接。
+   - 参数：
+     - `target`（字符串，必填）：SSH 别名或 `user@host`；
+     - `cwd`（字符串，选填）：远端工作目录（省略时默认为远端 `$HOME`）；
+     - `identity`（字符串，选填）：私钥路径；
+     - `port`（数字，选填）：SSH 端口号。
 
+3. **`remote_exit`**（主动断开工具）：
+   允许模型在完成远程任务后主动断开 SSH 连接并优雅关闭 Worker，将工作区工具无损恢复至本地。
+   - 参数：
+     - `force`（布尔值，选填）：即使有活跃子代理也强制断开。
 ## 当前支持范围
 
 ### 已验证

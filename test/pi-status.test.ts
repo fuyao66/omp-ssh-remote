@@ -57,4 +57,28 @@ describe("Pi Remote Workspace Status & AFT Remote Forwarding", () => {
     expect(status.connectionError).toBe("SSH connection timed out");
     expect(status.routing.ordinaryFilesystemPaths).toContain("fail-closed");
   });
+
+  test("Pi extension registers remote_connect, remote_exit, and remote_workspace_status tools", async () => {
+    const { default: piRemoteExtension } = await import("../src/pi-extension.ts");
+    const tools = new Map<string, any>();
+    const commands = new Map<string, any>();
+    const mockPi = {
+      registerTool(tool: any) {
+        tools.set(tool.name, tool);
+      },
+      registerCommand(name: string, cmd: any) {
+        commands.set(name, cmd);
+      },
+    };
+    await piRemoteExtension(mockPi as any);
+    expect(tools.has("remote_workspace_status")).toBe(true);
+    expect(tools.has("remote_connect")).toBe(true);
+    expect(tools.has("remote_exit")).toBe(true);
+    expect(commands.has("remote-connect")).toBe(true);
+    expect(commands.has("remote-exit")).toBe(true);
+    expect(commands.has("remote-status")).toBe(true);
+
+    const exitRes = await tools.get("remote_exit").execute("id-1", {}, undefined, undefined, {});
+    expect(exitRes.details).toEqual({ success: true, mode: "local" });
+  });
 });
