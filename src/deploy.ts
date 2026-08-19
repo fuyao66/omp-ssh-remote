@@ -1,7 +1,8 @@
 import { access, readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { OMP_VERSION } from "./protocol.ts";
 import {
   buildScpBaseCommand,
@@ -101,19 +102,23 @@ export const SUPPORTED_PLATFORMS: Record<string, "arm64" | "x64"> = {
   "Linux/aarch64": "arm64",
   "Linux/x86_64": "x64",
 };
+const MODULE_DIR =
+  typeof import.meta.dir === "string"
+    ? import.meta.dir
+    : dirname(fileURLToPath(import.meta.url));
 
 function resolveLocalWorkerPath(arch: "arm64" | "x64", host: "omp" | "pi" = "omp"): string[] {
   const prefix = host === "pi" ? "pi-worker-linux-" : "worker-linux-";
   return [
-    join(import.meta.dir, `${prefix}${arch}`),
-    join(import.meta.dir, `../dist/${prefix}${arch}`),
+    join(MODULE_DIR, `${prefix}${arch}`),
+    join(MODULE_DIR, `../dist/${prefix}${arch}`),
   ];
 }
 export function resolveLocalAftPath(arch: "arm64" | "x64"): string[] {
   const dirName = arch === "arm64" ? "aft-arm64" : "aft";
   const userHome = process.env.HOME || "/root";
   return [
-    join(import.meta.dir, `../vendor/${dirName}/bin/aft`),
+    join(MODULE_DIR, `../vendor/${dirName}/bin/aft`),
     join(userHome, `.pi/agent/npm/node_modules/@cortexkit/aft-linux-${arch}/bin/aft`),
     join(userHome, `.omp/node_modules/@cortexkit/aft-linux-${arch}/bin/aft`),
   ];
