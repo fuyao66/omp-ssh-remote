@@ -1,6 +1,12 @@
 import { readFile } from "node:fs/promises";
-import { getSSHConfigPath } from "@oh-my-pi/pi-utils/dirs";
+import { join } from "node:path";
 
+function getSSHConfigPath(scope: "project" | "user", cwd = process.cwd()): string {
+  const home = process.env.HOME || "/root";
+  return scope === "project"
+    ? join(cwd, ".omp/ssh.json")
+    : join(home, ".omp/agent/ssh.json");
+}
 export type RemoteConnectRequest = {
   target: string;
   displayTarget: string;
@@ -82,29 +88,27 @@ function normalizeHost(
       ? { keyPath: optionalString(raw.keyPath ?? raw.key) }
       : {}),
   };
-}
+};
 
 async function readHostFile(path: string): Promise<ConfiguredSshHost[]> {
   let text: string;
   try {
     text = await readFile(path, "utf8");
   } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return [];
-    }
-    throw error;
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT"))
+      throw error;
+    return [];
   }
-
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch (error) {
     throw new Error(
-      `Failed to parse OMP SSH config ${path}: ${error instanceof Error ? error.message : String(error)}`,
+      `Failed to parse OMP SSH config JSON at ${path}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error(`Invalid OMP SSH config: ${path}`);
+    throw new Error(`Invalid JSON root in OMP SSH config: ${path}`);
   }
   const hosts = (parsed as { hosts?: unknown }).hosts;
   if (hosts === undefined) return [];
@@ -115,13 +119,53 @@ async function readHostFile(path: string): Promise<ConfiguredSshHost[]> {
     normalizeHost(name, value, path),
   );
 }
+async function readSshConfigFile(configPath: string): Promise<ConfiguredSshHost[]> {
+  try {
+    const text = await readFile(configPath, "utf8");
+    const hosts: ConfiguredSshHost[] = [];
+    let currentHost: Partial<ConfiguredSshHost> | null = null;
+
+    for (const rawLine of text.split("\n")) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const parts = line.split(/\s+/);
+      const key = parts[0]?.toLowerCase();
+      const val = parts.slice(1).join(" ");
+
+      if (key === "host") {
+        if (currentHost?.name && currentHost.host) {
+          hosts.push(currentHost as ConfiguredSshHost);
+        }
+        if (val && !val.includes("*") && !val.includes("?")) {
+          currentHost = { name: val, host: val };
+        } else {
+          currentHost = null;
+        }
+      } else if (currentHost) {
+        if (key === "hostname") currentHost.host = val;
+        else if (key === "user") currentHost.username = val;
+        else if (key === "port") currentHost.port = parsePort(val);
+        else if (key === "identityfile") currentHost.keyPath = val.replace(/^~/, process.env.HOME || "");
+      }
+    }
+    if (currentHost?.name && currentHost.host) {
+      hosts.push(currentHost as ConfiguredSshHost);
+    }
+    return hosts;
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT"))
+      throw error;
+    return [];
+  }
+}
 
 export function mergeConfiguredSshHosts(
   projectHosts: readonly ConfiguredSshHost[],
   userHosts: readonly ConfiguredSshHost[],
+  sshConfigHosts: readonly ConfiguredSshHost[] = [],
 ): ConfiguredSshHost[] {
   const merged = new Map<string, ConfiguredSshHost>();
-  for (const host of [...projectHosts, ...userHosts]) {
+  for (const host of [...projectHosts, ...userHosts, ...sshConfigHosts]) {
     if (!merged.has(host.name)) merged.set(host.name, host);
   }
   return [...merged.values()];
@@ -130,11 +174,13 @@ export function mergeConfiguredSshHosts(
 export async function loadConfiguredSshHosts(
   cwd: string,
 ): Promise<ConfiguredSshHost[]> {
-  const [projectHosts, userHosts] = await Promise.all([
+  const home = process.env.HOME || "/root";
+  const [projectHosts, userHosts, sshConfigHosts] = await Promise.all([
     readHostFile(getSSHConfigPath("project", cwd)),
     readHostFile(getSSHConfigPath("user", cwd)),
+    readSshConfigFile(`${home}/.ssh/config`),
   ]);
-  return mergeConfiguredSshHosts(projectHosts, userHosts);
+  return mergeConfiguredSshHosts(projectHosts, userHosts, sshConfigHosts);
 }
 
 export function parseConnectArgs(
