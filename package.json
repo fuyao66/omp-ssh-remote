@@ -11,14 +11,20 @@
     "README.zh-CN.md"
   ],
   "scripts": {
+    "build": "bun scripts/build.ts",
     "build:worker:arm64": "bun scripts/compile-worker.ts arm64",
     "build:worker:x64": "bun scripts/compile-worker.ts x64",
     "build:worker:all": "bun scripts/compile-worker.ts arm64 && bun scripts/compile-worker.ts x64",
+    "build:pi:arm64": "bun scripts/compile-pi-worker.ts arm64",
+    "build:pi:x64": "bun scripts/compile-pi-worker.ts x64",
+    "build:pi:all": "bun scripts/compile-pi-worker.ts arm64 && bun scripts/compile-pi-worker.ts x64",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "check": "bun run typecheck && bun run build && bun test"
   },
   "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
     "@oh-my-pi/pi-coding-agent": "17.3.3"
   },
   "devDependencies": {
@@ -32,7 +38,7 @@
   },
   "pi": {
     "extensions": [
-      "./dist/extension.js"
+      "./dist/pi-extension.js"
     ]
   }
 }

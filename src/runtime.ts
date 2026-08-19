@@ -135,7 +135,7 @@ export async function createNativeWorkerRuntime(
       tools: xdevTools,
       mountedNames: xdevMountedNames,
       builtInNames: new Set(xdevMountedNames),
-      isActive: (name) => REMOTE_TOOL_NAMES.includes(name as RemoteToolName),
+      isActive: (name) => REMOTE_TOOL_NAMES.includes(name as (typeof REMOTE_TOOL_NAMES)[number]),
     } as NonNullable<ToolSession["xdev"]>,
     getFileMutationVersion: (path) => mutationVersions.get(path) ?? 0,
     bumpFileMutationVersion: (path) => {
@@ -143,7 +143,7 @@ export async function createNativeWorkerRuntime(
       mutationVersions.set(path, next);
       return next;
     },
-    isToolActive: (name) => REMOTE_TOOL_NAMES.includes(name as RemoteToolName),
+    isToolActive: (name) => REMOTE_TOOL_NAMES.includes(name as (typeof REMOTE_TOOL_NAMES)[number]),
     getToolByName: (name) =>
       callableTools.get(name) as unknown as ReturnType<
         NonNullable<ToolSession["getToolByName"]>

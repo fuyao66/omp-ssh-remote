@@ -1,11 +1,18 @@
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+function asRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error(`Protocol field ${label} must be an object`);
+  }
+  return value;
+}
 export const PROTOCOL_VERSION = 1 as const;
 export const TOOL_RUNTIME_VERSION = "0.3.0" as const;
 export const OMP_VERSION = "17.3.3" as const;
+export const PI_VERSION = "0.84.2" as const;
+export const PI_TOOL_RUNTIME_VERSION = "0.1.0" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
-
 export const REMOTE_TOOL_NAMES = [
   "read",
   "write",
@@ -20,11 +27,27 @@ export const REMOTE_TOOL_NAMES = [
   "debug",
 ] as const;
 export type RemoteToolName = (typeof REMOTE_TOOL_NAMES)[number];
-
+export type PiRemoteToolName = "read" | "write" | "edit" | "bash" | "grep" | "find" | "ls";
+export type AftRemoteToolName =
+  | "aft_inspect"
+  | "aft_outline"
+  | "aft_zoom"
+  | "aft_callgraph"
+  | "aft_semantic"
+  | "aft_conflicts"
+  | "aft_navigate"
+  | "aft_import"
+  | "aft_safety"
+  | "aft_undo"
+  | "ast_grep_search"
+  | "ast_grep_replace";
+export type AnyRemoteToolName = RemoteToolName | "find" | "ls" | AftRemoteToolName;
 export type InitializeRequest = {
   type: "initialize";
   protocolVersion: number;
-  ompVersion: string;
+  host?: "omp" | "pi";
+  ompVersion?: string;
+  hostVersion?: string;
   runtimeVersion: string;
   cwd: string;
   tools: string[];
@@ -34,7 +57,7 @@ export type ExecuteRequest = {
   type: "execute";
   id: string;
   toolCallId: string;
-  tool: RemoteToolName;
+  tool: AnyRemoteToolName;
   args: Record<string, unknown>;
 };
 
@@ -52,10 +75,14 @@ export type ToolManifest = {
 export type ReadyMessage = {
   type: "ready";
   protocolVersion: number;
-  ompVersion: string;
-  runtimeVersion: string;
-  cwd: string;
+  host?: "omp" | "pi";
+  ompVersion?: string;
+  hostVersion?: string;
+  toolRuntimeVersion?: string;
+  runtimeVersion?: string;
+  cwd?: string;
   tools: ToolManifest[];
+  capabilities?: Record<string, unknown>;
 };
 
 export type UpdateMessage = { type: "update"; id: string; result: unknown };
@@ -82,15 +109,31 @@ function numberField(value: Record<string, unknown>, key: string): number {
   return field;
 }
 
-function parseJsonObject(line: string): Record<string, unknown> {
-  const value: unknown = JSON.parse(line);
-  if (!isRecord(value)) throw new Error("Protocol message must be an object");
-  return value;
+function isAnyRemoteToolName(name: unknown): name is AnyRemoteToolName {
+  if (typeof name !== "string") return false;
+  return (
+    REMOTE_TOOL_NAMES.includes(name as RemoteToolName) ||
+    name === "find" ||
+    name === "ls" ||
+    name === "aft_inspect" ||
+    name === "aft_outline" ||
+    name === "aft_zoom" ||
+    name === "aft_callgraph" ||
+    name === "aft_semantic" ||
+    name === "aft_conflicts" ||
+    name === "aft_navigate" ||
+    name === "aft_import" ||
+    name === "aft_safety" ||
+    name === "aft_undo" ||
+    name === "ast_grep_search" ||
+    name === "ast_grep_replace"
+  );
 }
 
-export function parseRequest(line: string): Request {
-  const value = parseJsonObject(line);
-  const type = stringField(value, "type");
+export function parseRequest(raw: unknown): Request {
+  const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+  const value = asRecord(parsed, "Request");
+  const type = value.type;
   if (type === "initialize") {
     const tools = value.tools;
     if (
@@ -102,24 +145,24 @@ export function parseRequest(line: string): Request {
     return {
       type,
       protocolVersion: numberField(value, "protocolVersion"),
-      ompVersion: stringField(value, "ompVersion"),
+      ...(typeof value.host === "string" ? { host: value.host as "omp" | "pi" } : {}),
+      ...(typeof value.ompVersion === "string" ? { ompVersion: value.ompVersion } : {}),
+      ...(typeof value.hostVersion === "string" ? { hostVersion: value.hostVersion } : {}),
       runtimeVersion: stringField(value, "runtimeVersion"),
       cwd: stringField(value, "cwd"),
       tools,
     };
   }
   if (type === "execute") {
-    const tool = stringField(value, "tool");
-    if (!REMOTE_TOOL_NAMES.includes(tool as RemoteToolName))
-      throw new Error(`Unknown remote tool: ${tool}`);
-    if (!isRecord(value.args))
-      throw new Error("Protocol field args must be an object");
+    if (!isAnyRemoteToolName(value.tool)) {
+      throw new Error(`Unknown remote tool: ${String(value.tool)}`);
+    }
     return {
       type,
       id: stringField(value, "id"),
       toolCallId: stringField(value, "toolCallId"),
-      tool: tool as RemoteToolName,
-      args: value.args,
+      tool: value.tool,
+      args: asRecord(value.args, "args"),
     };
   }
   if (type === "cancel") return { type, id: stringField(value, "id") };
@@ -128,7 +171,7 @@ export function parseRequest(line: string): Request {
 }
 
 export function parseMessage(line: string): Message {
-  const value = parseJsonObject(line);
+  const value = asRecord(JSON.parse(line), "Message");
   const type = stringField(value, "type");
   if (type === "ready") {
     if (!Array.isArray(value.tools))
@@ -144,10 +187,14 @@ export function parseMessage(line: string): Message {
     return {
       type,
       protocolVersion: numberField(value, "protocolVersion"),
-      ompVersion: stringField(value, "ompVersion"),
-      runtimeVersion: stringField(value, "runtimeVersion"),
-      cwd: stringField(value, "cwd"),
+      ...(typeof value.host === "string" ? { host: value.host as "omp" | "pi" } : {}),
+      ...(typeof value.ompVersion === "string" ? { ompVersion: value.ompVersion } : {}),
+      ...(typeof value.hostVersion === "string" ? { hostVersion: value.hostVersion } : {}),
+      ...(typeof value.runtimeVersion === "string" ? { runtimeVersion: value.runtimeVersion } : {}),
+      ...(typeof value.toolRuntimeVersion === "string" ? { toolRuntimeVersion: value.toolRuntimeVersion } : {}),
+      ...(typeof value.cwd === "string" ? { cwd: value.cwd } : {}),
       tools,
+      ...(isRecord(value.capabilities) ? { capabilities: value.capabilities } : {}),
     };
   }
   if (type === "update" || type === "result") {

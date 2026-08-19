@@ -17,6 +17,7 @@ import {
   type ExecuteRequest,
   type InitializeRequest,
   type Message,
+  type RemoteToolName,
   type Request,
 } from "./protocol.ts";
 
@@ -123,11 +124,19 @@ async function initialize(request: InitializeRequest): Promise<void> {
 }
 
 function startExecute(request: ExecuteRequest): void {
-  if (!runtime) throw new Error("Worker is not initialized");
-  const tool = runtime.tools[request.tool];
-  if (!tool) throw new Error(`Remote tool is unavailable: ${request.tool}`);
-  if (active.has(request.id)) throw new Error(`Duplicate request id: ${request.id}`);
-
+  const toolName = request.tool as RemoteToolName;
+  const tool = runtime?.tools[toolName];
+  if (!tool) {
+    send({
+      type: "error",
+      id: request.id,
+      error: {
+        name: "UnknownTool",
+        message: `Tool not found on remote runtime: ${request.tool}`,
+      },
+    });
+    return;
+  }
   const controller = new AbortController();
   const done = (async () => {
     try {
@@ -135,7 +144,7 @@ function startExecute(request: ExecuteRequest): void {
         request.toolCallId,
         request.args,
         controller.signal,
-        partial => send({ type: "update", id: request.id, result: partial }),
+        (partial: unknown) => send({ type: "update", id: request.id, result: partial }),
         undefined,
       );
       send({ type: "result", id: request.id, result });

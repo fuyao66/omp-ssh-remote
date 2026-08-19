@@ -1,11 +1,14 @@
 import {
   OMP_VERSION,
+  PI_VERSION,
+  PI_TOOL_RUNTIME_VERSION,
   PROTOCOL_VERSION,
   REMOTE_TOOL_NAMES,
   TOOL_RUNTIME_VERSION,
   decodeFrames,
   encodeMessage,
   parseMessage,
+  type AnyRemoteToolName,
   type Message,
   type ReadyMessage,
   type RemoteToolName,
@@ -63,14 +66,23 @@ export class RemoteRuntimeClient {
     void this.#watchExit();
   }
 
-  async initialize(cwd: string, timeoutMs = 15_000): Promise<ReadyMessage> {
+  async initialize(
+    cwd: string,
+    timeoutMs = 15_000,
+    host: "omp" | "pi" = "omp",
+  ): Promise<ReadyMessage> {
+    const tools = host === "pi"
+      ? ["read", "write", "edit", "bash", "grep", "find", "ls"]
+      : [...REMOTE_TOOL_NAMES];
     this.#send({
       type: "initialize",
       protocolVersion: PROTOCOL_VERSION,
-      ompVersion: OMP_VERSION,
-      runtimeVersion: TOOL_RUNTIME_VERSION,
+      host,
+      ompVersion: host === "omp" ? OMP_VERSION : undefined,
+      hostVersion: host === "pi" ? PI_VERSION : OMP_VERSION,
+      runtimeVersion: host === "pi" ? PI_TOOL_RUNTIME_VERSION : TOOL_RUNTIME_VERSION,
       cwd,
-      tools: [...REMOTE_TOOL_NAMES],
+      tools,
     });
     try {
       const ready = await withTimeout(
@@ -78,18 +90,29 @@ export class RemoteRuntimeClient {
         timeoutMs,
         `Remote runtime initialization timed out after ${timeoutMs}ms`,
       );
-      if (
-        ready.protocolVersion !== PROTOCOL_VERSION ||
-        ready.ompVersion !== OMP_VERSION ||
-        ready.runtimeVersion !== TOOL_RUNTIME_VERSION
-      ) {
+      if (ready.protocolVersion !== PROTOCOL_VERSION) {
         throw new Error(
-          `Remote runtime version mismatch: protocol=${ready.protocolVersion}, OMP=${ready.ompVersion}, runtime=${ready.runtimeVersion}`,
+          `Remote runtime protocol mismatch: protocol=${ready.protocolVersion}`,
         );
       }
-      const available = new Set(ready.tools.map(tool => tool.name));
-      const missing = REMOTE_TOOL_NAMES.filter(name => !available.has(name));
-      if (missing.length > 0) throw new Error(`Remote runtime is missing tools: ${missing.join(", ")}`);
+      if (host === "omp") {
+        if (
+          ready.ompVersion !== OMP_VERSION ||
+          ready.runtimeVersion !== TOOL_RUNTIME_VERSION
+        ) {
+          throw new Error(
+            `Remote runtime version mismatch: protocol=${ready.protocolVersion}, OMP=${ready.ompVersion}, runtime=${ready.runtimeVersion}`,
+          );
+        }
+        const available = new Set(ready.tools.map(tool => tool.name));
+        const missing = REMOTE_TOOL_NAMES.filter(name => !available.has(name));
+        if (missing.length > 0) throw new Error(`Remote runtime is missing tools: ${missing.join(", ")}`);
+      } else {
+        const piTools = ["read", "write", "edit", "bash", "grep", "find", "ls"];
+        const available = new Set(ready.tools.map(tool => tool.name));
+        const missing = piTools.filter(name => !available.has(name));
+        if (missing.length > 0) throw new Error(`Remote Pi runtime is missing tools: ${missing.join(", ")}`);
+      }
       return ready;
     } catch (error) {
       this.#terminate(error);
@@ -98,7 +121,7 @@ export class RemoteRuntimeClient {
   }
 
   async execute(
-    tool: RemoteToolName,
+    tool: AnyRemoteToolName,
     toolCallId: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,

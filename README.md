@@ -100,9 +100,75 @@ Only tools already active in the host OMP session are shadowed. The extension do
 
 | Destination              | Capabilities                                                                                                                                    |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| Remote native runtime    | `read`, `write`, `edit`, `bash`, `grep`, `glob`, `lsp`, `ast_grep`, `ast_edit`, `eval`, `debug`                                                 |
+| Remote native runtime (OMP) | `read`, `write`, `edit`, `bash`, `grep`, `glob`, `lsp`, `ast_grep`, `ast_edit`, `eval`, `debug`                                                 |
+| Remote native runtime (Pi)  | `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`                                                                                          |
 | Local control plane      | TUI, sessions, model calls, credentials, Magic Context, memory, `ask`, `task`, `hub`, `todo`, browser/computer tools, web search, security scan |
 | Local internal resources | URI-backed resources such as `skill://`, `agent://`, `history://`, `artifact://`, `memory://`, and `local://`                                   |
+
+## Architecture & Dual Host Support
+
+OMP SSH Remote provides dedicated runtime pipelines for both **Oh My Pi (OMP)** and **Pi Agent**:
+
+### 1. OMP Architecture
+```mermaid
+flowchart LR
+    subgraph Local [Local OMP]
+        OMP[OMP Agent & TUI]
+        OMPExt[OMP Extension adapter]
+        OMP --> OMPExt
+    end
+
+    subgraph SSH1 [SSH Tunnel]
+        Tunnel1[SSH stdio ControlMaster]
+        OMPExt <--> Tunnel1
+    end
+
+    subgraph Remote1 [Remote Linux Host]
+        OMPWorker[OMP Companion Worker]
+        OMPNative[OMP 17.3.3 ToolSession]
+        OMPWorker --> OMPNative
+        OMPNative --> RemoteEnv1[(Remote Filesystem, LSP, Eval, Debug)]
+        Tunnel1 <--> OMPWorker
+    end
+```
+
+### 2. Pi Agent & Plugin Architecture
+```mermaid
+flowchart LR
+    subgraph LocalPi [Local Pi Agent]
+        Pi[Pi Agent]
+        PiPlugins[Pi Plugins: AFT, Subagents, Magic Context]
+        PiExt[Pi Extension adapter]
+        Pi --> PiPlugins --> PiExt
+    end
+
+    subgraph SSH2 [SSH Tunnel]
+        Tunnel2[SSH stdio ControlMaster]
+        PiExt <--> Tunnel2
+    end
+
+    subgraph Remote2 [Remote Linux Host]
+        PiWorker[Pi Companion Worker]
+        AFTBridge[AFT Bridge Client]
+        AFTEngine[Remote AFT Rust Engine]
+        PiTools[Pi 7 Core Tools]
+
+        Tunnel2 <--> PiWorker
+        PiWorker --> PiTools --> RemoteEnv2[(Remote Filesystem & Shell)]
+        PiWorker --> AFTBridge <--> AFTEngine --> RemoteAST[(Remote AST / Code Graph)]
+    end
+```
+
+## Pi Agent Plugin Adaptation Matrix
+
+| Plugin Name | Purpose | Remote Adaptation Strategy | Status |
+| :--- | :--- | :--- | :--- |
+| **`@cortexkit/aft-pi`** | AST Code Refactoring & Search | Full native remote support. Core 5 tools (`read`, `write`, `edit`, `bash`, `grep`) execute remotely; AFT-specific tools (`ast_grep_*`, `aft_outline`, `aft_zoom`, `aft_inspect`, `aft_callgraph`, etc.) are processed by a dedicated remote `aft` Rust engine. | **Fully Supported** (Remote AFT Engine) |
+| **`pi-subagents`** | Multi-Agent Orchestration | Subagents automatically inherit parent SSH connection parameters via process environment and spawn isolated remote companion workers over the existing tunnel. | **Supported** (Full remote auto-inheritance) |
+| **`@cortexkit/pi-magic-context`** | Persistent Agent Memory | Operates locally as part of the local control plane. Maintains persistent SQLite database on the local machine. | **Supported** (Local control plane) |
+| **`pi-web-access`** | Web Search & Scraping | Executes locally using local network and API credentials. | **Supported** (Local control plane) |
+| **`@juicesharp/rpiv-ask-user-question`** | User Interaction Modals | Renders interactive TUI prompts on the local terminal. | **Supported** (Local control plane) |
+| **UI Extensions** (`powerline`, `run-timer`, `gpt-fast-mode`, `ponytail`, `goal`) | Status Bars, Timers, Fast Mode | Operates locally in the Pi TUI layer. | **Supported** (Local UI layer) |
 
 Routing rules:
 

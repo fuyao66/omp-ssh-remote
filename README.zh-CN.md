@@ -98,11 +98,77 @@ flowchart LR
 
 extension 只替换宿主 OMP session 中原本已启用的工具，不会暴露用户配置中禁用的工具。
 
-| 执行位置         | 能力                                                                                                                           |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| 远端原生 runtime | `read`、`write`、`edit`、`bash`、`grep`、`glob`、`lsp`、`ast_grep`、`ast_edit`、`eval`、`debug`                                |
-| 本机控制面       | TUI、session、模型调用、凭据、Magic Context、memory、`ask`、`task`、`hub`、`todo`、browser/computer、web search、security scan |
-| 本机内部资源     | `skill://`、`agent://`、`history://`、`artifact://`、`memory://`、`local://` 等 URI resource                                   |
+| 目标端                   | 功能集合                                                                                                                                        |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| 远端原生运行时 (OMP)     | `read`、`write`、`edit`、`bash`、`grep`、`glob`、`lsp`、`ast_grep`、`ast_edit`、`eval`、`debug`                                                 |
+| 远端原生运行时 (Pi)      | `read`、`write`、`edit`、`bash`、`grep`、`find`、`ls`                                                                                          |
+| 本机控制面               | TUI、会话、模型调用、凭据、Magic Context、记忆、`ask`、`task`、`hub`、`todo`、浏览器/桌面工具、网络检索、安全扫描                               |
+| 本机内部资源             | 基于 URI 的内部资源，如 `skill://`、`agent://`、`history://`、`artifact://`、`memory://`、`local://`                                           |
+
+## 架构与双 Host 支持
+
+OMP SSH Remote 为 **Oh My Pi (OMP)** 与 **Pi Agent** 提供完全独立且针对性的运行时流水线：
+
+### 1. OMP 架构
+```mermaid
+flowchart LR
+    subgraph Local [本机 OMP]
+        OMP[OMP Agent 与 TUI]
+        OMPExt[OMP Extension 适配器]
+        OMP --> OMPExt
+    end
+
+    subgraph SSH1 [SSH 隧道]
+        Tunnel1[SSH stdio ControlMaster]
+        OMPExt <--> Tunnel1
+    end
+
+    subgraph Remote1 [远端 Linux 主机]
+        OMPWorker[OMP Companion Worker]
+        OMPNative[OMP 17.3.3 ToolSession]
+        OMPWorker --> OMPNative
+        OMPNative --> RemoteEnv1[(远端文件系统、LSP、Eval、Debug)]
+        Tunnel1 <--> OMPWorker
+    end
+```
+
+### 2. Pi Agent 与插件架构
+```mermaid
+flowchart LR
+    subgraph LocalPi [本机 Pi Agent]
+        Pi[Pi Agent]
+        PiPlugins[Pi 插件: AFT, Subagents, Magic Context]
+        PiExt[Pi Extension 适配器]
+        Pi --> PiPlugins --> PiExt
+    end
+
+    subgraph SSH2 [SSH 隧道]
+        Tunnel2[SSH stdio ControlMaster]
+        PiExt <--> Tunnel2
+    end
+
+    subgraph Remote2 [远端 Linux 主机]
+        PiWorker[Pi Companion Worker]
+        AFTBridge[AFT Bridge 客户端]
+        AFTEngine[远端常驻 AFT Rust 引擎]
+        PiTools[Pi 7 大核心工具]
+
+        Tunnel2 <--> PiWorker
+        PiWorker --> PiTools --> RemoteEnv2[(远端文件系统与 Shell)]
+        PiWorker --> AFTBridge <--> AFTEngine --> RemoteAST[(远端 AST 与代码图谱)]
+    end
+```
+
+## Pi 插件适配状态矩阵
+
+| 插件名称 | 功能定位 | 远端适配策略 | 状态 |
+| :--- | :--- | :--- | :--- |
+| **`@cortexkit/aft-pi`** | AST 代码重构与代码库搜索 | 完整原生远端支持。5 大基础工具（`read`, `write`, `edit`, `bash`, `grep`）远端执行；AFT 特有工具（`ast_grep_*`, `aft_outline`, `aft_zoom`, `aft_inspect`, `aft_callgraph` 等）由远端独立的 `aft` Rust 二进制引擎接管与分析。 | **完全适配**（远端 AFT 引擎） |
+| **`pi-subagents`** | 多 Agent 并发与子代理调度 | 子代理通过进程环境变量自动继承父进程的 SSH 连接配置，并在已有安全隧道上派生独立的远端 Companion Worker 并发执行。 | **已适配**（完整远端自动继承） |
+| **`@cortexkit/pi-magic-context`** | 智能持久记忆与上下文压缩 | 留在本机作为控制面运行，维护本地 SQLite 数据库与长期对话记忆。 | **已适配**（本机控制面） |
+| **`pi-web-access`** | 网络检索与网页抓取 | 留在本机执行，使用本地网络与 API 凭据。 | **已适配**（本机控制面） |
+| **`@juicesharp/rpiv-ask-user-question`** | 交互式提问弹窗 | 在本地终端渲染 TUI 弹框。 | **已适配**（本机控制面） |
+| **UI 扩展** (`powerline`, `run-timer`, `gpt-fast-mode`, `ponytail`, `goal`) | 状态栏、计时器、快速模式、目标管理 | 在本地 Pi TUI 层渲染。 | **已适配**（本机 UI 层） |
 
 路由规则：
 

@@ -28,6 +28,17 @@ const extension = await Bun.build({
 });
 if (!extension.success)
   throw new AggregateError(extension.logs, "Extension build failed");
+
+const piExtension = await Bun.build({
+  entrypoints: [resolve(root, "src/pi-extension.ts")],
+  outdir,
+  naming: "pi-extension.js",
+  target: "bun",
+  format: "esm",
+  minify: false,
+});
+if (!piExtension.success)
+  throw new AggregateError(piExtension.logs, "Pi Extension build failed");
 const worker = await Bun.build({
   entrypoints: [resolve(root, "src/worker.ts")],
   outdir,

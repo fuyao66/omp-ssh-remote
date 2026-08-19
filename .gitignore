@@ -5,3 +5,5 @@ dist/
 .DS_Store
 .cache/
 *.tgz
+vendor/aft/bin/aft
+vendor/aft-arm64/bin/aft

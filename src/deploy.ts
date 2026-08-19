@@ -66,18 +66,38 @@ export const SUPPORTED_PLATFORMS: Record<string, "arm64" | "x64"> = {
   "Linux/x86_64": "x64",
 };
 
-function resolveLocalWorkerPath(arch: "arm64" | "x64"): string[] {
+function resolveLocalWorkerPath(arch: "arm64" | "x64", host: "omp" | "pi" = "omp"): string[] {
+  const prefix = host === "pi" ? "pi-worker-linux-" : "worker-linux-";
   return [
-    join(import.meta.dir, `worker-linux-${arch}`),
-    join(import.meta.dir, `../dist/worker-linux-${arch}`),
+    join(import.meta.dir, `${prefix}${arch}`),
+    join(import.meta.dir, `../dist/${prefix}${arch}`),
   ];
+}
+export function resolveLocalAftPath(arch: "arm64" | "x64"): string[] {
+  const dirName = arch === "arm64" ? "aft-arm64" : "aft";
+  return [
+    join(import.meta.dir, `../vendor/${dirName}/bin/aft`),
+    `/home/fuyao/.pi/agent/npm/node_modules/@cortexkit/aft-linux-${arch}/bin/aft`,
+  ];
+}
+
+export async function resolveLocalAftBinary(arch: "arm64" | "x64"): Promise<string | undefined> {
+  const candidates = resolveLocalAftPath(arch);
+  for (const candidate of candidates) {
+    try {
+      await access(candidate);
+      return candidate;
+    } catch {}
+  }
+  return undefined;
 }
 
 async function resolveLocalWorker(
   arch: "arm64" | "x64",
   explicitPath?: string,
+  host: "omp" | "pi" = "omp",
 ): Promise<string> {
-  const candidates = explicitPath ? [explicitPath] : resolveLocalWorkerPath(arch);
+  const candidates = explicitPath ? [explicitPath] : resolveLocalWorkerPath(arch, host);
   for (const candidate of candidates) {
     try {
       await access(candidate);
@@ -145,29 +165,31 @@ export async function resolveRemoteHome(
 
 export async function prepareRemoteWorker(
   options: WorkerDeploymentOptions,
+  host: "omp" | "pi" = "omp",
 ): Promise<PreparedRemoteWorker> {
-  if (options.workerPath) return { workerPath: options.workerPath };
-  const probe = await run(
+  const probe = parseProbe(
+    await run(
     [
       ...buildSshBaseCommand(options),
       options.target,
-      `printf '%s\\n%s\\n%s\\n' "$(uname -s)" "$(uname -m)" "$HOME"`,
+      "uname -s && uname -m && printf '%s' \"$HOME\"",
     ],
-    "Remote platform probe",
+      "Probe remote host platform and home",
+    ),
   );
-  const { platform, home } = parseProbe(probe);
-  const arch = SUPPORTED_PLATFORMS[platform];
+  const arch = SUPPORTED_PLATFORMS[probe.platform];
   if (!arch) {
     throw new Error(
-      `No bundled worker for remote platform ${JSON.stringify(platform)}; supported: Linux/aarch64, Linux/x86_64`,
+      `Unsupported remote platform ${probe.platform}; supported: ${Object.keys(SUPPORTED_PLATFORMS).join(", ")}`,
     );
   }
-
-  const localWorker = await resolveLocalWorker(arch, options.localWorkerPath);
+  const localWorker = await resolveLocalWorker(arch, options.localWorkerPath, host);
   const hash = await readWorkerHash(localWorker);
-  const remoteDir = `${home}/.cache/omp-ssh-remote/${OMP_VERSION}/${hash}`;
-  const remoteWorker = `${remoteDir}/worker`;
-  const marker = `${remoteDir}/worker.sha256`;
+  const cacheDir = `${probe.home}/.cache/omp-ssh-remote`;
+  const workerFile = host === "pi" ? `pi-worker-linux-${arch}` : `worker-linux-${arch}`;
+  const remoteDir = `${cacheDir}/${host === "pi" ? "pi" : OMP_VERSION}/${hash}`;
+  const remoteWorker = `${remoteDir}/${workerFile}`;
+  const marker = `${remoteDir}/${workerFile}.sha256`;
   const quotedWorker = quoteRemoteArgument(remoteWorker);
   const quotedMarker = quoteRemoteArgument(marker);
   const exists = await run(
@@ -178,7 +200,13 @@ export async function prepareRemoteWorker(
     ],
     "Remote worker check",
   );
-  if (exists === "present") return { workerPath: remoteWorker, home };
+  if (exists === "present") {
+    // Check if AFT binary also needs deployment for Pi
+    if (host === "pi") {
+      await deployRemoteAftIfAvailable(options, probe.home, arch, remoteDir);
+    }
+    return { workerPath: remoteWorker, home: probe.home };
+  }
   if (exists !== "missing")
     throw new Error(`Unexpected remote worker check response: ${exists}`);
 
@@ -206,7 +234,69 @@ export async function prepareRemoteWorker(
     ],
     "Worker activation",
   );
-  return { workerPath: remoteWorker, home };
+  if (host === "pi") {
+    await deployRemoteAftIfAvailable(options, probe.home, arch, remoteDir);
+  }
+  return { workerPath: remoteWorker, home: probe.home };
+}
+
+async function deployRemoteAftIfAvailable(
+  options: WorkerDeploymentOptions,
+  home: string,
+  arch: "arm64" | "x64",
+  workerRemoteDir: string,
+): Promise<void> {
+  const localAft = await resolveLocalAftBinary(arch);
+  if (!localAft) return;
+
+  const aftHash = await readWorkerHash(localAft);
+  const remoteAftDir = `${home}/.cache/omp-ssh-remote/aft/${arch}/${aftHash}`;
+  const remoteAftBin = `${remoteAftDir}/aft`;
+  const quotedRemoteAftBin = quoteRemoteArgument(remoteAftBin);
+  const quotedWorkerDir = quoteRemoteArgument(workerRemoteDir);
+
+  const exists = await run(
+    [
+      ...buildSshBaseCommand(options),
+      options.target,
+      `test -x ${quotedRemoteAftBin} && printf present || printf missing`,
+    ],
+    "AFT binary check",
+  );
+
+  if (exists !== "present") {
+    await run(
+      [
+        ...buildSshBaseCommand(options),
+        options.target,
+        `mkdir -p ${quoteRemoteArgument(remoteAftDir)} && chmod 700 ${quoteRemoteArgument(remoteAftDir)}`,
+      ],
+      "AFT cache directory setup",
+    );
+    const nonce = crypto.randomUUID();
+    const tempUpload = `${remoteAftBin}.upload-${nonce}`;
+    const scp = buildScpBaseCommand(options);
+    scp.push(localAft, `${options.target}:${quoteRemoteArgument(tempUpload)}`);
+    await run(scp, "AFT binary upload");
+    await run(
+      [
+        ...buildSshBaseCommand(options),
+        options.target,
+        `set -eu; chmod 700 ${quoteRemoteArgument(tempUpload)}; mv -f ${quoteRemoteArgument(tempUpload)} ${quotedRemoteAftBin}`,
+      ],
+      "AFT binary activation",
+    );
+  }
+
+  // Symlink into the worker directory so Pi worker can find it as ./aft
+  await run(
+    [
+      ...buildSshBaseCommand(options),
+      options.target,
+      `ln -sf ${quotedRemoteAftBin} ${quotedWorkerDir}/aft`,
+    ],
+    "Link AFT binary to worker directory",
+  );
 }
 
 export async function ensureRemoteWorker(

@@ -53,17 +53,17 @@ const DEBUG_READONLY_ACTIONS = new Set([
   "sessions",
 ]);
 const TOOL_LABELS: Record<RemoteToolName, string> = {
-  read: "Read",
-  write: "Write",
-  edit: "Edit",
-  bash: "Bash",
-  grep: "Grep",
-  glob: "Glob",
-  lsp: "LSP",
-  ast_grep: "AST Grep",
-  ast_edit: "AST Edit",
-  eval: "Eval",
-  debug: "Debug",
+  read: "read",
+  write: "write",
+  edit: "edit",
+  bash: "bash",
+  grep: "grep",
+  glob: "glob",
+  lsp: "lsp",
+  ast_grep: "ast search",
+  ast_edit: "ast replace",
+  eval: "eval",
+  debug: "debug",
 };
 
 const REMOTE_WORKSPACE_STATUS_TOOL = "remote_workspace_status";
@@ -652,7 +652,7 @@ export default async function remoteRuntimeExtension(
       let next: RemoteRuntimeClient | undefined;
       try {
         const prepared = await prepareRemoteWorker(request);
-        const remoteCwd =
+        const remoteCwd: string =
           request.cwd ?? prepared.home ?? (await resolveRemoteHome(request));
         const options: RemoteConnectOptions = { ...request, cwd: remoteCwd };
         const connection = {
@@ -663,17 +663,18 @@ export default async function remoteRuntimeExtension(
           command: buildSshWorkerCommand(connection),
         });
         const ready = await next.initialize(options.cwd);
+        const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
           ownerSessionFile: normalizedSessionFile,
           root: sessionFamilyRoot(normalizedSessionFile),
           localCwd: ctx.cwd,
-          remoteCwd: ready.cwd,
+          remoteCwd: resolvedRemoteCwd,
           connection,
           members: new Set([state]),
           closing: false,
         };
         state.client = next;
-        state.remoteCwd = ready.cwd;
+        state.remoteCwd = resolvedRemoteCwd;
         state.localCwd = ctx.cwd;
         state.sessionFile = normalizedSessionFile;
         state.selected = true;
