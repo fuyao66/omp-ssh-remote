@@ -1,0 +1,10 @@
+{
+  "hosts": {
+    "trialsfinder": {
+      "host": "8.138.98.106",
+      "username": "root",
+      "port": 22,
+      "keyPath": "/home/fuyao/.ssh/trialsfinder_ed25519"
+    }
+  }
+}

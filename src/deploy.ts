@@ -75,9 +75,11 @@ function resolveLocalWorkerPath(arch: "arm64" | "x64", host: "omp" | "pi" = "omp
 }
 export function resolveLocalAftPath(arch: "arm64" | "x64"): string[] {
   const dirName = arch === "arm64" ? "aft-arm64" : "aft";
+  const userHome = process.env.HOME || "/root";
   return [
     join(import.meta.dir, `../vendor/${dirName}/bin/aft`),
-    `/home/fuyao/.pi/agent/npm/node_modules/@cortexkit/aft-linux-${arch}/bin/aft`,
+    join(userHome, `.pi/agent/npm/node_modules/@cortexkit/aft-linux-${arch}/bin/aft`),
+    join(userHome, `.omp/node_modules/@cortexkit/aft-linux-${arch}/bin/aft`),
   ];
 }
 
