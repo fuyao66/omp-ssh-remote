@@ -2,12 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createPiNativeWorkerRuntime } from "../src/pi-runtime.ts";
-import {
-  PI_TOOL_RUNTIME_VERSION,
-  PI_VERSION,
-  PROTOCOL_VERSION,
-} from "../src/protocol.ts";
+import { createPiAftWorkerRuntime } from "../src/pi/profiles/pi-aft-runtime.ts";
+import { PI_AFT_PROFILE } from "../src/pi/profiles/pi-aft.ts";
+import { PROTOCOL_VERSION } from "../src/protocol.ts";
 
 describe("Pi + AFT worker runtime", () => {
   test("exposes real Pi/AFT schemas and executes both runtimes", async () => {
@@ -16,12 +13,16 @@ describe("Pi + AFT worker runtime", () => {
       join(tempDir, "sample.ts"),
       "export interface Account { id: string; active: boolean }\n",
     );
-    const runtime = await createPiNativeWorkerRuntime(tempDir);
+    const runtime = await createPiAftWorkerRuntime(tempDir);
     try {
       expect(runtime.manifest.protocolVersion).toBe(PROTOCOL_VERSION);
       expect(runtime.manifest.host).toBe("pi");
-      expect(runtime.manifest.hostVersion).toBe(PI_VERSION);
-      expect(runtime.manifest.toolRuntimeVersion).toBe(PI_TOOL_RUNTIME_VERSION);
+      expect(runtime.manifest.hostVersion).toBe(
+        PI_AFT_PROFILE.handshake.hostVersion,
+      );
+      expect(runtime.manifest.toolRuntimeVersion).toBe(
+        PI_AFT_PROFILE.handshake.runtimeVersion,
+      );
 
       const manifests = new Map(
         runtime.manifest.tools.map((tool) => [tool.name, tool]),
@@ -41,7 +42,9 @@ describe("Pi + AFT worker runtime", () => {
         expect(manifests.get(name)?.parameters).toBeDefined();
       }
       expect(runtime.manifest.capabilities?.aftHostRuntime).toBe(
-        "@cortexkit/aft-pi@0.51.2",
+        PI_AFT_PROFILE.handshake.runtimeVersion === "0.1.0"
+          ? "@cortexkit/aft-pi@0.51.2"
+          : undefined,
       );
 
       const bashResult = (await runtime.execute({

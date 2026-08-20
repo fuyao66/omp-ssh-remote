@@ -1,17 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import {
-  AFT_REMOTE_TOOLS,
   MAX_FRAME_BYTES,
-  PI_NATIVE_TOOLS,
-  PI_TOOL_RUNTIME_VERSION,
-  PI_VERSION,
   PROTOCOL_VERSION,
   decodeFrames,
   parseMessage,
   parseRequest,
   type ReadyMessage,
 } from "../src/protocol.ts";
-import { validatePiReadyMessage } from "../src/client.ts";
+import {
+  PI_AFT_PROFILE,
+  PI_AFT_REMOTE_TOOLS,
+} from "../src/pi/profiles/pi-aft.ts";
 import {
   buildScpBaseCommand,
   buildSshWorkerCommand,
@@ -60,26 +59,32 @@ describe("Pi runtime manifest boundary", () => {
     type: "ready",
     protocolVersion: PROTOCOL_VERSION,
     host: "pi",
-    hostVersion: PI_VERSION,
-    toolRuntimeVersion: PI_TOOL_RUNTIME_VERSION,
-    tools: [...new Set([...PI_NATIVE_TOOLS, ...AFT_REMOTE_TOOLS])].map(
-      (name) => ({
-        name,
-        description: `${name} parameters`,
-        parameters: { type: "object", properties: {} },
-      }),
-    ),
-    capabilities: { aftHostRuntime: "@cortexkit/aft-pi@0.51.2" },
+    hostVersion: PI_AFT_PROFILE.handshake.hostVersion,
+    toolRuntimeVersion: PI_AFT_PROFILE.handshake.runtimeVersion,
+    tools: PI_AFT_REMOTE_TOOLS.map((name) => ({
+      name,
+      description: `${name} parameters`,
+      parameters: { type: "object", properties: {} },
+    })),
+    capabilities: {
+      profileId: PI_AFT_PROFILE.id,
+      profileVersion: PI_AFT_PROFILE.version,
+      aftHostRuntime: "@cortexkit/aft-pi@0.51.2",
+    },
   });
 
   test("accepts only the complete version-locked Pi and AFT surface", () => {
-    expect(() => validatePiReadyMessage(validReady())).not.toThrow();
+    expect(() =>
+      PI_AFT_PROFILE.handshake.validateReady(validReady()),
+    ).not.toThrow();
   });
 
   test("rejects missing, unknown, duplicate, and invalid-schema tools", () => {
     const missing = validReady();
     missing.tools = missing.tools.filter((tool) => tool.name !== "aft_outline");
-    expect(() => validatePiReadyMessage(missing)).toThrow("missing tools");
+    expect(() => PI_AFT_PROFILE.handshake.validateReady(missing)).toThrow(
+      "missing tools",
+    );
 
     const unknown = validReady();
     unknown.tools.push({
@@ -87,15 +92,19 @@ describe("Pi runtime manifest boundary", () => {
       description: "unexpected",
       parameters: { type: "object" },
     });
-    expect(() => validatePiReadyMessage(unknown)).toThrow("unsupported tool");
+    expect(() => PI_AFT_PROFILE.handshake.validateReady(unknown)).toThrow(
+      "unsupported tool",
+    );
 
     const duplicate = validReady();
     duplicate.tools.push(duplicate.tools[0]!);
-    expect(() => validatePiReadyMessage(duplicate)).toThrow("duplicate tool");
+    expect(() => PI_AFT_PROFILE.handshake.validateReady(duplicate)).toThrow(
+      "duplicate tool",
+    );
 
     const invalidSchema = validReady();
     invalidSchema.tools[0] = { ...invalidSchema.tools[0]!, parameters: {} };
-    expect(() => validatePiReadyMessage(invalidSchema)).toThrow(
+    expect(() => PI_AFT_PROFILE.handshake.validateReady(invalidSchema)).toThrow(
       "invalid parameter schema",
     );
   });

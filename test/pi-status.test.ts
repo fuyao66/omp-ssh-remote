@@ -3,7 +3,7 @@ import {
   buildPiWorkspaceStatus,
   getPiRemoteState,
   type PiRemoteExtensionState,
-} from "../src/pi-extension.ts";
+} from "../src/pi/host-extension.ts";
 import type { ReadyMessage } from "../src/protocol.ts";
 
 function readyWithTools(...names: string[]): ReadyMessage {
@@ -25,7 +25,8 @@ function readyWithTools(...names: string[]): ReadyMessage {
 afterEach(() => {
   const state = getPiRemoteState();
   state.selected = false;
-  state.client = undefined;
+  state.scope = undefined;
+  state.profile = undefined;
   state.cwd = undefined;
   state.connectOptions = undefined;
   state.connectionError = undefined;
@@ -46,7 +47,7 @@ describe("Pi remote workspace status", () => {
     const state: PiRemoteExtensionState = {
       selected: true,
       cwd: "/remote/project",
-      client: { isClosed: false } as never,
+      scope: { isClosed: false } as never,
       ownershipVerified: true,
       ready: readyWithTools("read", "find", "aft_outline", "bash_status"),
     };
@@ -58,15 +59,26 @@ describe("Pi remote workspace status", () => {
       "aft_outline",
       "bash_status",
     ]);
-    expect(status.aftTools).toEqual(["read", "aft_outline", "bash_status"]);
-    expect(status.routing.aftEngine).toContain("headless Pi Agent");
+    expect(status.profileToolGroups).toEqual([
+      {
+        id: "aft",
+        displayName: "AFT plugin runtime",
+        tools: ["read", "aft_outline", "bash_status"],
+      },
+      {
+        id: "pi-native",
+        displayName: "Pi native runtime",
+        tools: ["find"],
+      },
+    ]);
+    expect(status.routing.executionRuntime).toContain("headless Pi Agent");
   });
 
   test("fails closed until both transport and tool ownership are verified", () => {
     const status = buildPiWorkspaceStatus({
       selected: true,
       cwd: "/remote/project",
-      client: { isClosed: false } as never,
+      scope: { isClosed: false } as never,
       ownershipVerified: false,
       ready: readyWithTools("read"),
       connectionError: "read is owned by AFT before Pi SSH Remote",
@@ -77,7 +89,7 @@ describe("Pi remote workspace status", () => {
   });
 
   test("registers the three control tools and commands without remote wrappers locally", async () => {
-    const { default: extension } = await import("../src/pi-extension.ts");
+    const { default: extension } = await import("../src/pi/host-extension.ts");
     const tools = new Map<string, any>();
     const commands = new Map<string, any>();
     const handlers = new Map<string, any[]>();

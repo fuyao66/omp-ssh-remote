@@ -2,15 +2,17 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  AFT_REMOTE_TOOLS,
-  PI_NATIVE_TOOLS,
-  PI_TOOL_RUNTIME_VERSION,
-  PI_VERSION,
+  PI_AFT_PLUGIN_ID,
+  PI_AFT_PROFILE,
+  PI_AFT_NATIVE_TOOLS,
+  PI_AFT_REMOTE_TOOLS,
+} from "./pi-aft.ts";
+import {
   PROTOCOL_VERSION,
   type ExecuteRequest,
   type ReadyMessage,
   type ToolManifest,
-} from "./protocol.ts";
+} from "../../protocol.ts";
 import {
   DefaultResourceLoader,
   SessionManager,
@@ -26,9 +28,9 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import aftExtension from "@cortexkit/aft-pi";
-export { AFT_EXTENDED_TOOLS } from "./protocol.ts";
+export { PI_AFT_EXTENDED_TOOLS } from "./pi-aft.ts";
 
-export interface PiNativeWorkerRuntime {
+export interface PiAftWorkerRuntime {
   manifest: ReadyMessage;
   execute(
     request: ExecuteRequest,
@@ -54,10 +56,10 @@ function nativeToolMap(cwd: string): Map<string, ExecutableTool> {
   return tools;
 }
 
-export async function createPiNativeWorkerRuntime(
+export async function createPiAftWorkerRuntime(
   cwd: string,
   _settings: Record<string, unknown> = {},
-): Promise<PiNativeWorkerRuntime> {
+): Promise<PiAftWorkerRuntime> {
   const previousCwd = process.cwd();
   let agentDir: string | undefined;
   let session:
@@ -87,7 +89,7 @@ export async function createPiNativeWorkerRuntime(
       settingsManager,
       resourceLoader,
       sessionManager,
-      tools: [...new Set<string>([...PI_NATIVE_TOOLS, ...AFT_REMOTE_TOOLS])],
+      tools: [...PI_AFT_REMOTE_TOOLS],
     }));
     await session.bindExtensions({ mode: "print" });
   } catch (error) {
@@ -106,12 +108,12 @@ export async function createPiNativeWorkerRuntime(
 
   const nativeTools = nativeToolMap(cwd);
   const tools = new Map<string, ExecutableTool>();
-  for (const name of PI_NATIVE_TOOLS) {
+  for (const name of PI_AFT_NATIVE_TOOLS) {
     const tool =
       initializedSession.getToolDefinition(name) ?? nativeTools.get(name);
     if (tool) tools.set(name, tool);
   }
-  for (const name of AFT_REMOTE_TOOLS) {
+  for (const name of PI_AFT_REMOTE_TOOLS) {
     const tool = initializedSession.getToolDefinition(name);
     if (tool) tools.set(name, tool);
   }
@@ -124,12 +126,14 @@ export async function createPiNativeWorkerRuntime(
   const manifest: ReadyMessage = {
     type: "ready",
     protocolVersion: PROTOCOL_VERSION,
-    toolRuntimeVersion: PI_TOOL_RUNTIME_VERSION,
+    toolRuntimeVersion: PI_AFT_PROFILE.handshake.runtimeVersion,
     host: "pi",
-    hostVersion: PI_VERSION,
+    hostVersion: PI_AFT_PROFILE.handshake.hostVersion,
     cwd,
     tools: manifestTools,
     capabilities: {
+      profileId: PI_AFT_PROFILE.id,
+      profileVersion: PI_AFT_PROFILE.version,
       artifacts: false,
       lsp: false,
       ast: true,
@@ -138,7 +142,7 @@ export async function createPiNativeWorkerRuntime(
       sessionSpawns: "disabled",
       asyncBash: tools.has("bash_status"),
       remoteWorktrees: "disabled",
-      aftHostRuntime: "@cortexkit/aft-pi@0.51.2",
+      aftHostRuntime: PI_AFT_PLUGIN_ID,
     },
   };
 

@@ -26,6 +26,19 @@ flowchart LR
   AFT --> Workspace[Remote files, index, backups, and processes]
 ```
 
+## Profiles and Integrations
+
+The Pi host adapter is profile-neutral. A runtime profile owns its exact Pi/plugin versions, admitted tools and schemas, companion artifact bundle, tool groups, and lifecycle description. The shared workspace scope owns one companion connection and rejects tools outside the selected profile before transport.
+
+Currently supported:
+
+| Kind                     | ID             | Responsibility                                                                                                           |
+| ------------------------ | -------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Runtime profile          | `pi-aft`       | Pi `0.84.2`, AFT `0.51.2`, exact 19-tool manifest, x64/ARM64 worker and AFT artifacts                                    |
+| Orchestrator integration | `pi-subagents` | Pass the selected profile and connection specification to a child Pi process, which opens an independent companion scope |
+
+Other installed Pi plugins are not automatically copied, bundled, or remoteized. Model routing, credentials, memory, web access, ask/TUI, and UI extensions remain local. A new workspace plugin requires an explicit versioned profile; an orchestrator requires a separate scope integration. Remote workflow worktrees are not implemented.
+
 ## Profile Ownership
 
 Pi resolves duplicate extension tools first-wins and does not expose an OMP-style call-through to a superseded tool. Therefore this package must appear before `@cortexkit/aft-pi` in Pi settings.
@@ -125,13 +138,13 @@ AFT background Bash is supported through its native `bash_status`, `bash_watch`,
 
 Cached trial host measurements on Linux x86_64, persistent SSH ControlMaster, August 2026:
 
-| Operation | Result |
-| --- | --- |
-| cached worker/AFT deployment probe | `134.54 ms` |
-| headless Pi+AFT initialization | `1243.15 ms` |
-| read p50 / p95 | `19.05 / 48.59 ms` |
-| Bash p50 / p95 | `89.28 / 185.93 ms` |
-| AFT outline p50 / p95 | `18.96 / 49.25 ms` |
+| Operation                          | Result              |
+| ---------------------------------- | ------------------- |
+| cached worker/AFT deployment probe | `134.54 ms`         |
+| headless Pi+AFT initialization     | `1243.15 ms`        |
+| read p50 / p95                     | `19.05 / 48.59 ms`  |
+| Bash p50 / p95                     | `89.28 / 185.93 ms` |
+| AFT outline p50 / p95              | `18.96 / 49.25 ms`  |
 
 The manifest contained 19 verified tools. Results are acceptance evidence, not a network-independent guarantee.
 

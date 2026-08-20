@@ -9,7 +9,10 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import aftExtension from "@cortexkit/aft-pi";
-import { AFT_REMOTE_TOOLS, PI_NATIVE_TOOLS } from "../src/protocol.ts";
+import {
+  PI_AFT_REMOTE_TOOLS,
+  PI_AFT_NATIVE_TOOLS,
+} from "../src/pi/profiles/pi-aft.ts";
 
 const target = process.env.REMOTE_TARGET;
 const remoteCwd = process.env.REMOTE_CWD;
@@ -53,8 +56,8 @@ const { session } = await createAgentSession({
   sessionManager: SessionManager.inMemory(localCwd),
   tools: [
     ...new Set([
-      ...PI_NATIVE_TOOLS,
-      ...AFT_REMOTE_TOOLS,
+      ...PI_AFT_NATIVE_TOOLS,
+      ...PI_AFT_REMOTE_TOOLS,
       "remote_connect",
       "remote_exit",
       "remote_workspace_status",

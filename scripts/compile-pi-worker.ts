@@ -1,7 +1,6 @@
 import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-
-const AFT_VERSION = "0.51.2";
+import { PI_AFT_PLUGIN_VERSION } from "../src/pi/profiles/pi-aft.ts";
 
 type Target = "arm64" | "x64";
 
@@ -26,7 +25,7 @@ const aftEntry = resolve(root, "node_modules/@cortexkit/aft-pi/dist/index.js");
 const aftSourceText = await readFile(aftEntry, "utf8");
 const patchedAftSource = aftSourceText.replace(
   /var PLUGIN_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/,
-  `var PLUGIN_VERSION = ${JSON.stringify(AFT_VERSION)};`,
+  `var PLUGIN_VERSION = ${JSON.stringify(PI_AFT_PLUGIN_VERSION)};`,
 );
 if (patchedAftSource === aftSourceText) {
   throw new Error(`Could not lock AFT plugin version in ${aftEntry}`);
@@ -40,14 +39,11 @@ const aftBundlePlugin: Bun.BunPlugin = {
       path: aftEntry,
       namespace: "pi-ssh-remote-aft",
     }));
-    build.onLoad(
-      { filter: /.*/, namespace: "pi-ssh-remote-aft" },
-      () => ({
-        contents: patchedAftSource,
-        loader: "js",
-        resolveDir: dirname(aftEntry),
-      }),
-    );
+    build.onLoad({ filter: /.*/, namespace: "pi-ssh-remote-aft" }, () => ({
+      contents: patchedAftSource,
+      loader: "js",
+      resolveDir: dirname(aftEntry),
+    }));
   },
 };
 const result = await Bun.build({

@@ -3,7 +3,11 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { OMP_VERSION } from "./protocol.ts";
+import { OMP_WORKER_BUNDLE } from "./omp/runtime-contract.ts";
+import type {
+  RemoteCompanionArtifact,
+  RemoteWorkerBundle,
+} from "./runtime-contract.ts";
 import {
   buildScpBaseCommand,
   buildSshBaseCommand,
@@ -125,26 +129,26 @@ function resolveLocalWorkerPath(
   return [join(artifactDir, `worker-linux-${arch}`)];
 }
 
-export function resolveLocalAftPath(
+function resolveLocalCompanionPath(
+  artifact: RemoteCompanionArtifact,
   arch: "arm64" | "x64",
   artifactDir = MODULE_DIR,
-): string[] {
-  return [join(artifactDir, `aft-linux-${arch}`)];
+): string {
+  return join(artifactDir, `${artifact.filePrefix}-${arch}`);
 }
 
-export async function resolveLocalAftBinary(
+async function resolveLocalCompanionBinary(
+  artifact: RemoteCompanionArtifact,
   arch: "arm64" | "x64",
   artifactDir?: string,
 ): Promise<string> {
-  const candidates = resolveLocalAftPath(arch, artifactDir);
-  for (const candidate of candidates) {
-    try {
-      await access(candidate);
-      return candidate;
-    } catch {}
-  }
+  const candidate = resolveLocalCompanionPath(artifact, arch, artifactDir);
+  try {
+    await access(candidate);
+    return candidate;
+  } catch {}
   throw new Error(
-    `${arch} AFT binary not found in the Pi plugin package; checked: ${candidates.join(", ")}`,
+    `${arch} ${artifact.id} companion artifact not found; checked: ${candidate}`,
   );
 }
 
@@ -214,7 +218,7 @@ export async function resolveRemoteHome(
 
 export async function prepareRemoteWorker(
   options: WorkerDeploymentOptions,
-  host: "omp" | "pi" = "omp",
+  bundle: RemoteWorkerBundle = OMP_WORKER_BUNDLE,
 ): Promise<PreparedRemoteWorker> {
   const probe = parseProbe(
     await run(
@@ -240,7 +244,7 @@ export async function prepareRemoteWorker(
   const hash = await readWorkerHash(localWorker);
   const cacheDir = `${probe.home}/.cache/omp-ssh-remote`;
   const workerFile = `worker-linux-${arch}`;
-  const remoteDir = `${cacheDir}/${host === "pi" ? "pi" : OMP_VERSION}/${hash}`;
+  const remoteDir = `${cacheDir}/${bundle.cacheNamespace}/${hash}`;
   const remoteWorker = `${remoteDir}/${workerFile}`;
   const marker = `${remoteDir}/${workerFile}.sha256`;
   const quotedWorker = quoteRemoteArgument(remoteWorker);
@@ -254,9 +258,13 @@ export async function prepareRemoteWorker(
     "Remote worker check",
   );
   if (exists === "present") {
-    if (host === "pi") {
-      await deployRemoteAft(options, probe.home, arch, remoteDir);
-    }
+    await deployCompanionArtifacts(
+      options,
+      probe.home,
+      arch,
+      remoteDir,
+      bundle,
+    );
     return { workerPath: remoteWorker, home: probe.home };
   }
   if (exists !== "missing")
@@ -286,25 +294,47 @@ export async function prepareRemoteWorker(
     ],
     "Worker activation",
   );
-  if (host === "pi") {
-    await deployRemoteAft(options, probe.home, arch, remoteDir);
-  }
+  await deployCompanionArtifacts(options, probe.home, arch, remoteDir, bundle);
   return { workerPath: remoteWorker, home: probe.home };
 }
 
-async function deployRemoteAft(
+async function deployCompanionArtifacts(
   options: WorkerDeploymentOptions,
   home: string,
   arch: "arm64" | "x64",
   workerRemoteDir: string,
+  bundle: RemoteWorkerBundle,
 ): Promise<void> {
-  const localAft = await resolveLocalAftBinary(arch, options.localArtifactDir);
+  for (const artifact of bundle.companionArtifacts) {
+    await deployCompanionArtifact(
+      options,
+      home,
+      arch,
+      workerRemoteDir,
+      bundle,
+      artifact,
+    );
+  }
+}
 
-  const aftHash = await readWorkerHash(localAft);
-  const remoteAftDir = `${home}/.cache/omp-ssh-remote/pi/aft/${arch}/${aftHash}`;
-  const remoteAftBin = `${remoteAftDir}/aft`;
-  const marker = `${remoteAftBin}.sha256`;
-  const quotedRemoteAftBin = quoteRemoteArgument(remoteAftBin);
+async function deployCompanionArtifact(
+  options: WorkerDeploymentOptions,
+  home: string,
+  arch: "arm64" | "x64",
+  workerRemoteDir: string,
+  bundle: RemoteWorkerBundle,
+  artifact: RemoteCompanionArtifact,
+): Promise<void> {
+  const localArtifact = await resolveLocalCompanionBinary(
+    artifact,
+    arch,
+    options.localArtifactDir,
+  );
+  const artifactHash = await readWorkerHash(localArtifact);
+  const remoteArtifactDir = `${home}/.cache/omp-ssh-remote/${bundle.cacheNamespace}/${artifact.id}/${arch}/${artifactHash}`;
+  const remoteArtifactBin = `${remoteArtifactDir}/${artifact.executableName}`;
+  const marker = `${remoteArtifactBin}.sha256`;
+  const quotedRemoteArtifactBin = quoteRemoteArgument(remoteArtifactBin);
   const quotedMarker = quoteRemoteArgument(marker);
   const quotedWorkerDir = quoteRemoteArgument(workerRemoteDir);
 
@@ -312,9 +342,9 @@ async function deployRemoteAft(
     [
       ...buildSshBaseCommand(options),
       options.target,
-      `test -x ${quotedRemoteAftBin} && test "$(cat ${quotedMarker} 2>/dev/null)" = '${aftHash}' && printf present || printf missing`,
+      `test -x ${quotedRemoteArtifactBin} && test "$(cat ${quotedMarker} 2>/dev/null)" = '${artifactHash}' && printf present || printf missing`,
     ],
-    "AFT binary check",
+    `${artifact.id} companion artifact check`,
   );
 
   if (exists !== "present") {
@@ -322,23 +352,26 @@ async function deployRemoteAft(
       [
         ...buildSshBaseCommand(options),
         options.target,
-        `mkdir -p ${quoteRemoteArgument(remoteAftDir)} && chmod 700 ${quoteRemoteArgument(remoteAftDir)}`,
+        `mkdir -p ${quoteRemoteArgument(remoteArtifactDir)} && chmod 700 ${quoteRemoteArgument(remoteArtifactDir)}`,
       ],
-      "AFT cache directory setup",
+      `${artifact.id} companion artifact cache setup`,
     );
     const nonce = crypto.randomUUID();
-    const tempUpload = `${remoteAftBin}.upload-${nonce}`;
+    const tempUpload = `${remoteArtifactBin}.upload-${nonce}`;
     const tempMarker = `${marker}.upload-${nonce}`;
     const scp = buildScpBaseCommand(options);
-    scp.push(localAft, `${options.target}:${quoteRemoteArgument(tempUpload)}`);
-    await run(scp, "AFT binary upload");
+    scp.push(
+      localArtifact,
+      `${options.target}:${quoteRemoteArgument(tempUpload)}`,
+    );
+    await run(scp, `${artifact.id} companion artifact upload`);
     await run(
       [
         ...buildSshBaseCommand(options),
         options.target,
-        `set -eu; actual=$(sha256sum ${quoteRemoteArgument(tempUpload)} | cut -d ' ' -f 1); test "$actual" = '${aftHash}'; chmod 700 ${quoteRemoteArgument(tempUpload)}; mv -f ${quoteRemoteArgument(tempUpload)} ${quotedRemoteAftBin}; printf '%s\n' '${aftHash}' > ${quoteRemoteArgument(tempMarker)}; chmod 600 ${quoteRemoteArgument(tempMarker)}; mv -f ${quoteRemoteArgument(tempMarker)} ${quotedMarker}`,
+        `set -eu; actual=$(sha256sum ${quoteRemoteArgument(tempUpload)} | cut -d ' ' -f 1); test "$actual" = '${artifactHash}'; chmod 700 ${quoteRemoteArgument(tempUpload)}; mv -f ${quoteRemoteArgument(tempUpload)} ${quotedRemoteArtifactBin}; printf '%s\n' '${artifactHash}' > ${quoteRemoteArgument(tempMarker)}; chmod 600 ${quoteRemoteArgument(tempMarker)}; mv -f ${quoteRemoteArgument(tempMarker)} ${quotedMarker}`,
       ],
-      "AFT binary activation",
+      `${artifact.id} companion artifact activation`,
     );
   }
 
@@ -346,9 +379,9 @@ async function deployRemoteAft(
     [
       ...buildSshBaseCommand(options),
       options.target,
-      `ln -sf ${quotedRemoteAftBin} ${quotedWorkerDir}/aft`,
+      `ln -sf ${quotedRemoteArtifactBin} ${quotedWorkerDir}/${quoteRemoteArgument(artifact.executableName)}`,
     ],
-    "Link AFT binary to Pi worker directory",
+    `Link ${artifact.id} companion artifact to worker directory`,
   );
 }
 

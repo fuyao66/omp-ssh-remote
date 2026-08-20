@@ -6,29 +6,23 @@ import type {
   ToolInfo,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
-import { resolveRemoteHome, prepareRemoteWorker } from "./deploy.ts";
-import { RemoteRuntimeClient } from "./client.ts";
+import { resolveRemoteHome, prepareRemoteWorker } from "../deploy.ts";
 import {
   parseConnectArgs,
   loadConfiguredSshHosts,
   type RemoteConnectRequest,
-} from "./connect-options.ts";
-import { buildSshWorkerCommand } from "./ssh.ts";
+} from "../connect-options.ts";
+import type { ReadyMessage, ToolManifest } from "../protocol.ts";
 import {
-  AFT_REMOTE_TOOLS,
-  PI_NATIVE_TOOLS,
-  type AnyRemoteToolName,
-  type ReadyMessage,
-  type ToolManifest,
-} from "./protocol.ts";
+  clearPiSubagentConnectionSpec,
+  publishPiSubagentConnectionSpec,
+  readPiSubagentConnectionSpec,
+} from "./integrations/pi-subagents.ts";
+import { DEFAULT_PI_PROFILE, getPiRuntimeProfile } from "./profiles/index.ts";
+import type { PiRuntimeProfile } from "./profile.ts";
+import { PiRemoteWorkspaceScope } from "./scope.ts";
 
-export const PI_REMOTE_CORE_TOOLS: readonly string[] = PI_NATIVE_TOOLS;
-const PI_REMOTE_INHERIT_ENV = "PI_REMOTE_CONNECTION_SPEC";
 const STATE_KEY = Symbol.for("pi-ssh-remote/state");
-const KNOWN_WORKSPACE_TOOLS = new Set<string>([
-  ...PI_NATIVE_TOOLS,
-  ...AFT_REMOTE_TOOLS,
-]);
 
 export interface PiRemoteWorkspaceStatus {
   mode: "local" | "remote" | "unavailable";
@@ -36,19 +30,25 @@ export interface PiRemoteWorkspaceStatus {
   remoteCwd: string | null;
   connectionError: string | null;
   remoteWorkspaceTools: string[];
-  aftTools: string[];
+  profileToolGroups: Array<{
+    id: string;
+    displayName: string;
+    tools: string[];
+  }>;
+  profile: { id: string; version: string; displayName: string } | null;
   routing: {
     ordinaryFilesystemPaths: string;
     internalUris: string;
     subagents: string;
-    aftEngine: string;
+    executionRuntime: string;
   };
   note: string;
 }
 
 export interface PiRemoteExtensionState {
   selected: boolean;
-  client?: RemoteRuntimeClient;
+  scope?: PiRemoteWorkspaceScope;
+  profile?: PiRuntimeProfile;
   cwd?: string;
   connectOptions?: RemoteConnectRequest;
   connectionError?: string;
@@ -69,30 +69,30 @@ export function getPiRemoteState(): PiRemoteExtensionState {
   return globalState;
 }
 
-function isAftTool(name: string): boolean {
-  return (
-    name.startsWith("aft_") ||
-    name.startsWith("ast_grep_") ||
-    name.startsWith("bash_") ||
-    ["read", "write", "edit", "bash"].includes(name)
-  );
-}
-
 export function buildPiWorkspaceStatus(
   state: PiRemoteExtensionState,
 ): PiRemoteWorkspaceStatus {
   const mode = !state.selected
     ? "local"
     : state.connectionError ||
-        !state.client ||
-        state.client.isClosed ||
+        !state.scope ||
+        state.scope.isClosed ||
         !state.ownershipVerified
       ? "unavailable"
       : "remote";
   const toolNames = state.ready?.tools.map((tool) => tool.name) ?? [];
+  const profile = state.profile ?? DEFAULT_PI_PROFILE;
 
   return {
     mode,
+    profile:
+      mode === "local"
+        ? null
+        : {
+            id: profile.id,
+            version: profile.version,
+            displayName: profile.displayName,
+          },
     transport:
       mode === "local"
         ? "not-selected"
@@ -106,23 +106,30 @@ export function buildPiWorkspaceStatus(
           "Remote tool ownership has not been verified")
         : null,
     remoteWorkspaceTools: mode === "remote" ? toolNames : [],
-    aftTools: mode === "remote" ? toolNames.filter(isAftTool) : [],
+    profileToolGroups:
+      mode === "remote"
+        ? profile.toolGroups.map((group) => ({
+            id: group.id,
+            displayName: group.displayName,
+            tools: toolNames.filter((name) => group.tools.has(name)),
+          }))
+        : [],
     routing: {
       ordinaryFilesystemPaths:
         mode === "remote"
-          ? "remote native Pi/AFT runtime"
+          ? `remote ${profile.displayName} runtime`
           : mode === "unavailable"
             ? "fail-closed (remote profile selected but unavailable)"
-            : "local Pi/AFT runtime",
+            : `local ${profile.displayName} runtime`,
       internalUris: "local Pi control plane",
       subagents:
         mode === "remote"
           ? "independent companion inherited through connection environment"
           : "local process execution",
-      aftEngine:
+      executionRuntime:
         mode === "remote"
-          ? "headless Pi Agent with the matching AFT plugin and native engine on the remote workspace"
-          : "local AFT plugin runtime",
+          ? profile.executionRuntime.remote
+          : profile.executionRuntime.local,
     },
     note:
       mode === "remote"
@@ -154,6 +161,16 @@ export default async function piRemoteExtension(
   pi: ExtensionAPI,
 ): Promise<void> {
   const state = globalState;
+  let inheritedSpec: ReturnType<typeof readPiSubagentConnectionSpec>;
+  try {
+    inheritedSpec = readPiSubagentConnectionSpec();
+  } catch (error) {
+    state.selected = true;
+    state.profile = DEFAULT_PI_PROFILE;
+    state.ownershipVerified = false;
+    state.connectionError =
+      error instanceof Error ? error.message : String(error);
+  }
   let registeredRemoteTools = new Set<string>();
 
   const verifyOwnership = (): void => {
@@ -194,8 +211,8 @@ export default async function piRemoteExtension(
           if (
             !state.selected ||
             !state.ownershipVerified ||
-            !state.client ||
-            state.client.isClosed
+            !state.scope ||
+            state.scope.isClosed
           ) {
             state.connectionError ??=
               "Remote runtime connection lost (fail-closed protection)";
@@ -207,8 +224,8 @@ export default async function piRemoteExtension(
             params && typeof params === "object"
               ? (params as Record<string, unknown>)
               : {};
-          return (await state.client.execute(
-            manifest.name as AnyRemoteToolName,
+          return (await state.scope.execute(
+            manifest.name,
             toolCallId,
             args,
             signal,
@@ -222,11 +239,12 @@ export default async function piRemoteExtension(
   };
 
   const connectPrepared = async (
+    profile: PiRuntimeProfile,
     parsed: RemoteConnectRequest,
     remoteCwd: string,
     remoteWorkerPath: string,
   ): Promise<ReadyMessage> => {
-    if (state.client && !state.client.isClosed) {
+    if (state.scope && !state.scope.isClosed) {
       throw new Error(
         "Already connected to a remote runtime. Run /remote-exit first.",
       );
@@ -234,39 +252,37 @@ export default async function piRemoteExtension(
     state.selected = true;
     state.ownershipVerified = false;
     state.connectionError = undefined;
+    state.profile = profile;
     state.connectOptions = parsed;
     state.cwd = remoteCwd;
     state.localActiveTools ??= pi.getActiveTools();
 
-    const client = new RemoteRuntimeClient({
-      command: buildSshWorkerCommand({
-        target: parsed.target,
-        port: parsed.port,
-        identityFile: parsed.identityFile,
-        knownHostsFile: parsed.knownHostsFile,
-        workerPath: remoteWorkerPath,
-      }),
-    });
-    state.client = client;
+    let openedScope: PiRemoteWorkspaceScope | undefined;
     try {
-      const ready = await client.initialize(remoteCwd, 30_000, "pi");
-      state.ready = ready;
-      registerRemoteWrappers(ready);
-      verifyOwnership();
-      process.env[PI_REMOTE_INHERIT_ENV] = JSON.stringify({
+      openedScope = await PiRemoteWorkspaceScope.open({
+        profile,
         connectOptions: parsed,
         workerPath: remoteWorkerPath,
         cwd: remoteCwd,
       });
-      return ready;
+      state.scope = openedScope;
+      state.ready = openedScope.ready;
+      registerRemoteWrappers(openedScope.ready);
+      verifyOwnership();
+      publishPiSubagentConnectionSpec({
+        profileId: profile.id,
+        connectOptions: parsed,
+        workerPath: remoteWorkerPath,
+        cwd: remoteCwd,
+      });
+      return openedScope.ready;
     } catch (error) {
+      await openedScope?.close(true);
       state.ownershipVerified = false;
       state.connectionError =
         error instanceof Error ? error.message : String(error);
-      try {
-        await client.close();
-      } catch {}
-      state.client = undefined;
+      state.scope = undefined;
+      state.ready = undefined;
       throw error;
     }
   };
@@ -297,6 +313,7 @@ export default async function piRemoteExtension(
       knownHostsFile: parsed.knownHostsFile,
     });
     const remoteCwd = parsed.cwd ?? remoteHome;
+    const profile = DEFAULT_PI_PROFILE;
     const prepared = await prepareRemoteWorker(
       {
         target: parsed.target,
@@ -305,12 +322,10 @@ export default async function piRemoteExtension(
         knownHostsFile: parsed.knownHostsFile,
         localWorkerPath: parsed.workerPath,
       },
-      "pi",
+      profile.workerBundle,
     );
-    return connectPrepared(parsed, remoteCwd, prepared.workerPath);
+    return connectPrepared(profile, parsed, remoteCwd, prepared.workerPath);
   };
-
-  const inheritedSpec = process.env[PI_REMOTE_INHERIT_ENV];
 
   pi.registerTool({
     name: "remote_workspace_status",
@@ -331,7 +346,7 @@ export default async function piRemoteExtension(
     name: "remote_connect",
     label: "Remote Connect",
     description:
-      "Connect this Pi session to an SSH workspace and activate the remote Pi/AFT tool profile.",
+      "Connect this Pi session to an SSH workspace and activate the selected remote runtime profile.",
     parameters: Type.Object({
       target: Type.String({ description: "SSH alias or user@host" }),
       cwd: Type.Optional(
@@ -379,7 +394,7 @@ export default async function piRemoteExtension(
     name: "remote_exit",
     label: "Remote Exit",
     description:
-      "Queue a graceful remote disconnect and rebuild the local Pi/AFT profile.",
+      "Queue a graceful remote disconnect and rebuild the local Pi tool profile.",
     parameters: Type.Object({
       force: Type.Optional(Type.Boolean()),
     }),
@@ -424,36 +439,30 @@ export default async function piRemoteExtension(
   });
 
   pi.registerCommand("remote-exit", {
-    description: "Disconnect and restore the local Pi/AFT tool profile",
+    description: "Disconnect and restore the local Pi tool profile",
     handler: async (
       args: string,
       ctx: ExtensionCommandContext,
     ): Promise<void> => {
       const force = args.trim() === "--force";
-      if (!state.selected && !state.client) {
+      if (!state.selected && !state.scope) {
         ctx.ui?.notify?.("Not connected to a remote runtime.", "warning");
         return;
       }
       try {
-        if (state.client && !state.client.isClosed) {
-          try {
-            await state.client.close();
-          } catch (error) {
-            if (!force) throw error;
-            state.client.kill();
-          }
-        }
+        await state.scope?.close(force);
         state.selected = false;
-        state.client = undefined;
+        state.scope = undefined;
         state.ready = undefined;
+        state.profile = undefined;
         state.cwd = undefined;
         state.connectOptions = undefined;
         state.connectionError = undefined;
         state.ownershipVerified = undefined;
         state.isInheritedChild = undefined;
-        delete process.env[PI_REMOTE_INHERIT_ENV];
+        clearPiSubagentConnectionSpec();
         ctx.ui?.notify?.(
-          "Disconnected. Reloading the local Pi/AFT profile.",
+          "Disconnected. Reloading the local Pi tool profile.",
           "info",
         );
         await ctx.reload();
@@ -486,14 +495,15 @@ export default async function piRemoteExtension(
   });
 
   pi.on("tool_call", (event) => {
+    const profile = state.profile ?? DEFAULT_PI_PROFILE;
     const guardedNames = new Set([
-      ...KNOWN_WORKSPACE_TOOLS,
+      ...profile.knownWorkspaceTools,
       ...(state.ready?.tools.map((tool) => tool.name) ?? []),
     ]);
     if (
       state.selected &&
       guardedNames.has(event.toolName) &&
-      (!state.ownershipVerified || !state.client || state.client.isClosed)
+      (!state.ownershipVerified || !state.scope || state.scope.isClosed)
     ) {
       return {
         block: true,
@@ -505,18 +515,15 @@ export default async function piRemoteExtension(
   });
 
   pi.on("session_start", async () => {
-    if (inheritedSpec && !state.selected && !state.client) {
+    if (inheritedSpec && !state.selected && !state.scope) {
       try {
-        const inherited = JSON.parse(inheritedSpec) as {
-          connectOptions: RemoteConnectRequest;
-          workerPath: string;
-          cwd: string;
-        };
+        const profile = getPiRuntimeProfile(inheritedSpec.profileId);
         state.isInheritedChild = true;
         await connectPrepared(
-          inherited.connectOptions,
-          inherited.cwd,
-          inherited.workerPath,
+          profile,
+          inheritedSpec.connectOptions,
+          inheritedSpec.cwd,
+          inheritedSpec.workerPath,
         );
       } catch (error) {
         state.selected = true;
@@ -534,24 +541,26 @@ export default async function piRemoteExtension(
       state.localActiveTools = undefined;
     }
   });
-
   pi.on("session_shutdown", async (event) => {
     if (event.reason === "reload") return;
-    if (state.client && !state.client.isClosed) {
-      try {
-        await state.client.close();
-      } catch {
-        state.client.kill();
-      }
+    try {
+      await state.scope?.close(true);
+    } finally {
+      state.scope = undefined;
+      state.selected = false;
+      state.ready = undefined;
+      state.profile = undefined;
+      state.cwd = undefined;
+      state.connectOptions = undefined;
+      state.connectionError = undefined;
+      state.isInheritedChild = undefined;
+      state.ownershipVerified = undefined;
+      state.localActiveTools = undefined;
+      clearPiSubagentConnectionSpec();
     }
-    state.client = undefined;
-    state.selected = false;
-    state.ready = undefined;
-    state.ownershipVerified = undefined;
-    delete process.env[PI_REMOTE_INHERIT_ENV];
   });
 
-  if (state.selected && state.ready && state.client && !state.client.isClosed) {
+  if (state.selected && state.ready && state.scope && !state.scope.isClosed) {
     registeredRemoteTools = new Set();
     registerRemoteWrappers(state.ready);
   }

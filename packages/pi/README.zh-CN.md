@@ -26,6 +26,19 @@ flowchart LR
   AFT --> Workspace[远端文件、索引、备份与进程]
 ```
 
+## Profiles 与 Integrations
+
+Pi host adapter 不依赖具体 profile。runtime profile 负责精确的 Pi/plugin 版本、准入工具与 schema、companion artifact bundle、工具分组和生命周期说明。共享 workspace scope 独占一个 companion 连接，并在进入 transport 前拒绝所选 profile 之外的工具。
+
+当前支持：
+
+| 类型               | ID             | 职责                                                                                     |
+| ------------------ | -------------- | ---------------------------------------------------------------------------------------- |
+| Runtime profile    | `pi-aft`       | Pi `0.84.2`、AFT `0.51.2`、严格 19 工具 manifest，以及 x64/ARM64 worker 与 AFT artifacts |
+| 编排器 integration | `pi-subagents` | 将已选 profile 与连接配置传给新的 Pi 子进程，由子进程打开独立 companion scope            |
+
+其他已安装 Pi plugin 不会被自动复制、打包或远端化。模型路由、凭据、memory、web access、ask/TUI 和 UI extensions 保持本机执行。新增工作区 plugin 需要显式版本化 profile；编排器需要独立的 scope integration。远端 workflow worktree 尚未实现。
+
 ## Profile 所有权
 
 Pi 的同名 extension tool 采用 first-wins，且没有 OMP 那种调用被覆盖工具的公开接口。因此本 package 必须在 Pi settings 中排在 `@cortexkit/aft-pi` 前面。
@@ -125,13 +138,13 @@ AFT 后台 Bash 通过原生 `bash_status`、`bash_watch`、`bash_write` 和 `ba
 
 2026 年 8 月在 Linux x86_64 试验主机、缓存 worker/AFT 和持久 SSH ControlMaster 条件下：
 
-| 操作 | 结果 |
-| --- | --- |
-| 缓存 worker/AFT 部署探测 | `134.54 ms` |
-| headless Pi+AFT 初始化 | `1243.15 ms` |
-| read p50 / p95 | `19.05 / 48.59 ms` |
-| Bash p50 / p95 | `89.28 / 185.93 ms` |
-| AFT outline p50 / p95 | `18.96 / 49.25 ms` |
+| 操作                     | 结果                |
+| ------------------------ | ------------------- |
+| 缓存 worker/AFT 部署探测 | `134.54 ms`         |
+| headless Pi+AFT 初始化   | `1243.15 ms`        |
+| read p50 / p95           | `19.05 / 48.59 ms`  |
+| Bash p50 / p95           | `89.28 / 185.93 ms` |
+| AFT outline p50 / p95    | `18.96 / 49.25 ms`  |
 
 manifest 包含 19 个已验证工具。数据用于验收，不代表与网络无关的性能保证。
 

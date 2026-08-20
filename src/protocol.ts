@@ -10,8 +10,6 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
 export const PROTOCOL_VERSION = 1 as const;
 export const TOOL_RUNTIME_VERSION = "0.3.0" as const;
 export const OMP_VERSION = "17.3.3" as const;
-export const PI_VERSION = "0.84.2" as const;
-export const PI_TOOL_RUNTIME_VERSION = "0.1.0" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
   "read",
@@ -27,44 +25,7 @@ export const REMOTE_TOOL_NAMES = [
   "debug",
 ] as const;
 export type RemoteToolName = (typeof REMOTE_TOOL_NAMES)[number];
-export const PI_NATIVE_TOOLS = [
-  "read",
-  "write",
-  "edit",
-  "bash",
-  "grep",
-  "find",
-  "ls",
-] as const;
-export type PiRemoteToolName = (typeof PI_NATIVE_TOOLS)[number];
-export const AFT_REMOTE_TOOLS = [
-  "read",
-  "write",
-  "edit",
-  "bash",
-  "grep",
-  "bash_status",
-  "bash_watch",
-  "bash_write",
-  "bash_kill",
-  "aft_outline",
-  "aft_zoom",
-  "aft_inspect",
-  "aft_conflicts",
-  "aft_import",
-  "aft_safety",
-  "ast_grep_search",
-  "ast_grep_replace",
-] as const;
-export type AftRemoteToolName = (typeof AFT_REMOTE_TOOLS)[number];
-export type AnyRemoteToolName =
-  RemoteToolName | PiRemoteToolName | AftRemoteToolName;
-
-export const AFT_EXTENDED_TOOLS: readonly AftRemoteToolName[] =
-  AFT_REMOTE_TOOLS.filter(
-    (name): name is AftRemoteToolName =>
-      !PI_NATIVE_TOOLS.includes(name as PiRemoteToolName),
-  );
+export type AnyRemoteToolName = string;
 
 export type InitializeRequest = {
   type: "initialize";
@@ -81,7 +42,7 @@ export type ExecuteRequest = {
   type: "execute";
   id: string;
   toolCallId: string;
-  tool: AnyRemoteToolName;
+  tool: string;
   args: Record<string, unknown>;
 };
 
@@ -133,15 +94,6 @@ function numberField(value: Record<string, unknown>, key: string): number {
   return field;
 }
 
-function isAnyRemoteToolName(name: unknown): name is AnyRemoteToolName {
-  if (typeof name !== "string") return false;
-  return (
-    REMOTE_TOOL_NAMES.includes(name as RemoteToolName) ||
-    PI_NATIVE_TOOLS.includes(name as PiRemoteToolName) ||
-    AFT_REMOTE_TOOLS.includes(name as AftRemoteToolName)
-  );
-}
-
 export function parseRequest(raw: unknown): Request {
   const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
   const value = asRecord(parsed, "Request");
@@ -172,14 +124,11 @@ export function parseRequest(raw: unknown): Request {
     };
   }
   if (type === "execute") {
-    if (!isAnyRemoteToolName(value.tool)) {
-      throw new Error(`Unknown remote tool: ${String(value.tool)}`);
-    }
     return {
       type,
       id: stringField(value, "id"),
       toolCallId: stringField(value, "toolCallId"),
-      tool: value.tool,
+      tool: stringField(value, "tool"),
       args: asRecord(value.args, "args"),
     };
   }

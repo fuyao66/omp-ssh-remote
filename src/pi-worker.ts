@@ -1,12 +1,10 @@
 #!/usr/bin/env bun
 import {
-  createPiNativeWorkerRuntime,
-  type PiNativeWorkerRuntime,
-} from "./pi-runtime.ts";
+  createPiAftWorkerRuntime,
+  type PiAftWorkerRuntime,
+} from "./pi/profiles/pi-aft-runtime.ts";
 import {
-  PI_VERSION,
   PROTOCOL_VERSION,
-  PI_TOOL_RUNTIME_VERSION,
   decodeFrames,
   encodeMessage,
   parseRequest,
@@ -24,7 +22,7 @@ const workerDir =
     : dirname(fileURLToPath(import.meta.url));
 process.env.PATH = `${workerDir}${delimiter}${process.env.PATH ?? ""}`;
 
-let runtime: PiNativeWorkerRuntime | undefined;
+let runtime: PiAftWorkerRuntime | undefined;
 const active = new Map<
   string,
   { controller: AbortController; done: Promise<void> }
@@ -79,7 +77,7 @@ async function initialize(request: InitializeRequest): Promise<void> {
       `Unsupported protocol version: ${request.protocolVersion} (expected ${PROTOCOL_VERSION})`,
     );
   }
-  runtime = await createPiNativeWorkerRuntime(request.cwd, {});
+  runtime = await createPiAftWorkerRuntime(request.cwd, {});
   send(runtime.manifest);
 }
 

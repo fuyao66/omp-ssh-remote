@@ -1,4 +1,6 @@
 import { RemoteRuntimeClient } from "../src/client.ts";
+import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
+import { PI_AFT_PROFILE } from "../src/pi/profiles/pi-aft.ts";
 import {
   loadConfiguredSshHosts,
   parseConnectArgs,
@@ -58,10 +60,11 @@ const summary = (samples: number[]) => ({
 
 const localArtifactDir = new URL(`../packages/${host}/dist/`, import.meta.url)
   .pathname;
+const runtime = host === "pi" ? PI_AFT_PROFILE : undefined;
 let started = performance.now();
 const prepared = await prepareRemoteWorker(
   { ...connection, localArtifactDir },
-  host,
+  runtime?.workerBundle,
 );
 const deployCacheMs = milliseconds(started);
 const cwd = requestedCwd ?? prepared.home;
@@ -75,7 +78,11 @@ const client = new RemoteRuntimeClient({
 const benchmarkFile = `.ssh-remote-benchmark-${host}-${process.pid}.ts`;
 try {
   started = performance.now();
-  const ready = await client.initialize(cwd, 30_000, host);
+  const ready = await client.initialize(
+    cwd,
+    runtime?.handshake ?? OMP_RUNTIME_HANDSHAKE,
+    30_000,
+  );
   const initializeMs = milliseconds(started);
   await client.execute("write", "benchmark-write", {
     path: benchmarkFile,

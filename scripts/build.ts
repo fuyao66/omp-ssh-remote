@@ -61,7 +61,7 @@ if (target === "all" || target === "omp") {
 
 if (target === "all" || target === "pi") {
   const extension = await Bun.build({
-    entrypoints: [resolve(root, "src/pi-extension.ts")],
+    entrypoints: [resolve(root, "src/pi/host-extension.ts")],
     outdir: piOutdir,
     naming: "pi-extension.js",
     target: "node",

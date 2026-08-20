@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RemoteRuntimeClient } from "../src/client.ts";
+import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
 
 let cwd: string;
 let client: RemoteRuntimeClient;
@@ -12,7 +13,7 @@ beforeAll(async () => {
   client = new RemoteRuntimeClient({
     command: ["bun", join(import.meta.dir, "../src/worker.ts")],
   });
-  const ready = await client.initialize(cwd);
+  const ready = await client.initialize(cwd, OMP_RUNTIME_HANDSHAKE);
   expect(ready.cwd).toBe(cwd);
   expect(ready.tools.map((tool) => tool.name).sort()).toEqual([
     "ast_edit",

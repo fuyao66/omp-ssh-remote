@@ -1,22 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import {
-  AFT_REMOTE_TOOLS,
-  OMP_VERSION,
-  PI_NATIVE_TOOLS,
-  PI_VERSION,
-  PI_TOOL_RUNTIME_VERSION,
   PROTOCOL_VERSION,
-  REMOTE_TOOL_NAMES,
-  TOOL_RUNTIME_VERSION,
   decodeFrames,
   encodeMessage,
   parseMessage,
-  type AnyRemoteToolName,
   type Message,
   type ReadyMessage,
-  type RemoteToolName,
   type Request,
 } from "./protocol.ts";
+import type { RemoteRuntimeHandshake } from "./runtime-contract.ts";
 
 export type SpawnSpec = {
   command: string[];
@@ -43,53 +35,6 @@ async function withTimeout<T>(
     return await Promise.race([promise, timeout]);
   } finally {
     clearTimeout(timer);
-  }
-}
-const PI_RUNTIME_TOOLS = new Set<string>([
-  ...PI_NATIVE_TOOLS,
-  ...AFT_REMOTE_TOOLS,
-]);
-
-export function validatePiReadyMessage(ready: ReadyMessage): void {
-  if (
-    ready.host !== "pi" ||
-    ready.hostVersion !== PI_VERSION ||
-    ready.toolRuntimeVersion !== PI_TOOL_RUNTIME_VERSION
-  ) {
-    throw new Error(
-      `Remote Pi runtime version mismatch: host=${ready.hostVersion}, runtime=${ready.toolRuntimeVersion}`,
-    );
-  }
-  if (ready.capabilities?.aftHostRuntime !== "@cortexkit/aft-pi@0.51.2") {
-    throw new Error("Remote Pi runtime did not verify AFT 0.51.2");
-  }
-  const names = new Set<string>();
-  for (const tool of ready.tools) {
-    if (!PI_RUNTIME_TOOLS.has(tool.name)) {
-      throw new Error(
-        `Remote Pi runtime exposed unsupported tool: ${tool.name}`,
-      );
-    }
-    if (names.has(tool.name)) {
-      throw new Error(`Remote Pi runtime exposed duplicate tool: ${tool.name}`);
-    }
-    if (
-      !tool.parameters ||
-      typeof tool.parameters !== "object" ||
-      Array.isArray(tool.parameters) ||
-      (tool.parameters as Record<string, unknown>).type !== "object"
-    ) {
-      throw new Error(
-        `Remote Pi tool ${tool.name} has an invalid parameter schema`,
-      );
-    }
-    names.add(tool.name);
-  }
-  const missing = [...PI_RUNTIME_TOOLS].filter((name) => !names.has(name));
-  if (missing.length > 0) {
-    throw new Error(
-      `Remote Pi runtime is missing tools: ${missing.join(", ")}`,
-    );
   }
 }
 
@@ -128,20 +73,20 @@ export class RemoteRuntimeClient {
 
   async initialize(
     cwd: string,
+    handshake: RemoteRuntimeHandshake,
     timeoutMs = 15_000,
-    host: "omp" | "pi" = "omp",
   ): Promise<ReadyMessage> {
-    const tools = host === "pi" ? [] : [...REMOTE_TOOL_NAMES];
     this.#send({
       type: "initialize",
       protocolVersion: PROTOCOL_VERSION,
-      host,
-      ompVersion: host === "omp" ? OMP_VERSION : undefined,
-      hostVersion: host === "pi" ? PI_VERSION : OMP_VERSION,
-      runtimeVersion:
-        host === "pi" ? PI_TOOL_RUNTIME_VERSION : TOOL_RUNTIME_VERSION,
+      host: handshake.host,
+      ...(handshake.host === "omp"
+        ? { ompVersion: handshake.hostVersion }
+        : {}),
+      hostVersion: handshake.hostVersion,
+      runtimeVersion: handshake.runtimeVersion,
       cwd,
-      tools,
+      tools: [...handshake.requestedTools],
     });
     try {
       const ready = await withTimeout(
@@ -154,26 +99,7 @@ export class RemoteRuntimeClient {
           `Remote runtime protocol mismatch: protocol=${ready.protocolVersion}`,
         );
       }
-      if (host === "omp") {
-        if (
-          ready.ompVersion !== OMP_VERSION ||
-          ready.runtimeVersion !== TOOL_RUNTIME_VERSION
-        ) {
-          throw new Error(
-            `Remote runtime version mismatch: protocol=${ready.protocolVersion}, OMP=${ready.ompVersion}, runtime=${ready.runtimeVersion}`,
-          );
-        }
-        const available = new Set(ready.tools.map((tool) => tool.name));
-        const missing = REMOTE_TOOL_NAMES.filter(
-          (name) => !available.has(name),
-        );
-        if (missing.length > 0)
-          throw new Error(
-            `Remote runtime is missing tools: ${missing.join(", ")}`,
-          );
-      } else {
-        validatePiReadyMessage(ready);
-      }
+      handshake.validateReady(ready);
       return ready;
     } catch (error) {
       this.#terminate(error);
@@ -182,7 +108,7 @@ export class RemoteRuntimeClient {
   }
 
   async execute(
-    tool: AnyRemoteToolName,
+    tool: string,
     toolCallId: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,

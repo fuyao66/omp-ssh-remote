@@ -27,11 +27,14 @@
   "dependencies": {
     "@cortexkit/aft-pi": "0.51.2",
     "@earendil-works/pi-agent-core": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.2",
     "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
     "@oh-my-pi/omptype": "17.3.3",
     "@oh-my-pi/pi-agent-core": "17.3.3",
     "@oh-my-pi/pi-coding-agent": "17.3.3",
     "@oh-my-pi/pi-utils": "17.3.3",
+    "diff": "8.0.4",
     "typebox": "1.1.38"
   },
   "devDependencies": {

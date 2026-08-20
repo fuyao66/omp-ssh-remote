@@ -1,4 +1,5 @@
 import { RemoteRuntimeClient } from "../src/client.ts";
+import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
 import { ensureRemoteWorker } from "../src/deploy.ts";
 import { buildSshWorkerCommand } from "../src/ssh.ts";
 
@@ -25,7 +26,7 @@ const client = new RemoteRuntimeClient({
   command: buildSshWorkerCommand({ ...options, workerPath }),
 });
 try {
-  const ready = await client.initialize(cwd);
+  const ready = await client.initialize(cwd, OMP_RUNTIME_HANDSHAKE);
   if (ready.cwd !== cwd) throw new Error(`Unexpected remote cwd: ${ready.cwd}`);
 
   const content = `remote-arm64-${Date.now()}`;
