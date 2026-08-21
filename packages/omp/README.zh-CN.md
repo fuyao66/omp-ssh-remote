@@ -12,7 +12,7 @@ OMP SSH Remote 将 Oh My Pi 控制面保留在本机，同时通过 SSH 在远�
 
 `read`、`write`、`edit`、前台 `bash`、`grep`、`glob`、`lsp`、`ast_grep`、`ast_edit`、受限 `eval` 和 `debug`。
 
-普通非隔离子代理继承连接配置，但各自使用独立 companion。`task isolated:true`、远端 async Bash 和 artifact transfer 尚不支持，并采用 fail-closed。
+普通非隔离子代理继承连接配置，但各自使用独立 companion。远端主机不安装 OMP；`ompVersion` 是编进 worker 的身份，必须等于本机 OMP `17.3.3`。`task isolated:true`、远端 async Bash 和 artifact transfer 尚不支持，并采用 fail-closed。
 
 ```mermaid
 flowchart LR
@@ -20,7 +20,7 @@ flowchart LR
   Adapter <--> SSH[持久有界 SSH NDJSON]
   SSH <--> Worker[远端 OMP companion]
   Worker --> Tools[原生 ToolSession: 文件、AST、LSP、eval、debug]
-  Tools --> Worktree[远端工作区]
+  Tools --> RemoteFS[远端工作区]
 ```
 
 ## 环境要求
@@ -105,7 +105,7 @@ x64 worker 首次上传耗时 `32.7 s`；缓存连接不再传输 worker。数�
 - 仅支持 Linux glibc x86_64 和 ARM64；
 - 仅支持 OMP `17.3.3`；
 - 不支持 async Bash / 本机 `hub` job bridge；
-- 不支持远端 isolated worktree；
+- 不支持 `task isolated:true` 远端 worktree；
 - 不支持远端到本机 artifact bridge；
 - 单个输出 frame 不能超过 16 MiB；
 - browser、desktop、模型凭据、memory 和本机 session 控制面不进入远端。

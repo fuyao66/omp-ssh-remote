@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Native remote Pi Agent and AFT workspace tools over a persistent SSH runtime",
+  "description": "Composable remote Pi workspace tools over a persistent SSH runtime",
   "license": "MIT",
   "keywords": [
     "pi-package"
@@ -14,8 +14,8 @@
     "README.zh-CN.md"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.2",
-    "@earendil-works/pi-agent-core": "0.84.2"
+    "@earendil-works/pi-coding-agent": ">=0.84.2",
+    "@earendil-works/pi-agent-core": ">=0.84.2"
   },
   "pi": {
     "extensions": [

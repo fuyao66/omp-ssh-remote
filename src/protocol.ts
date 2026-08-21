@@ -27,6 +27,23 @@ export const REMOTE_TOOL_NAMES = [
 export type RemoteToolName = (typeof REMOTE_TOOL_NAMES)[number];
 export type AnyRemoteToolName = string;
 
+export type RuntimeComponentKind = "host" | "plugin";
+export type RuntimeAssemblyComponent = {
+  id: string;
+  kind: RuntimeComponentKind;
+  contractVersion: string;
+  version: string;
+};
+export type RuntimeAssemblyTool = {
+  name: string;
+  owner: string;
+};
+export type RuntimeAssemblyRequest = {
+  id: string;
+  components: RuntimeAssemblyComponent[];
+  tools: RuntimeAssemblyTool[];
+};
+
 export type InitializeRequest = {
   type: "initialize";
   protocolVersion: number;
@@ -36,6 +53,7 @@ export type InitializeRequest = {
   runtimeVersion: string;
   cwd: string;
   tools: string[];
+  assembly?: RuntimeAssemblyRequest;
 };
 
 export type ExecuteRequest = {
@@ -49,7 +67,10 @@ export type ExecuteRequest = {
 export type CancelRequest = { type: "cancel"; id: string };
 export type ShutdownRequest = { type: "shutdown" };
 export type Request =
-  InitializeRequest | ExecuteRequest | CancelRequest | ShutdownRequest;
+  | InitializeRequest
+  | ExecuteRequest
+  | CancelRequest
+  | ShutdownRequest;
 
 export type ToolManifest = {
   name: string;
@@ -78,7 +99,10 @@ export type ErrorMessage = {
   error: { name: string; message: string; stack?: string };
 };
 export type Message =
-  ReadyMessage | UpdateMessage | ResultMessage | ErrorMessage;
+  | ReadyMessage
+  | UpdateMessage
+  | ResultMessage
+  | ErrorMessage;
 
 function stringField(value: Record<string, unknown>, key: string): string {
   const field = value[key];
@@ -92,6 +116,38 @@ function numberField(value: Record<string, unknown>, key: string): number {
   if (typeof field !== "number" || !Number.isFinite(field))
     throw new Error(`Protocol field ${key} must be a number`);
   return field;
+}
+
+function parseAssembly(value: unknown): RuntimeAssemblyRequest {
+  const assembly = asRecord(value, "assembly");
+  const components = assembly.components;
+  const tools = assembly.tools;
+  if (!Array.isArray(components) || !Array.isArray(tools)) {
+    throw new Error("Protocol assembly must contain component and tool arrays");
+  }
+  return {
+    id: stringField(assembly, "id"),
+    components: components.map((component) => {
+      const item = asRecord(component, "assembly component");
+      const kind = stringField(item, "kind");
+      if (kind !== "host" && kind !== "plugin") {
+        throw new Error(`Unknown runtime assembly component kind: ${kind}`);
+      }
+      return {
+        id: stringField(item, "id"),
+        kind,
+        contractVersion: stringField(item, "contractVersion"),
+        version: stringField(item, "version"),
+      };
+    }),
+    tools: tools.map((tool) => {
+      const item = asRecord(tool, "assembly tool");
+      return {
+        name: stringField(item, "name"),
+        owner: stringField(item, "owner"),
+      };
+    }),
+  };
 }
 
 export function parseRequest(raw: unknown): Request {
@@ -121,6 +177,9 @@ export function parseRequest(raw: unknown): Request {
       runtimeVersion: stringField(value, "runtimeVersion"),
       cwd: stringField(value, "cwd"),
       tools,
+      ...(value.assembly === undefined
+        ? {}
+        : { assembly: parseAssembly(value.assembly) }),
     };
   }
   if (type === "execute") {

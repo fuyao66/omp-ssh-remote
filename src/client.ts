@@ -87,6 +87,7 @@ export class RemoteRuntimeClient {
       runtimeVersion: handshake.runtimeVersion,
       cwd,
       tools: [...handshake.requestedTools],
+      ...(handshake.assembly ? { assembly: handshake.assembly } : {}),
     });
     try {
       const ready = await withTimeout(

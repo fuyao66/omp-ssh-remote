@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 import {
-  createPiAftWorkerRuntime,
-  type PiAftWorkerRuntime,
-} from "./pi/profiles/pi-aft-runtime.ts";
+  createPiWorkerRuntime,
+  type PiWorkerRuntime,
+} from "./pi/worker-runtime.ts";
+import { PI_REMOTE_RUNTIME_VERSION, stableJson } from "./pi/assembly.ts";
 import {
   PROTOCOL_VERSION,
   decodeFrames,
@@ -22,7 +23,7 @@ const workerDir =
     : dirname(fileURLToPath(import.meta.url));
 process.env.PATH = `${workerDir}${delimiter}${process.env.PATH ?? ""}`;
 
-let runtime: PiAftWorkerRuntime | undefined;
+let runtime: PiWorkerRuntime | undefined;
 const active = new Map<
   string,
   { controller: AbortController; done: Promise<void> }
@@ -72,12 +73,35 @@ function serializeError(error: unknown): {
 }
 
 async function initialize(request: InitializeRequest): Promise<void> {
+  if (runtime) {
+    throw new Error("Pi worker runtime is already initialized");
+  }
+  if (shuttingDown) {
+    throw new Error("Pi worker is shutting down");
+  }
   if (request.protocolVersion !== PROTOCOL_VERSION) {
     throw new Error(
       `Unsupported protocol version: ${request.protocolVersion} (expected ${PROTOCOL_VERSION})`,
     );
   }
-  runtime = await createPiAftWorkerRuntime(request.cwd, {});
+  if (request.host !== "pi") {
+    throw new Error(`Unsupported Pi worker host: ${request.host}`);
+  }
+  if (request.runtimeVersion !== PI_REMOTE_RUNTIME_VERSION) {
+    throw new Error(
+      `Unsupported Pi runtime contract: ${request.runtimeVersion} (expected ${PI_REMOTE_RUNTIME_VERSION})`,
+    );
+  }
+  if (!request.assembly) {
+    throw new Error("Pi worker initialization requires a runtime assembly");
+  }
+  if (
+    stableJson(request.tools) !==
+    stableJson(request.assembly.tools.map((tool) => tool.name))
+  ) {
+    throw new Error("Pi worker tool list does not match the runtime assembly");
+  }
+  runtime = await createPiWorkerRuntime(request.cwd, request.assembly);
   send(runtime.manifest);
 }
 

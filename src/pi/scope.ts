@@ -2,10 +2,10 @@ import { RemoteRuntimeClient } from "../client.ts";
 import type { RemoteConnectRequest } from "../connect-options.ts";
 import type { ReadyMessage } from "../protocol.ts";
 import { buildSshWorkerCommand } from "../ssh.ts";
-import type { PiRuntimeProfile } from "./profile.ts";
+import type { PiRuntimeAssembly } from "./assembly.ts";
 
 export interface OpenPiRemoteScopeOptions {
-  profile: PiRuntimeProfile;
+  assembly: PiRuntimeAssembly;
   connectOptions: RemoteConnectRequest;
   workerPath: string;
   cwd: string;
@@ -13,7 +13,7 @@ export interface OpenPiRemoteScopeOptions {
 }
 
 export class PiRemoteWorkspaceScope {
-  readonly profile: PiRuntimeProfile;
+  readonly assembly: PiRuntimeAssembly;
   readonly connectOptions: RemoteConnectRequest;
   readonly workerPath: string;
   readonly cwd: string;
@@ -25,7 +25,7 @@ export class PiRemoteWorkspaceScope {
     client: RemoteRuntimeClient,
     ready: ReadyMessage,
   ) {
-    this.profile = options.profile;
+    this.assembly = options.assembly;
     this.connectOptions = options.connectOptions;
     this.workerPath = options.workerPath;
     this.cwd = options.cwd;
@@ -48,7 +48,7 @@ export class PiRemoteWorkspaceScope {
     try {
       const ready = await client.initialize(
         options.cwd,
-        options.profile.handshake,
+        options.assembly.handshake,
         options.initializeTimeoutMs ?? 30_000,
       );
       return new PiRemoteWorkspaceScope(options, client, ready);
@@ -69,9 +69,9 @@ export class PiRemoteWorkspaceScope {
     signal?: AbortSignal,
     onUpdate?: (update: unknown) => void,
   ): Promise<unknown> {
-    if (!this.profile.knownWorkspaceTools.has(tool)) {
+    if (!this.assembly.knownWorkspaceTools.has(tool)) {
       throw new Error(
-        `Tool ${tool} is not admitted by Pi profile ${this.profile.id}`,
+        `Tool ${tool} is not admitted by Pi assembly ${this.assembly.id}`,
       );
     }
     return this.client.execute(tool, toolCallId, args, signal, onUpdate);

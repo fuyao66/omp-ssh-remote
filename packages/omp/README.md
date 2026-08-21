@@ -12,7 +12,7 @@ Remote native tools:
 
 `read`, `write`, `edit`, foreground `bash`, `grep`, `glob`, `lsp`, `ast_grep`, `ast_edit`, constrained `eval`, and `debug`.
 
-Ordinary non-isolated subagents inherit the connection configuration but receive independent companion processes. `task isolated:true`, remote async Bash, and artifact transfer are not supported and fail closed.
+Ordinary non-isolated subagents inherit the connection configuration but receive independent companion processes. The remote host does not install OMP; `ompVersion` is the bundled worker identity and must equal local OMP `17.3.3`. `task isolated:true`, remote async Bash, and artifact transfer are not supported and fail closed.
 
 ```mermaid
 flowchart LR
@@ -20,7 +20,7 @@ flowchart LR
   Adapter <--> SSH[Persistent bounded SSH NDJSON]
   SSH <--> Worker[Remote OMP companion]
   Worker --> Tools[Native ToolSession: files, AST, LSP, eval, debug]
-  Tools --> Worktree[Remote workspace]
+  Tools --> RemoteFS[Remote workspace]
 ```
 
 ## Requirements
@@ -105,7 +105,7 @@ First upload of the x64 worker took `32.7 s`; cached connections avoid that tran
 - Linux glibc x86_64 and ARM64 only;
 - OMP `17.3.3` only;
 - no async Bash / local `hub` job bridge;
-- no remote isolated worktrees;
+- no `task isolated:true` remote worktrees;
 - no remote-to-local artifact bridge;
 - no output frame above 16 MiB;
 - no remote browser, desktop, model credentials, memory, or local session control plane.

@@ -6,11 +6,14 @@ import {
   parseMessage,
   parseRequest,
   type ReadyMessage,
+  type RuntimeAssemblyRequest,
 } from "../src/protocol.ts";
 import {
-  PI_AFT_PROFILE,
-  PI_AFT_REMOTE_TOOLS,
-} from "../src/pi/profiles/pi-aft.ts";
+  PI_CORE_COMPONENT_ID,
+  PI_REMOTE_RUNTIME_VERSION,
+  validatePiReadyMessage,
+} from "../src/pi/assembly.ts";
+import { AFT_PLUGIN_ID } from "../src/pi/plugins/aft.ts";
 import {
   buildScpBaseCommand,
   buildSshWorkerCommand,
@@ -19,6 +22,80 @@ import {
 
 async function* chunks(...values: string[]): AsyncGenerator<Uint8Array> {
   for (const value of values) yield new TextEncoder().encode(value);
+}
+
+const assemblyRequest: RuntimeAssemblyRequest = {
+  id: "schema-compatible-assembly",
+  components: [
+    {
+      id: PI_CORE_COMPONENT_ID,
+      kind: "host",
+      contractVersion: "1",
+      version: "0.90.0",
+    },
+    {
+      id: AFT_PLUGIN_ID,
+      kind: "plugin",
+      contractVersion: "1",
+      version: "0.60.0",
+    },
+  ],
+  tools: [
+    { name: "find", owner: PI_CORE_COMPONENT_ID },
+    { name: "read", owner: AFT_PLUGIN_ID },
+  ],
+};
+const expectedTools = [
+  {
+    name: "find",
+    owner: PI_CORE_COMPONENT_ID,
+    description: "find",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+  },
+  {
+    name: "read",
+    owner: AFT_PLUGIN_ID,
+    description: "read",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+  },
+];
+const validationAssembly = {
+  id: assemblyRequest.id,
+  request: assemblyRequest,
+  tools: expectedTools,
+};
+
+function validReady(): ReadyMessage {
+  return {
+    type: "ready",
+    protocolVersion: PROTOCOL_VERSION,
+    host: "pi",
+    hostVersion: "0.91.0",
+    toolRuntimeVersion: PI_REMOTE_RUNTIME_VERSION,
+    tools: expectedTools.map(({ name, description, parameters }) => ({
+      name,
+      description,
+      parameters,
+    })),
+    capabilities: {
+      assembly: {
+        id: assemblyRequest.id,
+        components: [
+          { ...assemblyRequest.components[0], version: "0.91.0" },
+          { ...assemblyRequest.components[1], version: "0.61.0" },
+        ],
+        tools: assemblyRequest.tools.map((tool) => ({ ...tool })),
+      },
+    },
+  };
 }
 
 describe("protocol boundaries", () => {
@@ -33,6 +110,22 @@ describe("protocol boundaries", () => {
       { type: "shutdown" },
       { type: "cancel", id: "1" },
     ]);
+  });
+
+  test("parses a structured runtime assembly on initialization", () => {
+    const request = parseRequest({
+      type: "initialize",
+      protocolVersion: PROTOCOL_VERSION,
+      host: "pi",
+      hostVersion: "0.90.0",
+      runtimeVersion: PI_REMOTE_RUNTIME_VERSION,
+      cwd: "/workspace",
+      tools: ["find", "read"],
+      assembly: assemblyRequest,
+    });
+    expect(
+      request.type === "initialize" ? request.assembly : undefined,
+    ).toEqual(assemblyRequest);
   });
 
   test("rejects oversized unterminated frames", async () => {
@@ -51,38 +144,30 @@ describe("protocol boundaries", () => {
     expect(() => parseMessage('{"type":"result","id":"1"}')).toThrow(
       "missing result",
     );
+    expect(() =>
+      parseRequest({
+        type: "initialize",
+        protocolVersion: 1,
+        runtimeVersion: "1",
+        cwd: "/tmp",
+        tools: [],
+        assembly: { id: "bad", components: [{}], tools: [] },
+      }),
+    ).toThrow("must be a string");
   });
 });
 
-describe("Pi runtime manifest boundary", () => {
-  const validReady = (): ReadyMessage => ({
-    type: "ready",
-    protocolVersion: PROTOCOL_VERSION,
-    host: "pi",
-    hostVersion: PI_AFT_PROFILE.handshake.hostVersion,
-    toolRuntimeVersion: PI_AFT_PROFILE.handshake.runtimeVersion,
-    tools: PI_AFT_REMOTE_TOOLS.map((name) => ({
-      name,
-      description: `${name} parameters`,
-      parameters: { type: "object", properties: {} },
-    })),
-    capabilities: {
-      profileId: PI_AFT_PROFILE.id,
-      profileVersion: PI_AFT_PROFILE.version,
-      aftHostRuntime: "@cortexkit/aft-pi@0.51.2",
-    },
-  });
-
-  test("accepts only the complete version-locked Pi and AFT surface", () => {
+describe("Pi runtime assembly boundary", () => {
+  test("accepts different Pi and plugin versions when contracts and schemas match", () => {
     expect(() =>
-      PI_AFT_PROFILE.handshake.validateReady(validReady()),
+      validatePiReadyMessage(validationAssembly, validReady()),
     ).not.toThrow();
   });
 
-  test("rejects missing, unknown, duplicate, and invalid-schema tools", () => {
+  test("rejects missing, unknown, duplicate, and incompatible tools", () => {
     const missing = validReady();
-    missing.tools = missing.tools.filter((tool) => tool.name !== "aft_outline");
-    expect(() => PI_AFT_PROFILE.handshake.validateReady(missing)).toThrow(
+    missing.tools = missing.tools.filter((tool) => tool.name !== "read");
+    expect(() => validatePiReadyMessage(validationAssembly, missing)).toThrow(
       "missing tools",
     );
 
@@ -92,21 +177,46 @@ describe("Pi runtime manifest boundary", () => {
       description: "unexpected",
       parameters: { type: "object" },
     });
-    expect(() => PI_AFT_PROFILE.handshake.validateReady(unknown)).toThrow(
+    expect(() => validatePiReadyMessage(validationAssembly, unknown)).toThrow(
       "unsupported tool",
     );
 
     const duplicate = validReady();
     duplicate.tools.push(duplicate.tools[0]!);
-    expect(() => PI_AFT_PROFILE.handshake.validateReady(duplicate)).toThrow(
+    expect(() => validatePiReadyMessage(validationAssembly, duplicate)).toThrow(
       "duplicate tool",
     );
 
     const invalidSchema = validReady();
     invalidSchema.tools[0] = { ...invalidSchema.tools[0]!, parameters: {} };
-    expect(() => PI_AFT_PROFILE.handshake.validateReady(invalidSchema)).toThrow(
-      "invalid parameter schema",
-    );
+    expect(() =>
+      validatePiReadyMessage(validationAssembly, invalidSchema),
+    ).toThrow("invalid parameter schema");
+
+    const incompatibleSchema = validReady();
+    incompatibleSchema.tools[0] = {
+      ...incompatibleSchema.tools[0]!,
+      parameters: { type: "object", properties: {} },
+    };
+    expect(() =>
+      validatePiReadyMessage(validationAssembly, incompatibleSchema),
+    ).toThrow("schema is incompatible");
+  });
+
+  test("rejects component contract and ownership drift", () => {
+    const contractDrift = validReady();
+    const capability = contractDrift.capabilities?.assembly as any;
+    capability.components[1].contractVersion = "2";
+    expect(() =>
+      validatePiReadyMessage(validationAssembly, contractDrift),
+    ).toThrow("component contract mismatch");
+
+    const ownershipDrift = validReady();
+    const ownershipCapability = ownershipDrift.capabilities?.assembly as any;
+    ownershipCapability.tools[1].owner = PI_CORE_COMPONENT_ID;
+    expect(() =>
+      validatePiReadyMessage(validationAssembly, ownershipDrift),
+    ).toThrow("tool ownership");
   });
 });
 

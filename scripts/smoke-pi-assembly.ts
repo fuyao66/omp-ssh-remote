@@ -1,5 +1,5 @@
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { hostname } from "node:os";
-import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   DefaultResourceLoader,
@@ -9,27 +9,26 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import aftExtension from "@cortexkit/aft-pi";
-import {
-  PI_AFT_REMOTE_TOOLS,
-  PI_AFT_NATIVE_TOOLS,
-} from "../src/pi/profiles/pi-aft.ts";
+import { PI_CORE_TOOL_NAMES } from "../src/pi/assembly.ts";
+import { AFT_PLUGIN_ID, AFT_PLUGIN_TOOLS } from "../src/pi/plugins/aft.ts";
 
 const target = process.env.REMOTE_TARGET;
 const remoteCwd = process.env.REMOTE_CWD;
 const expectedHostname = process.env.REMOTE_EXPECTED_HOSTNAME;
+const pluginMode = process.env.PI_SMOKE_PLUGINS ?? "aft";
 if (!target || !remoteCwd) {
   throw new Error("REMOTE_TARGET and REMOTE_CWD are required");
 }
-const root = await mkdtemp("/tmp/pi-ssh-remote-profile-");
+if (pluginMode !== "none" && pluginMode !== "aft") {
+  throw new Error("PI_SMOKE_PLUGINS must be none or aft");
+}
+const withAft = pluginMode === "aft";
+const root = await mkdtemp("/tmp/pi-ssh-remote-assembly-");
 const agentDir = join(root, "agent");
 const localCwd = join(root, "project");
 await Promise.all([
-  import("node:fs/promises").then(({ mkdir }) =>
-    mkdir(agentDir, { recursive: true }),
-  ),
-  import("node:fs/promises").then(({ mkdir }) =>
-    mkdir(localCwd, { recursive: true }),
-  ),
+  mkdir(agentDir, { recursive: true }),
+  mkdir(localCwd, { recursive: true }),
 ]);
 
 const settingsManager = SettingsManager.create(localCwd, agentDir);
@@ -40,7 +39,9 @@ const resourceLoader = new DefaultResourceLoader({
   additionalExtensionPaths: [
     new URL("../packages/pi", import.meta.url).pathname,
   ],
-  extensionFactories: [{ name: "aft", factory: aftExtension, hidden: true }],
+  extensionFactories: withAft
+    ? [{ name: AFT_PLUGIN_ID, factory: aftExtension, hidden: true }]
+    : [],
   noExtensions: true,
   noSkills: true,
   noPromptTemplates: true,
@@ -56,8 +57,8 @@ const { session } = await createAgentSession({
   sessionManager: SessionManager.inMemory(localCwd),
   tools: [
     ...new Set([
-      ...PI_AFT_NATIVE_TOOLS,
-      ...PI_AFT_REMOTE_TOOLS,
+      ...PI_CORE_TOOL_NAMES,
+      ...(withAft ? AFT_PLUGIN_TOOLS : []),
       "remote_connect",
       "remote_exit",
       "remote_workspace_status",
@@ -87,7 +88,7 @@ const execute = async (name: string, args: Record<string, unknown>) => {
   const tool = session.getToolDefinition(name) as ToolDefinition | undefined;
   if (!tool) throw new Error(`Missing tool definition ${name}`);
   return tool.execute(
-    `profile-smoke-${name}-${Date.now()}`,
+    `assembly-smoke-${name}-${Date.now()}`,
     args,
     undefined,
     undefined,
@@ -103,18 +104,33 @@ const textOf = (result: unknown): string => {
 let remoteConnected = false;
 try {
   const localReadSource = toolSource("read");
-  if (!localReadSource.includes("aft")) {
-    throw new Error(`Local read is not owned by AFT: ${localReadSource}`);
+  if (withAft !== localReadSource.includes(AFT_PLUGIN_ID)) {
+    throw new Error(`Unexpected local read owner: ${localReadSource}`);
   }
 
   await execute("remote_connect", { target, cwd: remoteCwd });
   remoteConnected = true;
 
+  const status = JSON.parse(
+    textOf(await execute("remote_workspace_status", {})),
+  );
+  const pluginIds = (status.assembly?.plugins ?? []).map(
+    (plugin: { id?: string }) => plugin.id,
+  );
+  if (
+    status.assembly?.host?.id !== "pi-core" ||
+    withAft !== pluginIds.includes(AFT_PLUGIN_ID)
+  ) {
+    throw new Error(
+      `Resolved runtime assembly is incorrect: ${JSON.stringify(status)}`,
+    );
+  }
+
   const remoteRead = session.getAllTools().find((tool) => tool.name === "read");
   const remoteReadSource = toolSource("read");
   if (
     !remoteReadSource.includes("packages/pi/dist/pi-extension.js") ||
-    remoteReadSource.includes("aft")
+    remoteReadSource.includes(AFT_PLUGIN_ID)
   ) {
     throw new Error(`Remote read owner is incorrect: ${remoteReadSource}`);
   }
@@ -139,31 +155,39 @@ try {
     );
   }
 
-  const probePath = ".pi-ssh-remote-profile-smoke.ts";
+  const probePath = ".pi-ssh-remote-assembly-smoke.ts";
   await execute("write", {
     path: probePath,
-    content: "export interface RemoteProfileProbe { id: string }\n",
+    content: "export interface RemoteAssemblyProbe { id: string }\n",
   });
-  const outline = textOf(await execute("aft_outline", { target: probePath }));
-  if (!outline.includes("RemoteProfileProbe")) {
-    throw new Error(`Remote AFT outline failed: ${outline}`);
+  const probe = textOf(
+    withAft
+      ? await execute("aft_outline", { target: probePath })
+      : await execute("read", { path: probePath }),
+  );
+  if (!probe.includes("RemoteAssemblyProbe")) {
+    throw new Error(
+      `Remote ${withAft ? "AFT outline" : "Pi read"} failed: ${probe}`,
+    );
   }
   await execute("bash", { command: `rm -f ${probePath}` });
 
   await session.prompt("/remote-exit");
   remoteConnected = false;
   const restoredReadSource = toolSource("read");
-  if (!restoredReadSource.includes("aft")) {
-    throw new Error(`Local AFT owner was not restored: ${restoredReadSource}`);
+  if (withAft !== restoredReadSource.includes(AFT_PLUGIN_ID)) {
+    throw new Error(`Local read owner was not restored: ${restoredReadSource}`);
   }
 
   console.log(
     JSON.stringify({
+      pluginMode,
+      assembly: status.assembly,
       localReadSource,
       remoteReadSource,
       restoredReadSource,
       remoteHostname,
-      outline: outline.trim(),
+      probe: probe.trim(),
     }),
   );
 } finally {

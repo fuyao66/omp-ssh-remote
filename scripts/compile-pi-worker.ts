@@ -1,6 +1,5 @@
 import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { PI_AFT_PLUGIN_VERSION } from "../src/pi/profiles/pi-aft.ts";
 
 type Target = "arm64" | "x64";
 
@@ -21,19 +20,41 @@ const aftSource = resolve(
 const aftOutfile = resolve(dist, `aft-linux-${target}`);
 await mkdir(dist, { recursive: true });
 
-const aftEntry = resolve(root, "node_modules/@cortexkit/aft-pi/dist/index.js");
+async function packageVersion(path: string): Promise<string> {
+  const manifest = JSON.parse(await readFile(path, "utf8")) as Record<
+    string,
+    unknown
+  >;
+  if (typeof manifest.version !== "string" || !manifest.version) {
+    throw new Error(`Package manifest has no version: ${path}`);
+  }
+  return manifest.version;
+}
+
+const aftPackageDir = resolve(root, "node_modules/@cortexkit/aft-pi");
+const piPackageDir = resolve(
+  root,
+  "node_modules/@earendil-works/pi-coding-agent",
+);
+const [aftVersion, piVersion] = await Promise.all([
+  packageVersion(resolve(aftPackageDir, "package.json")),
+  packageVersion(resolve(piPackageDir, "package.json")),
+]);
+const aftEntry = resolve(aftPackageDir, "dist/index.js");
 const aftSourceText = await readFile(aftEntry, "utf8");
 const patchedAftSource = aftSourceText.replace(
   /var PLUGIN_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/,
-  `var PLUGIN_VERSION = ${JSON.stringify(PI_AFT_PLUGIN_VERSION)};`,
+  `var PLUGIN_VERSION = ${JSON.stringify(aftVersion)};`,
 );
 if (patchedAftSource === aftSourceText) {
-  throw new Error(`Could not lock AFT plugin version in ${aftEntry}`);
+  throw new Error(`Could not embed the resolved AFT version in ${aftEntry}`);
 }
-console.log(`Compiling Pi + AFT worker for ${target}...`);
+console.log(
+  `Compiling composable Pi worker for ${target} (Pi ${piVersion}, AFT adapter ${aftVersion})...`,
+);
 
 const aftBundlePlugin: Bun.BunPlugin = {
-  name: "pi-ssh-remote:aft-version-lock",
+  name: "pi-ssh-remote:aft-runtime",
   setup(build) {
     build.onResolve({ filter: /^@cortexkit\/aft-pi$/ }, () => ({
       path: aftEntry,
@@ -48,7 +69,11 @@ const aftBundlePlugin: Bun.BunPlugin = {
 };
 const result = await Bun.build({
   entrypoints: [resolve(root, "src/pi-worker.ts")],
-  define: { "process.env.PI_COMPILED": JSON.stringify("true") },
+  define: {
+    "process.env.PI_COMPILED": JSON.stringify("true"),
+    "process.env.PI_BUNDLED_HOST_VERSION": JSON.stringify(piVersion),
+    "process.env.PI_BUNDLED_AFT_VERSION": JSON.stringify(aftVersion),
+  },
   plugins: [aftBundlePlugin],
   compile: {
     target: bunTarget,
@@ -80,5 +105,5 @@ const [workerHash, aftHash] = await Promise.all([
   writeHash(aftOutfile),
 ]);
 console.log(
-  `Pi ${target} worker: ${outfile} (${workerHash}); AFT: ${aftOutfile} (${aftHash})`,
+  `Pi ${target} worker: ${outfile} (${workerHash}); AFT adapter artifact: ${aftOutfile} (${aftHash})`,
 );

@@ -1,6 +1,21 @@
+import {
+  createBashTool,
+  createEditTool,
+  createFindTool,
+  createGrepTool,
+  createLsTool,
+  createReadTool,
+  createSyntheticSourceInfo,
+  createWriteTool,
+} from "@earendil-works/pi-coding-agent";
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
-import { PI_AFT_PROFILE } from "../src/pi/profiles/pi-aft.ts";
+import {
+  PI_CORE_TOOL_NAMES,
+  resolvePiRuntimeAssembly,
+  type PiRuntimeAssembly,
+  type PiToolSnapshot,
+} from "../src/pi/assembly.ts";
 import {
   loadConfiguredSshHosts,
   parseConnectArgs,
@@ -20,6 +35,32 @@ if (!target) throw new Error("REMOTE_ALIAS or REMOTE_TARGET is required");
 
 function quote(value: string): string {
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
+}
+
+async function basePiAssembly(cwd: string): Promise<PiRuntimeAssembly> {
+  const definitions = [
+    createReadTool(cwd),
+    createWriteTool(cwd),
+    createEditTool(cwd),
+    createBashTool(cwd),
+    createGrepTool(cwd),
+    createFindTool(cwd),
+    createLsTool(cwd),
+  ];
+  const tools = definitions.map(
+    (tool): PiToolSnapshot => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+      sourceInfo: createSyntheticSourceInfo(`<builtin:${tool.name}>`, {
+        source: "builtin",
+      }),
+    }),
+  );
+  return resolvePiRuntimeAssembly({
+    tools,
+    activeTools: [...PI_CORE_TOOL_NAMES],
+  });
 }
 
 const configuredHosts = await loadConfiguredSshHosts(process.cwd());
@@ -60,7 +101,7 @@ const summary = (samples: number[]) => ({
 
 const localArtifactDir = new URL(`../packages/${host}/dist/`, import.meta.url)
   .pathname;
-const runtime = host === "pi" ? PI_AFT_PROFILE : undefined;
+const runtime = host === "pi" ? await basePiAssembly(process.cwd()) : undefined;
 let started = performance.now();
 const prepared = await prepareRemoteWorker(
   { ...connection, localArtifactDir },
@@ -108,20 +149,13 @@ try {
             ),
           ),
         }
-      : {
-          aftOutline: summary(
-            await sample(8, (index) =>
-              client.execute("aft_outline", `benchmark-aft-${index}`, {
-                target: benchmarkFile,
-              }),
-            ),
-          ),
-        };
+      : {};
 
   console.log(
     JSON.stringify({
       host,
-      remotePlatform: ready.capabilities?.aftHostRuntime ?? ready.ompVersion,
+      remoteRuntime:
+        ready.capabilities?.assembly ?? ready.ompVersion ?? ready.hostVersion,
       toolCount: ready.tools.length,
       deployCacheMs,
       initializeMs,
