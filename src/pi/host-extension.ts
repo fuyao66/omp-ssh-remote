@@ -27,7 +27,7 @@ import { PiRemoteWorkspaceScope } from "./scope.ts";
 import { PI_PLUGIN_ADAPTERS } from "./plugins/index.ts";
 const STATE_KEY = Symbol.for("pi-ssh-remote/state");
 
-function filterStaleRemoteWrappers(
+export function filterStaleRemoteWrappers(
   tools: readonly ToolInfo[],
 ): readonly ToolInfo[] {
   const controlSource = sourceKey(

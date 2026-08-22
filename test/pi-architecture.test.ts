@@ -14,6 +14,7 @@ import {
 } from "../src/pi/assembly.ts";
 import { AFT_PLUGIN_ID } from "../src/pi/plugins/aft.ts";
 import { PiRemoteWorkspaceScope } from "../src/pi/scope.ts";
+import { filterStaleRemoteWrappers } from "../src/pi/host-extension.ts";
 
 const ENV_KEY = "PI_REMOTE_CONNECTION_SPEC";
 const objectSchema = { type: "object", properties: {} };
@@ -276,5 +277,61 @@ describe("Pi package provenance", () => {
       AFT_PLUGIN_ID,
     ]);
     expect(assembly.tools[0]?.owner).toBe(AFT_PLUGIN_ID);
+  });
+});
+
+describe("stale remote wrapper filtering", () => {
+  const extensionSource = {
+    source: "local",
+    path: "/ext/omp-ssh-remote/index.ts",
+  };
+
+  test("drops leftover remote wrappers but keeps native tools before reconnection", () => {
+    const tools = [
+      {
+        name: "remote_workspace_status",
+        description: "status",
+        parameters: objectSchema,
+        sourceInfo: extensionSource,
+      },
+      {
+        name: "read",
+        description: "stale remote wrapper",
+        parameters: objectSchema,
+        sourceInfo: extensionSource,
+      },
+      {
+        name: "read",
+        description: "native read",
+        parameters: objectSchema,
+        sourceInfo: { source: "builtin", path: "<builtin:read>" },
+      },
+      {
+        name: "custom_control_tool",
+        description: "extension-owned control tool",
+        parameters: objectSchema,
+        sourceInfo: extensionSource,
+      },
+    ];
+    const kept = filterStaleRemoteWrappers(tools as never);
+    expect(
+      kept.map((item) => `${item.name}:${item.description}`),
+    ).toEqual([
+      "remote_workspace_status:status",
+      "read:native read",
+      "custom_control_tool:extension-owned control tool",
+    ]);
+  });
+
+  test("keeps the registry unchanged when no control tool is present", () => {
+    const tools = [
+      {
+        name: "read",
+        description: "stale remote wrapper",
+        parameters: objectSchema,
+        sourceInfo: extensionSource,
+      },
+    ];
+    expect(filterStaleRemoteWrappers(tools as never)).toBe(tools as never);
   });
 });
