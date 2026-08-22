@@ -24,8 +24,25 @@ import {
   type PiRuntimeAssembly,
 } from "./assembly.ts";
 import { PiRemoteWorkspaceScope } from "./scope.ts";
-
+import { PI_PLUGIN_ADAPTERS } from "./plugins/index.ts";
 const STATE_KEY = Symbol.for("pi-ssh-remote/state");
+
+function filterStaleRemoteWrappers(
+  tools: readonly ToolInfo[],
+): readonly ToolInfo[] {
+  const controlSource = sourceKey(
+    tools.find((tool) => tool.name === "remote_workspace_status"),
+  );
+  if (!controlSource) return tools;
+  const remoteWorkspaceNames = new Set([
+    ...PI_CORE_TOOL_NAMES,
+    ...PI_PLUGIN_ADAPTERS.flatMap((adapter) => [...adapter.remoteTools]),
+  ]);
+  return tools.filter(
+    (tool) =>
+      !(remoteWorkspaceNames.has(tool.name) && sourceKey(tool) === controlSource),
+  );
+}
 
 export interface PiRemoteWorkspaceStatus {
   mode: "local" | "remote" | "unavailable";
@@ -214,11 +231,13 @@ export default async function piRemoteExtension(
   }
   let registeredRemoteTools = new Set<string>();
 
-  const resolveCurrentAssembly = (): Promise<PiRuntimeAssembly> =>
-    resolvePiRuntimeAssembly({
-      tools: pi.getAllTools(),
-      activeTools: pi.getActiveTools(),
-    });
+  const resolveCurrentAssembly = (): Promise<PiRuntimeAssembly> => {
+      const tools = filterStaleRemoteWrappers(pi.getAllTools());
+      return resolvePiRuntimeAssembly({
+        tools,
+        activeTools: pi.getActiveTools(),
+      });
+    };
 
   const verifyOwnership = (): void => {
     if (!state.selected || !state.ready) return;
@@ -470,9 +489,9 @@ export default async function piRemoteExtension(
       const command = force ? "/remote-exit --force" : "/remote-exit";
       setImmediate(() => {
         pi.sendUserMessage(command, {
-          deliverAs: "followUp",
-          expandPromptTemplates: true,
-        });
+                  deliverAs: "steer",
+                  expandPromptTemplates: true,
+                });
       });
       return {
         content: [{ type: "text", text: `Queued ${command}` }],
