@@ -5,7 +5,7 @@
     "": {
       "name": "omp-ssh-remote",
       "dependencies": {
-        "@cortexkit/aft-pi": ">=0.51.2",
+        "@cortexkit/aft-pi": ">=0.52.0",
         "@earendil-works/pi-agent-core": ">=0.84.2",
         "@earendil-works/pi-ai": ">=0.84.2",
         "@earendil-works/pi-coding-agent": ">=0.84.2",
@@ -101,23 +101,23 @@
 
     "@bufbuild/protobuf": ["@bufbuild/protobuf@2.14.0", "", {}, "sha512-C3UGsiCwSprE2NKIIFA3hCDlpXTMCAXRZuEVp88L1GY36Y41+rYL5fryE+nOFhp4p4JPQvdV8PQ4DWgHgeTE+w=="],
 
-    "@cortexkit/aft-bridge": ["@cortexkit/aft-bridge@0.51.3", "", { "dependencies": { "@cortexkit/subc-client": "^0.5.0", "undici": "^7.25.0" } }, "sha512-8OkBTPtFnXRMrGe79w7nNOo/qx2xo1f4a7U3WUBNUf6+tsvjTaZDedD464jy8OLy9fEQo33iPXYkeuQScCGrig=="],
+    "@cortexkit/aft-bridge": ["@cortexkit/aft-bridge@0.52.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.8.1", "undici": "^7.25.0" } }, "sha512-xJe0VhUgNFeAWD8C+KTAUZAxCGr+LPBADs0nhSl58OOPsEOA7uMJIwO2Ikew0hp6KB9+rsobXip6ePE51fXPqQ=="],
 
-    "@cortexkit/aft-darwin-arm64": ["@cortexkit/aft-darwin-arm64@0.51.3", "", { "os": "darwin", "cpu": "arm64", "bin": { "aft": "bin/aft" } }, "sha512-fUia4vP5EJRs9qgHJfTFbA/ebu3HsdtrPMHC1u0g4H+iuzrTOTqwz0dMe9c1tjpj8k0A4ACuWb2IOS7bc+InSw=="],
+    "@cortexkit/aft-darwin-arm64": ["@cortexkit/aft-darwin-arm64@0.52.0", "", { "os": "darwin", "cpu": "arm64", "bin": { "aft": "bin/aft" } }, "sha512-xH2M7YEaY6JVMARdeVcSaYh1LJ9vecKd61BIf3ooUCtwvRtEf89ga8N5w4n1YusyiSzph6bmJPrGALhEjHAgxw=="],
 
-    "@cortexkit/aft-darwin-x64": ["@cortexkit/aft-darwin-x64@0.51.3", "", { "os": "darwin", "cpu": "x64", "bin": { "aft": "bin/aft" } }, "sha512-7p1UIukN1Z2HJKM5eV+l/0JXxrB6yXBWhwrEv3gIs92cm0tZrwu5jrJwKPvaMPOVLaCBDxDV/yqkjdiaJOvOCA=="],
+    "@cortexkit/aft-darwin-x64": ["@cortexkit/aft-darwin-x64@0.52.0", "", { "os": "darwin", "cpu": "x64", "bin": { "aft": "bin/aft" } }, "sha512-ACwCriP+wzv8tKZQbepJ2wUQkRTt43/i5Mvt5+FdZhT/dzn5mO7eIPCgpwTLBgVZCjxZeBuaTAhLyyfnDURKFg=="],
 
-    "@cortexkit/aft-linux-arm64": ["@cortexkit/aft-linux-arm64@0.51.3", "", { "os": "linux", "cpu": "arm64", "bin": { "aft": "bin/aft" } }, "sha512-6rVGojpWpVPqQyP0AStwBVuCjtYrYxGGnMPri1gVik+ul1uxsj+tHMaVEhMAuj6OZ4d+fGD+4t+S8JxzSefdYQ=="],
+    "@cortexkit/aft-linux-arm64": ["@cortexkit/aft-linux-arm64@0.52.0", "", { "os": "linux", "cpu": "arm64", "bin": { "aft": "bin/aft" } }, "sha512-lQk8lqOdD6gQkIM2NVOZA6IecmgsIh9w3lgdMUdbIEbtCWiGNbHX1CIgoMz2MNwtXVgDffI5IY95ks5hHGr9aw=="],
 
-    "@cortexkit/aft-linux-x64": ["@cortexkit/aft-linux-x64@0.51.3", "", { "os": "linux", "cpu": "x64", "bin": { "aft": "bin/aft" } }, "sha512-A66yRJ9laHsK7OUDi4QaPAKWimUYksvby9j4VABz3JTUkRHNqJfCxTca+MvYIoFkbeeLHrhNfy03jmaRqMsfKg=="],
+    "@cortexkit/aft-linux-x64": ["@cortexkit/aft-linux-x64@0.52.0", "", { "os": "linux", "cpu": "x64", "bin": { "aft": "bin/aft" } }, "sha512-hqgqXiO4Ndyn3tZfqL9ZZDd+BhQtQnKf5elr2zOJ9HGy4sPKs69t9169zLPDSQvBta1fwOj0mEIcgCwA5YXsdQ=="],
 
-    "@cortexkit/aft-pi": ["@cortexkit/aft-pi@0.51.3", "", { "dependencies": { "@cortexkit/aft-bridge": "0.51.3", "comment-json": "^5.0.0", "diff": "^8.0.4", "typebox": "1.1.38", "zod": "^4.4.3" }, "optionalDependencies": { "@cortexkit/aft-darwin-arm64": "0.51.3", "@cortexkit/aft-darwin-x64": "0.51.3", "@cortexkit/aft-linux-arm64": "0.51.3", "@cortexkit/aft-linux-x64": "0.51.3", "@cortexkit/aft-win32-arm64": "0.51.3", "@cortexkit/aft-win32-x64": "0.51.3" }, "peerDependencies": { "@earendil-works/pi-coding-agent": "*", "@earendil-works/pi-tui": "*" } }, "sha512-EN8IQOSpGDhjzHZ2nc0JWAfuWYhXgZXN9EdzIuhaS7y5/+eBNhY1lq9aVkMVP5/AaS05QlruJZXCGVbcf2XcKg=="],
+    "@cortexkit/aft-pi": ["@cortexkit/aft-pi@0.52.0", "", { "dependencies": { "@cortexkit/aft-bridge": "0.52.0", "comment-json": "^5.0.0", "diff": "^8.0.4", "typebox": "1.1.38", "zod": "^4.4.3" }, "optionalDependencies": { "@cortexkit/aft-darwin-arm64": "0.52.0", "@cortexkit/aft-darwin-x64": "0.52.0", "@cortexkit/aft-linux-arm64": "0.52.0", "@cortexkit/aft-linux-x64": "0.52.0", "@cortexkit/aft-win32-arm64": "0.52.0", "@cortexkit/aft-win32-x64": "0.52.0" }, "peerDependencies": { "@earendil-works/pi-coding-agent": "*", "@earendil-works/pi-tui": "*" } }, "sha512-sUWiksu+rL77a5E5Y/2nvH3xJmUNb0cA0tROFDHX1JuQg2tDKu1XbCiAetbgGJtwwCO9nUT98BUjQ9IGaWqzZQ=="],
 
-    "@cortexkit/aft-win32-arm64": ["@cortexkit/aft-win32-arm64@0.51.3", "", { "os": "win32", "cpu": "arm64", "bin": { "aft": "bin/aft.exe" } }, "sha512-gR3vZQcHXlyA+GR2kwsCag7RUMYFqRSOMTuCy0WFOw1Tb3Ne6D5d9fqlFZv2h1RB0LDw0c/X32ixQqY4vMc+/w=="],
+    "@cortexkit/aft-win32-arm64": ["@cortexkit/aft-win32-arm64@0.52.0", "", { "os": "win32", "cpu": "arm64", "bin": { "aft": "bin/aft.exe" } }, "sha512-MpnHGD/9LRc9kVoP3L31EZirTMZwBjSLPBTNXRpZMnlKPeehVe4q2UvdTD5YPIkve4XimiRSN6vco9y2VK9bLw=="],
 
-    "@cortexkit/aft-win32-x64": ["@cortexkit/aft-win32-x64@0.51.3", "", { "os": "win32", "cpu": "x64", "bin": { "aft": "bin/aft.exe" } }, "sha512-5D2ynKA6ZjCl8EASv75IiWzTNBqvqEdjaNiaU8jQFIAhnTtNc65ioLBEmUGKcNMOTgK9tOgMqnIOAwJdNH/Fzg=="],
+    "@cortexkit/aft-win32-x64": ["@cortexkit/aft-win32-x64@0.52.0", "", { "os": "win32", "cpu": "x64", "bin": { "aft": "bin/aft.exe" } }, "sha512-zaz7gtqsyXNBqHk6mauaO6cNqjzt9GCMbw25LA0dgz2BpybEOlCGrTPoTP3QyXPhBYB30ERbG1atzm4LmtzpfA=="],
 
-    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.5.0", "", {}, "sha512-kk+cwjngl0DuERweZSQnBiixL9y5xqhipIsjpQgfJpKjN5Tm9c38Afq471Tw0agBu9OZHXhUa0SSbElQHiudBw=="],
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.8.1", "", {}, "sha512-8U9w3AnSff0QYlLVzcKOuTULakRtVpcGJrquGHxOQQlWZGzXZdCs8nroLMeoM2xhFGwxIh8xFk832w1KG6akAA=="],
 
     "@earendil-works/pi-agent-core": ["@earendil-works/pi-agent-core@0.84.2", "", { "dependencies": { "@earendil-works/pi-ai": "^0.84.2", "@earendil-works/pi-telemetry": "^0.84.2", "diff": "8.0.4", "ignore": "7.0.5", "typebox": "1.3.7", "yaml": "2.9.0" } }, "sha512-8Pn3wSCxj0cfo5I6jxQYVB/3uuQRmHhAlEclyjqpOuMEdQMIODHizRogv56FLdbU+dTiGnybeHQ2N+sV1/L2YA=="],
 

@@ -26,6 +26,13 @@ import {
 import { PiRemoteWorkspaceScope } from "./scope.ts";
 import { PI_PLUGIN_ADAPTERS } from "./plugins/index.ts";
 const STATE_KEY = Symbol.for("pi-ssh-remote/state");
+const RELOAD_KEY = Symbol.for("pi-ssh-remote/reload");
+
+type PendingReload = {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+};
 
 export function filterStaleRemoteWrappers(
   tools: readonly ToolInfo[],
@@ -40,7 +47,9 @@ export function filterStaleRemoteWrappers(
   ]);
   return tools.filter(
     (tool) =>
-      !(remoteWorkspaceNames.has(tool.name) && sourceKey(tool) === controlSource),
+      !(
+        remoteWorkspaceNames.has(tool.name) && sourceKey(tool) === controlSource
+      ),
   );
 }
 
@@ -87,10 +96,33 @@ export interface PiRemoteExtensionState {
 
 type GlobalWithPiRemoteState = typeof globalThis & {
   [STATE_KEY]?: PiRemoteExtensionState;
+  [RELOAD_KEY]?: PendingReload;
 };
 
 const globalScope = globalThis as GlobalWithPiRemoteState;
 const globalState = (globalScope[STATE_KEY] ??= { selected: false });
+
+function beginPendingReload(): PendingReload {
+  const existing = globalScope[RELOAD_KEY];
+  if (existing) return existing;
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  const pending = { promise, resolve, reject };
+  globalScope[RELOAD_KEY] = pending;
+  return pending;
+}
+
+function finishPendingReload(error?: unknown): void {
+  const pending = globalScope[RELOAD_KEY];
+  if (!pending) return;
+  delete globalScope[RELOAD_KEY];
+  if (error === undefined) pending.resolve();
+  else pending.reject(error);
+}
 
 export function getPiRemoteState(): PiRemoteExtensionState {
   return globalState;
@@ -232,12 +264,12 @@ export default async function piRemoteExtension(
   let registeredRemoteTools = new Set<string>();
 
   const resolveCurrentAssembly = (): Promise<PiRuntimeAssembly> => {
-      const tools = filterStaleRemoteWrappers(pi.getAllTools());
-      return resolvePiRuntimeAssembly({
-        tools,
-        activeTools: pi.getActiveTools(),
-      });
-    };
+    const tools = filterStaleRemoteWrappers(pi.getAllTools());
+    return resolvePiRuntimeAssembly({
+      tools,
+      activeTools: pi.getActiveTools(),
+    });
+  };
 
   const verifyOwnership = (): void => {
     if (!state.selected || !state.ready) return;
@@ -374,6 +406,7 @@ export default async function piRemoteExtension(
     request: string | RemoteConnectRequest,
     localCwd: string,
   ): Promise<ReadyMessage> => {
+    await globalScope[RELOAD_KEY]?.promise;
     const assembly = await resolveCurrentAssembly();
     const configuredHosts = await loadConfiguredSshHosts(localCwd);
     const parsed =
@@ -487,15 +520,17 @@ export default async function piRemoteExtension(
         typeof params === "object" &&
         (params as Record<string, unknown>).force === true;
       const command = force ? "/remote-exit --force" : "/remote-exit";
+      const pendingReload = beginPendingReload();
       setImmediate(() => {
         pi.sendUserMessage(command, {
-                  deliverAs: "steer",
-                  expandPromptTemplates: true,
-                });
+          deliverAs: "steer",
+          expandPromptTemplates: true,
+        });
       });
+      await pendingReload.promise;
       return {
-        content: [{ type: "text", text: `Queued ${command}` }],
-        details: { queued: true, command },
+        content: [{ type: "text", text: `Disconnected (${command})` }],
+        details: { queued: false, command },
       } as never;
     },
   });
@@ -532,6 +567,7 @@ export default async function piRemoteExtension(
         ctx.ui?.notify?.("Not connected to a remote runtime.", "warning");
         return;
       }
+      beginPendingReload();
       try {
         await state.scope?.close(force);
         state.selected = false;
@@ -549,9 +585,10 @@ export default async function piRemoteExtension(
           "info",
         );
         await ctx.reload();
+        finishPendingReload();
         return;
       } catch (error) {
-        state.selected = true;
+        finishPendingReload(error);
         state.ownershipVerified = false;
         state.connectionError =
           error instanceof Error ? error.message : String(error);
@@ -598,6 +635,7 @@ export default async function piRemoteExtension(
   });
 
   pi.on("session_start", async () => {
+    registeredRemoteTools = new Set();
     if (inheritedSpec && !state.selected && !state.scope) {
       try {
         const assembly = await resolveCurrentAssembly();

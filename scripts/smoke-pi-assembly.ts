@@ -172,8 +172,25 @@ try {
   }
   await execute("bash", { command: `rm -f ${probePath}` });
 
-  await session.prompt("/remote-exit");
+  await execute("remote_exit", { force: false });
+  await new Promise((resolve) => setTimeout(resolve, 1000));
   remoteConnected = false;
+  if (process.env.PI_SMOKE_RECONNECT === "1") {
+    await execute("remote_connect", { target, cwd: remoteCwd });
+    remoteConnected = true;
+    const reconnectedStatus = JSON.parse(
+      textOf(await execute("remote_workspace_status", {})),
+    );
+    if (!reconnectedStatus.assembly?.id) {
+      throw new Error(
+        `Reconnect did not produce an assembly: ${JSON.stringify(reconnectedStatus)}`,
+      );
+    }
+    await execute("bash", { command: "printf reconnect-ok" });
+    await execute("remote_exit", { force: false });
+    remoteConnected = false;
+  }
+
   const restoredReadSource = toolSource("read");
   if (withAft !== restoredReadSource.includes(AFT_PLUGIN_ID)) {
     throw new Error(`Local read owner was not restored: ${restoredReadSource}`);

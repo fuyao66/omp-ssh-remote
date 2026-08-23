@@ -25,7 +25,7 @@
     "check": "bun run typecheck && bun run build && bun test"
   },
   "dependencies": {
-    "@cortexkit/aft-pi": ">=0.51.2",
+    "@cortexkit/aft-pi": ">=0.52.0",
     "@earendil-works/pi-agent-core": ">=0.84.2",
     "@earendil-works/pi-ai": ">=0.84.2",
     "@earendil-works/pi-coding-agent": ">=0.84.2",
