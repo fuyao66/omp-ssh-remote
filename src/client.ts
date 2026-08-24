@@ -63,6 +63,9 @@ export class RemoteRuntimeClient {
       this.#resolveReady = resolve;
       this.#rejectReady = reject;
     });
+    // Client may be killed before initialize() attaches a consumer; keep the
+    // ready rejection from becoming an unhandled fatal session error.
+    void this.#ready.catch(() => {});
     this.#exitPromise = new Promise<number | null>((resolve) => {
       this.#process.on("close", (code) => resolve(code));
     });

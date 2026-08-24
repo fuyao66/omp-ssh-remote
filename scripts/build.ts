@@ -1,6 +1,6 @@
 import { mkdir, readdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
-
+import { resolveOmpHostVersion } from "../src/omp/host-identity.ts";
 type BuildTarget = "all" | "omp" | "pi";
 const target = (process.argv[2] ?? "all") as BuildTarget;
 if (target !== "all" && target !== "omp" && target !== "pi") {
@@ -50,6 +50,7 @@ const legacyModulePlugin: Bun.BunPlugin = {
 };
 
 if (target === "all" || target === "omp") {
+  const hostVersion = await resolveOmpHostVersion();
   const extension = await Bun.build({
     entrypoints: [resolve(root, "src/extension.ts")],
     outdir: ompOutdir,
@@ -62,6 +63,9 @@ if (target === "all" || target === "omp") {
       "@oh-my-pi/omptype",
       "@oh-my-pi/pi-utils",
     ],
+    define: {
+      "process.env.OMP_COMPILED_HOST_VERSION": JSON.stringify(hostVersion),
+    },
   });
   if (!extension.success)
     throw new AggregateError(extension.logs, "OMP extension build failed");

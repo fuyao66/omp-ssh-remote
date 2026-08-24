@@ -590,13 +590,11 @@ async function attachFamilyMember(
 
   let next: RemoteRuntimeClient | undefined;
   try {
+    const handshake = await ompHandshake(pi);
     next = new RemoteRuntimeClient({
       command: buildSshWorkerCommand(family.connection),
     });
-    const ready = await next.initialize(
-      family.remoteCwd,
-      await ompHandshake(pi),
-    );
+    const ready = await next.initialize(family.remoteCwd, handshake);
     if (family.closing)
       throw new Error(
         "Remote session family disconnected during subagent initialization",
@@ -709,10 +707,11 @@ export default async function remoteRuntimeExtension(
           ...options,
           workerPath: prepared.workerPath,
         };
+        const handshake = await ompHandshake(pi);
         next = new RemoteRuntimeClient({
           command: buildSshWorkerCommand(connection),
         });
-        const ready = await next.initialize(options.cwd, await ompHandshake(pi));
+        const ready = await next.initialize(options.cwd, handshake);
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
           ownerSessionFile: normalizedSessionFile,
@@ -861,10 +860,11 @@ export default async function remoteRuntimeExtension(
           ...options,
           workerPath: prepared.workerPath,
         };
+        const handshake = await ompHandshake(pi);
         next = new RemoteRuntimeClient({
           command: buildSshWorkerCommand(connection),
         });
-        const ready = await next.initialize(options.cwd, await ompHandshake(pi));
+        const ready = await next.initialize(options.cwd, handshake);
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
           ownerSessionFile: normalizedSessionFile,
