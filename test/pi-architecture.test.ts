@@ -192,7 +192,7 @@ describe("tintin subagent assembly inheritance", () => {
     expect(process.env[OWNER_KEY]).toBe("root-a");
   });
 
-  test("does not let a root entry consume the inherited child spec", async () => {
+  test("lets a fresh default entry inherit the active root connection", async () => {
     const assembly = await coreAssembly();
     publishPiTintinSubagentConnectionSpec({
       ownerToken: OWNER_TOKEN,
@@ -205,9 +205,28 @@ describe("tintin subagent assembly inheritance", () => {
     const mock = createPiMock();
     await (await import("../src/pi/pi-extension.ts")).default(mock.pi as never);
     const state = getPiRemoteStateForSession(mock.pi.events as object);
-    expect(state.isInheritedChild).toBeUndefined();
+    expect(state.isInheritedChild).toBe(true);
+    expect(state.inheritanceOwnerToken).toBeUndefined();
     expect(state.selected).toBe(false);
-    expect(readPiTintinSubagentConnectionSpec()).toBeDefined();
+  });
+
+  test("keeps the default entry as root across reloads", async () => {
+    const assembly = await coreAssembly();
+    publishPiTintinSubagentConnectionSpec({
+      ownerToken: OWNER_TOKEN,
+      assembly: assembly.request,
+      tools: assembly.tools,
+      connectOptions: { target: "gpu-box", displayTarget: "gpu-box" },
+      workerPath: "/remote/worker",
+      cwd: "/remote/project",
+    });
+    const mock = createPiMock();
+    const state = getPiRemoteStateForSession(mock.pi.events as object);
+    state.inheritanceOwnerToken = OWNER_TOKEN;
+    await (await import("../src/pi/pi-extension.ts")).default(mock.pi as never);
+    expect(state.isInheritedChild).toBeUndefined();
+    expect(state.inheritanceOwnerToken).toBe(OWNER_TOKEN);
+    expect(state.selected).toBe(false);
   });
 
   test("rejects malformed inherited assemblies", async () => {
@@ -613,8 +632,8 @@ describe("inherited child ownership", () => {
   test("restoration failures leave an inherited child selected and fail-closed", async () => {
     const assembly = await coreAssembly();
     publishPiTintinSubagentConnectionSpec({
-       ownerToken: OWNER_TOKEN,
-       assembly: assembly.request,
+      ownerToken: OWNER_TOKEN,
+      assembly: assembly.request,
       tools: assembly.tools.map((tool) =>
         tool.name === "read" ? { ...tool, owner: "tampered-owner" } : tool,
       ),
@@ -658,8 +677,8 @@ describe("inherited child ownership", () => {
   test("does not consume inherited state after child remote-exit disables inheritance", async () => {
     const assembly = await coreAssembly();
     publishPiTintinSubagentConnectionSpec({
-       ownerToken: OWNER_TOKEN,
-       assembly: assembly.request,
+      ownerToken: OWNER_TOKEN,
+      assembly: assembly.request,
       tools: assembly.tools,
       connectOptions: { target: "gpu-box", displayTarget: "gpu-box" },
       workerPath: "/remote/worker",

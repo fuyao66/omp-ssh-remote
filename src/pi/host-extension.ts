@@ -18,6 +18,7 @@ import {
   claimPiTintinSubagentConnectionSpec,
   clearPiTintinSubagentConnectionSpec,
   hasPiTintinSubagentConnectionSpec,
+  hasPiTintinSubagentRootOwner,
   publishPiTintinSubagentConnectionSpec,
   readPiTintinSubagentConnectionSpec,
 } from "./integrations/tintin-subagents.ts";
@@ -290,19 +291,23 @@ export async function installPiRemoteExtension(
   options: { inheritedChild?: boolean } = {},
 ): Promise<void> {
   const state = pi.events ? getPiRemoteStateForSession(pi.events) : globalState;
-  if (options.inheritedChild) {
+  if (
+    options.inheritedChild ||
+    (state.inheritanceOwnerToken === undefined &&
+      hasPiTintinSubagentRootOwner())
+  ) {
     state.isInheritedChild = true;
   } else {
     state.inheritanceOwnerToken ??= randomUUID();
   }
   const inheritedConnectionRequested =
-    options.inheritedChild === true &&
+    state.isInheritedChild === true &&
     !state.inheritanceDisabled &&
     hasPiTintinSubagentConnectionSpec();
   let inheritedSpec: ReturnType<typeof readPiTintinSubagentConnectionSpec>;
   if (!inheritedConnectionRequested || state.inheritanceDisabled) {
     inheritedSpec = undefined;
-    if (options.inheritedChild && !state.inheritanceDisabled) {
+    if (state.isInheritedChild && !state.inheritanceDisabled) {
       state.selected = true;
       state.ownershipVerified = false;
       state.connectionError =
@@ -372,11 +377,7 @@ export async function installPiRemoteExtension(
           onUpdate?: AgentToolUpdateCallback<unknown>,
           _ctx?: ExtensionContext,
         ) => {
-          if (
-            !state.selected ||
-            !state.scope ||
-            state.scope.isClosed
-          ) {
+          if (!state.selected || !state.scope || state.scope.isClosed) {
             state.connectionError ??=
               "Remote runtime connection lost (fail-closed protection)";
             throw new Error(

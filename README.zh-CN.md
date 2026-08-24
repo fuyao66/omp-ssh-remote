@@ -55,7 +55,7 @@ OMP 与 Pi 在同一 transport 和部署 core 上采用不同的 extension 模�
 
 Pi 首先适配基础 host，再根据当前 active tool registry 和已明确支持的 plugin adapters 计算 runtime assembly。Pi `RuntimeAssembly` 记录 component contracts、实际解析版本、active tool ownership、schema 和必需 artifacts。版本会保留用于身份和诊断，但不作为相等准入条件。只要 component contract 和精确工具 schema 仍兼容，远端 worker 可以使用不同的 Pi/plugin 版本。未知 plugin 永远不会被推断为可远端执行。
 
-当前 registry 支持仅 Pi core，以及由满足各自独立准入合同的 plugin adapter 扩展的 Pi core。`@tintinweb/pi-subagents` 是当前 in-process 编排 integration：一个已连接的 root session 可以创建多个普通 child；每个 child 必须加载 `pi-tintin-extension.js`，恢复父 session 已验证的 assembly、保留本机 Pi cwd，并在父 session 的远端 cwd 上打开独立 companion。同一进程中的第二个独立 root 会被拒绝。它不定义远端 runtime。它的本机 `isolation: "worktree"` 模式不支持远端连接态；真实 SSH smoke 仍是该 integration 的外部 acceptance gate。
+当前 registry 支持仅 Pi core，以及由满足各自独立准入合同的 plugin adapter 扩展的 Pi core。`@tintinweb/pi-subagents` 是当前 in-process 编排 integration：一个已连接的 root session 可以创建多个普通 child。默认 Pi extension 会根据活跃 root owner 识别新的同进程 child；限制 extension 加载的自定义 agent 使用 `pi-tintin-extension.js`。每个 child 恢复父 session 已验证的 assembly、保留本机 Pi cwd，并在父 session 的远端 cwd 上打开独立 companion。同一进程中的第二个独立 root 会被拒绝。它不定义远端 runtime。它的本机 `isolation: "worktree"` 模式不支持远端连接态；真实 SSH smoke 仍是该 integration 的外部 acceptance gate。
 
 ```mermaid
 flowchart LR

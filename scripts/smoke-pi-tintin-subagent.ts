@@ -38,10 +38,7 @@ const rootExtensionPath = new URL(
   "../packages/pi/dist/pi-extension.js",
   import.meta.url,
 ).pathname;
-const tintinChildExtensionPath = new URL(
-  "../packages/pi/dist/pi-tintin-extension.js",
-  import.meta.url,
-).pathname;
+const childExtensionPath = rootExtensionPath;
 const childVerifierPath = new URL(
   "./fixtures/tintin-remote-verifier.ts",
   import.meta.url,
@@ -56,7 +53,7 @@ await writeFile(
   `---
 description: Verify a remote workspace
 extensions:
-  - ${JSON.stringify(tintinChildExtensionPath)}
+  - ${JSON.stringify(childExtensionPath)}
   - ${JSON.stringify(childVerifierPath)}
 tools: bash
 run_in_background: false
@@ -174,7 +171,7 @@ try {
     bashSource?: unknown;
   };
   const bashResults = JSON.stringify(childState.bashResults);
-  if (!JSON.stringify(childState.bashSource).includes(tintinChildExtensionPath)) {
+  if (!JSON.stringify(childState.bashSource).includes(childExtensionPath)) {
     throw new Error(
       `Tintin child bash is not owned by Pi SSH Remote: ${childStateText}`,
     );

@@ -60,6 +60,10 @@ export function hasPiTintinSubagentConnectionSpec(): boolean {
   return process.env[INHERIT_ENV] !== undefined;
 }
 
+export function hasPiTintinSubagentRootOwner(): boolean {
+  return process.env[OWNER_ENV] !== undefined;
+}
+
 export function readPiTintinSubagentConnectionSpec():
   PiTintinSubagentConnectionSpec | undefined {
   const serialized = process.env[INHERIT_ENV];
@@ -94,9 +98,7 @@ export function readPiTintinSubagentConnectionSpec():
   return value as unknown as PiTintinSubagentConnectionSpec;
 }
 
-export function claimPiTintinSubagentConnectionSpec(
-  ownerToken: string,
-): void {
+export function claimPiTintinSubagentConnectionSpec(ownerToken: string): void {
   const existingOwner = process.env[OWNER_ENV];
   if (existingOwner !== undefined && existingOwner !== ownerToken) {
     throw new Error(
@@ -118,9 +120,7 @@ export function publishPiTintinSubagentConnectionSpec(
   process.env[INHERIT_ENV] = JSON.stringify(spec);
 }
 
-export function clearPiTintinSubagentConnectionSpec(
-  ownerToken?: string,
-): void {
+export function clearPiTintinSubagentConnectionSpec(ownerToken?: string): void {
   if (ownerToken === undefined || process.env[OWNER_ENV] !== ownerToken) return;
   delete process.env[INHERIT_ENV];
   delete process.env[OWNER_ENV];

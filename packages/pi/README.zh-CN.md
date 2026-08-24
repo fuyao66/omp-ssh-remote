@@ -137,7 +137,7 @@ packages/pi/dist/aft-linux-arm64.sha256
 /remote-connect user@example.com /srv/project --port 22 --identity ~/.ssh/id_ed25519
 ```
 
-模型可以调用 `remote_connect`、`remote_workspace_status` 和 `remote_exit`。status 会报告 assembly ID、本机与远端 component 版本、工具分组、ownership verification 和 transport state。连接失败或丢失后，必须先 `/remote-exit` 才能重连。一个已连接的 root session 可以创建多个普通 `@tintinweb/pi-subagents` child；每个 child 必须加载 `pi-tintin-extension.js` 才能恢复 root assembly 并打开独立 companion。同一进程中的第二个独立 root 会被拒绝。远端连接态不要启用 tintin 的本机 `isolation: "worktree"` 模式。仓库中的 tintin smoke 是该 integration 的外部 acceptance gate。
+模型可以调用 `remote_connect`、`remote_workspace_status` 和 `remote_exit`。status 会报告 assembly ID、本机与远端 component 版本、工具分组、ownership verification 和 transport state。连接失败或丢失后，必须先 `/remote-exit` 才能重连。一个已连接的 root session 可以创建多个普通 `@tintinweb/pi-subagents` child；默认 Pi extension 会在 root owner 存在时自动识别新的同进程 child。限制 extension 加载的自定义 agent 必须显式加载 `pi-tintin-extension.js`。同一进程中的第二个独立 root 会被拒绝。远端连接态不要启用 tintin 的本机 `isolation: "worktree"` 模式。仓库中的 tintin smoke 是该 integration 的外部 acceptance gate。
 
 ## 部署与安全
 

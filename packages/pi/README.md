@@ -137,7 +137,7 @@ Explicit form:
 /remote-connect user@example.com /srv/project --port 22 --identity ~/.ssh/id_ed25519
 ```
 
-The model can invoke `remote_connect`, `remote_workspace_status`, and `remote_exit`. Status reports the assembly ID, local and remote component versions, tool groups, ownership verification, and transport state. After a failed or lost connection, `/remote-exit` is required before reconnecting. One connected root session may create multiple ordinary `@tintinweb/pi-subagents` children; each child must load `pi-tintin-extension.js` to restore the root assembly and open an independent companion. A second independent root in the same process is rejected. Do not enable tintin's local `isolation: "worktree"` mode for a remote-connected session. The included tintin smoke is the external acceptance gate for this integration.
+The model can invoke `remote_connect`, `remote_workspace_status`, and `remote_exit`. Status reports the assembly ID, local and remote component versions, tool groups, ownership verification, and transport state. After a failed or lost connection, `/remote-exit` is required before reconnecting. One connected root session may create multiple ordinary `@tintinweb/pi-subagents` children; the default Pi extension automatically recognizes a new in-process child while the root owner is active. Custom agents that restrict extension loading must explicitly load `pi-tintin-extension.js`. A second independent root in the same process is rejected. Do not enable tintin's local `isolation: "worktree"` mode for a remote-connected session. The included tintin smoke is the external acceptance gate for this integration.
 
 ## Deployment and Security
 
