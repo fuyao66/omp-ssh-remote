@@ -56,6 +56,12 @@ if (target === "all" || target === "omp") {
     target: "bun",
     format: "esm",
     minify: false,
+    external: [
+      "@oh-my-pi/pi-coding-agent",
+      "@oh-my-pi/pi-agent-core",
+      "@oh-my-pi/omptype",
+      "@oh-my-pi/pi-utils",
+    ],
   });
   if (!extension.success)
     throw new AggregateError(extension.logs, "OMP extension build failed");

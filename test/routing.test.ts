@@ -129,6 +129,22 @@ describe("remote session boundaries", () => {
     ).toBe(false);
   });
 
+  test("matches OMP 18.x task child session artifact layout", () => {
+    // OMP task children write under sessionFile.slice(0, -6) + "/" + name + ".jsonl"
+    expect(
+      sessionBelongsToFamily(
+        "/tmp/omp-ssh-remote-smoke/session.jsonl",
+        "/tmp/omp-ssh-remote-smoke/session/Child.jsonl",
+      ),
+    ).toBe(true);
+    expect(
+      sessionBelongsToFamily(
+        "/tmp/omp-ssh-remote-smoke/session.jsonl",
+        "/tmp/omp-ssh-remote-smoke/session-other/Child.jsonl",
+      ),
+    ).toBe(false);
+  });
+
   test("detects flat and batch isolated task requests", () => {
     expect(taskRequestsIsolation({ task: "read", isolated: true })).toBe(true);
     expect(

@@ -8,7 +8,6 @@ import { disposeAllKernelSessions } from "@oh-my-pi/pi-coding-agent/eval/py/exec
 import { shutdownAll as shutdownAllLspClients } from "@oh-my-pi/pi-coding-agent/lsp/client";
 import { createNativeWorkerRuntime, type NativeWorkerRuntime } from "./runtime.ts";
 import {
-  OMP_VERSION,
   PROTOCOL_VERSION,
   TOOL_RUNTIME_VERSION,
   decodeFrames,
@@ -20,6 +19,8 @@ import {
   type RemoteToolName,
   type Request,
 } from "./protocol.ts";
+import { resolveOmpHostVersion } from "./omp/host-identity.ts";
+import { toolParametersToWire } from "./omp/runtime-contract.ts";
 
 const JS_EVAL_PROCESS_ARG = "__omp_worker_js_eval_process";
 
@@ -102,21 +103,24 @@ async function initialize(request: InitializeRequest): Promise<void> {
   if (request.protocolVersion !== PROTOCOL_VERSION) {
     throw new Error(`Protocol mismatch: client=${request.protocolVersion}, worker=${PROTOCOL_VERSION}`);
   }
-  if (request.ompVersion !== OMP_VERSION) {
-    throw new Error(`OMP version mismatch: client=${request.ompVersion}, worker=${OMP_VERSION}`);
+  if (request.host !== undefined && request.host !== "omp") {
+    throw new Error(`Host mismatch: client=${request.host}, worker=omp`);
   }
   if (request.runtimeVersion !== TOOL_RUNTIME_VERSION) {
     throw new Error(`Runtime version mismatch: client=${request.runtimeVersion}, worker=${TOOL_RUNTIME_VERSION}`);
   }
-  runtime = await createNativeWorkerRuntime(request.cwd);
+  const hostVersion = await resolveOmpHostVersion();
+  runtime = await createNativeWorkerRuntime(request.cwd, hostVersion);
   const requested = new Set(request.tools);
   const tools = Object.values(runtime.tools)
     .filter(tool => requested.has(tool.name))
-    .map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters }));
+    .map(tool => ({ name: tool.name, description: tool.description, parameters: toolParametersToWire(tool.parameters) }));
   send({
     type: "ready",
     protocolVersion: PROTOCOL_VERSION,
-    ompVersion: OMP_VERSION,
+    host: "omp",
+    ompVersion: hostVersion,
+    hostVersion,
     runtimeVersion: TOOL_RUNTIME_VERSION,
     cwd: runtime.cwd,
     tools,

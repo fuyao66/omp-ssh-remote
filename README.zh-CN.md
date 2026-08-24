@@ -6,7 +6,7 @@
 
 | Package        | 宿主                | 远端 runtime                                    | 文档                                           |
 | -------------- | ------------------- | ----------------------------------------------- | ---------------------------------------------- |
-| `packages/omp` | Oh My Pi `17.3.3`   | OMP 原生 `ToolSession`，11 个工作区工具         | [OMP SSH Remote](packages/omp/README.zh-CN.md) |
+| `packages/omp` | Oh My Pi `>=18.0.0` | OMP 原生 `ToolSession`，11 个工作区工具         | [OMP SSH Remote](packages/omp/README.zh-CN.md) |
 | `packages/pi`  | 兼容的当前 Pi Agent | 可组合 Pi core 与检测到的受支持 plugin adapters | [Pi SSH Remote](packages/pi/README.zh-CN.md)   |
 
 不要安装仓库根目录。先在根目录构建，再只链接所用宿主对应的 package：
@@ -38,7 +38,7 @@ pi install "$PWD/packages/pi"
 packages/omp/                  仅 OMP 的 manifest、文档、extension 和 workers
 packages/pi/                   仅 Pi 的 manifest、文档、extension 和 workers
 src/runtime-contract.ts        宿主无关的 runtime handshake 与 artifact 合同
-src/omp/                       固定 OMP runtime 的准入合同
+src/omp/                       OMP 能力/schema 准入合同
 src/pi/assembly.ts             Pi host/plugin capability resolver 与 RuntimeAssembly
 src/pi/plugins/                可独立拔插的 Pi workspace adapters
 src/pi/host-extension.ts       消费已解析 assembly 的 Pi host 生命周期 adapter
@@ -51,7 +51,7 @@ test/                          共享 core 与分宿主行为合同
 
 ## 架构
 
-OMP 与 Pi 在同一 transport 和部署 core 上采用不同的 extension 模型。OMP 只有一套固定原生工作区 runtime：本机 OMP 与编进 companion 的 worker 都必须是 `17.3.3`。远端主机不安装 OMP；`ompVersion` 是 worker 身份。
+OMP 与 Pi 在同一 transport 和部署 core 上采用不同的 extension 模型。OMP 只有一套原生工作区 runtime：本机 OMP 与 companion 通过 runtime 契约和精确原生工具 schema 互相准入。宿主包版本只保留为身份元数据，不是相等门禁。远端主机不安装 OMP。
 
 Pi 首先适配基础 host，再根据当前 active tool registry 和已明确支持的 plugin adapters 计算 runtime assembly。Pi `RuntimeAssembly` 记录 component contracts、实际解析版本、active tool ownership、schema 和必需 artifacts。版本会保留用于身份和诊断，但不作为相等准入条件。只要 component contract 和精确工具 schema 仍兼容，远端 worker 可以使用不同的 Pi/plugin 版本。未知 plugin 永远不会被推断为可远端执行。
 
@@ -59,7 +59,7 @@ Pi 首先适配基础 host，再根据当前 active tool registry 和已明确�
 
 ```mermaid
 flowchart LR
-  Core[Remote Workspace Core] --> OMP[固定 OMP runtime]
+  Core[Remote Workspace Core] --> OMP[OMP schema 准入]
   Core --> PiHost[基础 Pi host adapter]
   PiHost --> Resolver[Runtime assembly resolver]
   PluginAdapters[受支持 plugin adapters] --> Resolver

@@ -6,7 +6,7 @@ This repository contains two independently installable SSH remote-workspace plug
 
 | Package        | Host                        | Remote runtime                                             | Documentation                            |
 | -------------- | --------------------------- | ---------------------------------------------------------- | ---------------------------------------- |
-| `packages/omp` | Oh My Pi `17.3.3`           | OMP native `ToolSession`, 11 workspace tools               | [OMP SSH Remote](packages/omp/README.md) |
+| `packages/omp` | Oh My Pi `>=18.0.0`         | OMP native `ToolSession`, 11 workspace tools               | [OMP SSH Remote](packages/omp/README.md) |
 | `packages/pi`  | Compatible current Pi Agent | Composable Pi core plus detected supported plugin adapters | [Pi SSH Remote](packages/pi/README.md)   |
 
 Do not install the repository root. Build from the root, then link only the package for the host you use:
@@ -38,7 +38,7 @@ Both packages provide `/remote-connect`, `/remote-status`, `/remote-exit`, plus 
 packages/omp/                  OMP-only manifest, docs, extension, and workers
 packages/pi/                   Pi-only manifest, docs, extension, and workers
 src/runtime-contract.ts        host-neutral runtime handshake and artifact contract
-src/omp/                       fixed OMP runtime admission contract
+src/omp/                       OMP capability/schema admission contract
 src/pi/assembly.ts             Pi host/plugin capability resolver and RuntimeAssembly
 src/pi/plugins/                independently pluggable Pi workspace adapters
 src/pi/host-extension.ts       Pi host lifecycle adapter for the resolved assembly
@@ -51,7 +51,7 @@ test/                          shared-core and host-specific contracts
 
 ## Architecture
 
-OMP and Pi deliberately use different extension models over the same transport and deployment core. OMP has one fixed native workspace runtime: local OMP and the bundled companion must both be `17.3.3`. The remote host does not install OMP; `ompVersion` is the worker identity.
+OMP and Pi deliberately use different extension models over the same transport and deployment core. OMP has one native workspace runtime: local OMP and the companion admit each other by runtime contract and exact native tool schemas. Host package versions are retained as identity metadata, not equality gates. The remote host does not install OMP.
 
 Pi first adapts the base host and then computes a runtime assembly from the current active tool registry and explicitly supported plugin adapters. A Pi `RuntimeAssembly` records component contracts, actual resolved versions, active tool ownership and schemas, and required artifacts. Versions are retained for identity and diagnostics but are not equality gates. The remote worker may use different Pi/plugin versions when its component contracts and exact tool schemas remain compatible. Unknown plugins are never inferred as remote-capable.
 
@@ -59,7 +59,7 @@ The current registry supports Pi core alone and Pi core extended by whichever pl
 
 ```mermaid
 flowchart LR
-  Core[Remote Workspace Core] --> OMP[Fixed OMP runtime]
+  Core[Remote Workspace Core] --> OMP[OMP schema admission]
   Core --> PiHost[Base Pi host adapter]
   PiHost --> Resolver[Runtime assembly resolver]
   PluginAdapters[Supported plugin adapters] --> Resolver

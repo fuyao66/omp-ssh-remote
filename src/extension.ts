@@ -14,7 +14,8 @@ import {
 import { RemoteRuntimeClient } from "./client.ts";
 import { prepareRemoteWorker, resolveRemoteHome } from "./deploy.ts";
 import { REMOTE_TOOL_NAMES, type RemoteToolName } from "./protocol.ts";
-import { OMP_RUNTIME_HANDSHAKE } from "./omp/runtime-contract.ts";
+import { createOmpRuntimeHandshake, toolParametersToWire } from "./omp/runtime-contract.ts";
+import { resolveOmpHostVersion } from "./omp/host-identity.ts";
 import {
   isInternalUri,
   normalizePathArgument,
@@ -491,6 +492,19 @@ function registerWrapper(
   });
   state.wrappedTools.add(name);
 }
+async function ompHandshake(pi: ExtensionAPI) {
+  const metadata = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
+  return createOmpRuntimeHandshake({
+    hostVersion: await resolveOmpHostVersion(),
+    localTools: REMOTE_TOOL_NAMES.map((name) => {
+      const native = metadata.get(name);
+      if (!native)
+        throw new Error(`OMP native tool metadata is unavailable: ${name}`);
+      return { name, parameters: toolParametersToWire(native.parameters) };
+    }),
+  });
+}
+
 
 function registerActiveWrappers(
   pi: ExtensionAPI,
@@ -581,7 +595,7 @@ async function attachFamilyMember(
     });
     const ready = await next.initialize(
       family.remoteCwd,
-      OMP_RUNTIME_HANDSHAKE,
+      await ompHandshake(pi),
     );
     if (family.closing)
       throw new Error(
@@ -698,7 +712,7 @@ export default async function remoteRuntimeExtension(
         next = new RemoteRuntimeClient({
           command: buildSshWorkerCommand(connection),
         });
-        const ready = await next.initialize(options.cwd, OMP_RUNTIME_HANDSHAKE);
+        const ready = await next.initialize(options.cwd, await ompHandshake(pi));
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
           ownerSessionFile: normalizedSessionFile,
@@ -850,7 +864,7 @@ export default async function remoteRuntimeExtension(
         next = new RemoteRuntimeClient({
           command: buildSshWorkerCommand(connection),
         });
-        const ready = await next.initialize(options.cwd, OMP_RUNTIME_HANDSHAKE);
+        const ready = await next.initialize(options.cwd, await ompHandshake(pi));
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
           ownerSessionFile: normalizedSessionFile,

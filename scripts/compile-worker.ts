@@ -1,6 +1,6 @@
 import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
-import { OMP_VERSION } from "../src/protocol.ts";
+import { resolveOmpHostVersion } from "../src/omp/host-identity.ts";
 
 type Target = "arm64" | "x64";
 
@@ -12,18 +12,19 @@ if (targetArg !== "arm64" && targetArg !== "x64") {
 }
 const target: Target = targetArg;
 
+const hostVersion = await resolveOmpHostVersion();
 const archTag = target === "arm64" ? "linux-arm64" : "linux-x64";
 const bunTarget = target === "arm64" ? "bun-linux-arm64" : "bun-linux-x64";
 const addonFiles =
   target === "x64"
     ? [
         {
-          variant: "baseline" as const,
-          filename: "pi_natives.linux-x64-baseline.node",
+          variant: "modern" as const,
+          filename: `pi_natives.${archTag}-modern.node`,
         },
         {
-          variant: "modern" as const,
-          filename: "pi_natives.linux-x64-modern.node",
+          variant: "baseline" as const,
+          filename: `pi_natives.${archTag}-baseline.node`,
         },
       ]
     : [{ variant: "default" as const, filename: `pi_natives.${archTag}.node` }];
@@ -37,7 +38,6 @@ const dist = resolve(root, "packages/omp/dist");
 const outfile = resolve(dist, `worker-linux-${target}`);
 await mkdir(dist, { recursive: true });
 await mkdir(cache, { recursive: true });
-
 for (const file of addonFiles) {
   const addonPath = resolve(packageDir, file.filename);
   try {
@@ -47,7 +47,7 @@ for (const file of addonFiles) {
       [
         "npm",
         "pack",
-        `@oh-my-pi/pi-natives-${archTag}@${OMP_VERSION}`,
+        `@oh-my-pi/pi-natives-${archTag}@${hostVersion}`,
         "--pack-destination",
         cache,
         "--silent",
@@ -88,7 +88,7 @@ await writeFile(
   `import archivePath from ${JSON.stringify(archivePath)} with { type: "file" };\n` +
     `export const embeddedAddon = {\n` +
     `  platformTag: ${JSON.stringify(archTag)},\n` +
-    `  version: ${JSON.stringify(OMP_VERSION)},\n` +
+    `  version: ${JSON.stringify(hostVersion)},\n` +
     `  archive: { format: "tar.gz", filename: ${JSON.stringify(basename(archivePath))}, filePath: archivePath },\n` +
     `  files: [${fileSpecs.join(", ")}],\n` +
     `};\n`,
@@ -131,7 +131,10 @@ const result = await Bun.build({
   entrypoints: [resolve(root, "src/worker.ts")],
   root,
   plugins: [buildPlugin],
-  define: { "process.env.PI_COMPILED": JSON.stringify("true") },
+  define: {
+    "process.env.PI_COMPILED": JSON.stringify("true"),
+    "process.env.OMP_COMPILED_HOST_VERSION": JSON.stringify(hostVersion),
+  },
   compile: {
     target: bunTarget,
     outfile,

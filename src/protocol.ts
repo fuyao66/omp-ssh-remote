@@ -1,4 +1,4 @@
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function asRecord(value: unknown, label: string): Record<string, unknown> {
@@ -9,7 +9,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
 }
 export const PROTOCOL_VERSION = 1 as const;
 export const TOOL_RUNTIME_VERSION = "0.3.0" as const;
-export const OMP_VERSION = "17.3.3" as const;
+export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
   "read",

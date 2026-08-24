@@ -15,6 +15,8 @@ import type {
   ToolInfo,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { REMOTE_TOOL_NAMES } from "../src/protocol.ts";
+import { toolParametersToWire } from "../src/omp/runtime-contract.ts";
+import { createNativeWorkerRuntime } from "../src/runtime.ts";
 
 const target = Bun.env.REMOTE_TARGET;
 const cwd = Bun.env.REMOTE_CWD;
@@ -39,10 +41,11 @@ const activeTools = [
   "eval",
   "debug",
 ];
+const schemaRuntime = await createNativeWorkerRuntime(localCwd, "smoke");
 const nativeTools = REMOTE_TOOL_NAMES.map((name) => ({
   name,
-  description: `native ${name}`,
-  parameters: { type: "object", additionalProperties: true },
+  description: schemaRuntime.tools[name].description,
+  parameters: toolParametersToWire(schemaRuntime.tools[name].parameters),
   sourceInfo: {
     path: "builtin",
     source: "builtin",

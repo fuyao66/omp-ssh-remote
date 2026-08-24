@@ -14,7 +14,6 @@ import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import {
-  OMP_VERSION,
   REMOTE_TOOL_NAMES,
   type RemoteToolName,
 } from "./protocol.ts";
@@ -96,6 +95,7 @@ const WORKER_OVERRIDES = {
   "eval.rb": false,
   "eval.jl": false,
   "tools.xdev": false,
+  "debug.enabled": true,
 } as const;
 
 export type NativeWorkerRuntime = {
@@ -106,6 +106,7 @@ export type NativeWorkerRuntime = {
 
 export async function createNativeWorkerRuntime(
   cwd: string,
+  hostVersion: string,
 ): Promise<NativeWorkerRuntime> {
   const resolvedCwd = resolve(cwd);
   const cwdStat = await stat(resolvedCwd);
@@ -129,7 +130,7 @@ export async function createNativeWorkerRuntime(
     settings,
     getSessionFile: () => null,
     getSessionSpawns: () => "",
-    getSessionId: () => `omp-ssh-remote:${OMP_VERSION}`,
+    getSessionId: () => `omp-ssh-remote:${hostVersion}`,
     getArtifactsDir: () => null,
     xdev: {
       tools: xdevTools,

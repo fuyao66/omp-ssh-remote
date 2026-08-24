@@ -12,11 +12,11 @@ OMP SSH Remote 将 Oh My Pi 控制面保留在本机，同时通过 SSH 在远�
 
 `read`、`write`、`edit`、前台 `bash`、`grep`、`glob`、`lsp`、`ast_grep`、`ast_edit`、受限 `eval` 和 `debug`。
 
-普通非隔离子代理继承连接配置，但各自使用独立 companion。远端主机不安装 OMP；`ompVersion` 是编进 worker 的身份，必须等于本机 OMP `17.3.3`。`task isolated:true`、远端 async Bash 和 artifact transfer 尚不支持，并采用 fail-closed。
+普通非隔离子代理继承连接配置，但各自使用独立 companion。远端主机不安装 OMP；companion 报告编译时所针对的宿主包版本，仅作为身份元数据。准入比较远端 runtime 契约与精确原生工具 schema，而不是要求 OMP 包版本完全相等。`task isolated:true`、远端 async Bash 和 artifact transfer 尚不支持，并采用 fail-closed。
 
 ```mermaid
 flowchart LR
-  OMP[本机 OMP 17.3.3] --> Adapter[OMP package adapter]
+  OMP[本机 OMP] --> Adapter[OMP package adapter]
   Adapter <--> SSH[持久有界 SSH NDJSON]
   SSH <--> Worker[远端 OMP companion]
   Worker --> Tools[原生 ToolSession: 文件、AST、LSP、eval、debug]
@@ -25,7 +25,7 @@ flowchart LR
 
 ## 环境要求
 
-- 本机 Linux 或 WSL，OMP 必须为 `17.3.3`，并安装 Bun `1.3+`、npm、tar、OpenSSH 和 SCP；
+- 本机 Linux 或 WSL，OMP `>=18.0.0`，并安装 Bun `1.3+`、npm、tar、OpenSSH 和 SCP；
 - 远端为 glibc Linux `x86_64` 或 `aarch64`；
 - 公钥 SSH 可在 batch mode 下登录；
 - 远端项目目录已存在；
@@ -81,7 +81,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 adapter 探测远端平台和 home，选择 package 自带的对应 worker，校验本机 SHA-256 sidecar，上传到 UUID 临时路径，在远端复核 SHA-256 后原子启用到：
 
 ```text
-~/.cache/omp-ssh-remote/17.3.3/<sha256>/worker-linux-<arch>
+~/.cache/omp-ssh-remote/omp-1/<sha256>/worker-linux-<arch>
 ```
 
 协议 frame 上限为 16 MiB，部署 stdout/stderr 上限为 1 MiB。SSH 使用 batch mode、严格 host checking、`ForwardAgent=no` 和 `ClearAllForwardings=yes`。transport 断开时所有 pending call 报错，不会改为本机重试。前台子进程会收到取消；显式使用 `nohup` 或 `setsid` 脱离的命令属于不受管理的远端进程，断连后可能继续运行。
@@ -103,7 +103,7 @@ x64 worker 首次上传耗时 `32.7 s`；缓存连接不再传输 worker。数�
 ## 限制
 
 - 仅支持 Linux glibc x86_64 和 ARM64；
-- 仅支持 OMP `17.3.3`；
+- OMP `>=18.0.0`，且 companion schema 匹配；
 - 不支持 async Bash / 本机 `hub` job bridge；
 - 不支持 `task isolated:true` 远端 worktree；
 - 不支持远端到本机 artifact bridge；

@@ -12,11 +12,11 @@ Remote native tools:
 
 `read`, `write`, `edit`, foreground `bash`, `grep`, `glob`, `lsp`, `ast_grep`, `ast_edit`, constrained `eval`, and `debug`.
 
-Ordinary non-isolated subagents inherit the connection configuration but receive independent companion processes. The remote host does not install OMP; `ompVersion` is the bundled worker identity and must equal local OMP `17.3.3`. `task isolated:true`, remote async Bash, and artifact transfer are not supported and fail closed.
+Ordinary non-isolated subagents inherit the connection configuration but receive independent companion processes. The remote host does not install OMP; the companion reports the host package version it was compiled against as identity metadata. Admission compares the remote runtime contract and exact native tool schemas rather than requiring equal OMP package versions. `task isolated:true`, remote async Bash, and artifact transfer are not supported and fail closed.
 
 ```mermaid
 flowchart LR
-  OMP[Local OMP 17.3.3] --> Adapter[OMP package adapter]
+  OMP[Local OMP] --> Adapter[OMP package adapter]
   Adapter <--> SSH[Persistent bounded SSH NDJSON]
   SSH <--> Worker[Remote OMP companion]
   Worker --> Tools[Native ToolSession: files, AST, LSP, eval, debug]
@@ -25,7 +25,7 @@ flowchart LR
 
 ## Requirements
 
-- local Linux or WSL with OMP exactly `17.3.3`, Bun `1.3+`, npm, tar, OpenSSH, and SCP;
+- local Linux or WSL with OMP `>=18.0.0`, Bun `1.3+`, npm, tar, OpenSSH, and SCP;
 - remote glibc Linux `x86_64` or `aarch64`;
 - public-key SSH that succeeds in batch mode;
 - an existing remote project directory;
@@ -81,7 +81,7 @@ Ordinary filesystem paths route remotely while connected. Internal URI resources
 The adapter probes remote platform and home, selects the matching package-owned worker, verifies its local SHA-256 sidecar, uploads to a UUID temporary path, verifies the remote SHA-256, then atomically activates it under:
 
 ```text
-~/.cache/omp-ssh-remote/17.3.3/<sha256>/worker-linux-<arch>
+~/.cache/omp-ssh-remote/omp-1/<sha256>/worker-linux-<arch>
 ```
 
 Protocol frames are limited to 16 MiB; deployment stdout/stderr is limited to 1 MiB. SSH uses batch mode, strict host checking, `ForwardAgent=no`, and `ClearAllForwardings=yes`. Transport loss rejects pending calls and never retries them locally. Foreground child processes receive cancellation; deliberately detached commands such as `nohup` or `setsid` are unmanaged remote processes and can survive disconnect.
@@ -103,7 +103,7 @@ First upload of the x64 worker took `32.7 s`; cached connections avoid that tran
 ## Limits
 
 - Linux glibc x86_64 and ARM64 only;
-- OMP `17.3.3` only;
+- OMP `>=18.0.0` with matching compiled companion schemas;
 - no async Bash / local `hub` job bridge;
 - no `task isolated:true` remote worktrees;
 - no remote-to-local artifact bridge;

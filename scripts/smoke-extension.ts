@@ -10,6 +10,8 @@ const { default: remoteRuntimeExtension } = await import(
   new URL("../packages/omp/dist/extension.js", import.meta.url).href
 );
 import { REMOTE_TOOL_NAMES } from "../src/protocol.ts";
+import { toolParametersToWire } from "../src/omp/runtime-contract.ts";
+import { createNativeWorkerRuntime } from "../src/runtime.ts";
 
 const alias = Bun.env.REMOTE_ALIAS;
 const target = Bun.env.REMOTE_TARGET;
@@ -18,9 +20,7 @@ const identityFile = Bun.env.REMOTE_IDENTITY;
 const knownHostsFile = Bun.env.REMOTE_KNOWN_HOSTS;
 const port = Bun.env.REMOTE_PORT ?? "22";
 if (!cwd || (!alias && (!target || !identityFile || !knownHostsFile))) {
-  throw new Error(
-    "REMOTE_CWD plus either REMOTE_ALIAS or explicit remote connection variables are required",
-  );
+  throw new Error("Remote smoke environment is incomplete");
 }
 
 const activeTools = [
@@ -42,10 +42,11 @@ const commands = new Map<string, CapturedCommand>();
 const tools = new Map<string, ToolDefinition>();
 const events = new Set<string>();
 
+const schemaRuntime = await createNativeWorkerRuntime(process.cwd(), "smoke");
 const nativeTools = REMOTE_TOOL_NAMES.map((name) => ({
   name,
-  description: `native ${name}`,
-  parameters: { type: "object", additionalProperties: true },
+  description: schemaRuntime.tools[name].description,
+  parameters: toolParametersToWire(schemaRuntime.tools[name].parameters),
   sourceInfo: {
     path: "builtin",
     source: "builtin",
