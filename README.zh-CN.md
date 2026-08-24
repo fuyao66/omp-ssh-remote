@@ -4,10 +4,10 @@
 
 本仓库包含两个可独立安装的 SSH 远端工作区插件。它们共用有界 SSH transport、严格主机校验、按内容寻址部署、取消和 fail-closed 路由；但宿主 runtime、package manifest、companion binary 和生命周期规则彼此独立。
 
-| Package | 宿主 | 远端 runtime | 文档 |
-| --- | --- | --- | --- |
-| `packages/omp` | Oh My Pi `17.3.3` | OMP 原生 `ToolSession`，11 个工作区工具 | [OMP SSH Remote](packages/omp/README.zh-CN.md) |
-| `packages/pi` | 兼容的当前 Pi Agent | 可组合 Pi core 与检测到的受支持 plugin adapters | [Pi SSH Remote](packages/pi/README.zh-CN.md) |
+| Package        | 宿主                | 远端 runtime                                    | 文档                                           |
+| -------------- | ------------------- | ----------------------------------------------- | ---------------------------------------------- |
+| `packages/omp` | Oh My Pi `17.3.3`   | OMP 原生 `ToolSession`，11 个工作区工具         | [OMP SSH Remote](packages/omp/README.zh-CN.md) |
+| `packages/pi`  | 兼容的当前 Pi Agent | 可组合 Pi core 与检测到的受支持 plugin adapters | [Pi SSH Remote](packages/pi/README.zh-CN.md)   |
 
 不要安装仓库根目录。先在根目录构建，再只链接所用宿主对应的 package：
 
@@ -55,7 +55,7 @@ OMP 与 Pi 在同一 transport 和部署 core 上采用不同的 extension 模�
 
 Pi 首先适配基础 host，再根据当前 active tool registry 和已明确支持的 plugin adapters 计算 runtime assembly。Pi `RuntimeAssembly` 记录 component contracts、实际解析版本、active tool ownership、schema 和必需 artifacts。版本会保留用于身份和诊断，但不作为相等准入条件。只要 component contract 和精确工具 schema 仍兼容，远端 worker 可以使用不同的 Pi/plugin 版本。未知 plugin 永远不会被推断为可远端执行。
 
-当前 registry 支持纯 Pi 和带 AFT adapter 的 Pi。`pi-subagents` 是本机编排：子进程通过环境变量继承已序列化的 assembly 和 SSH 连接，并自己打开独立 companion。它不定义远端 runtime。普通子 session 使用父 session 的远端 cwd。
+当前 registry 支持仅 Pi core，以及由满足各自独立准入合同的 plugin adapter 扩展的 Pi core。`@tintinweb/pi-subagents` 是当前 in-process 编排 integration：一个已连接的 root session 可以创建多个普通 child；每个 child 必须加载 `pi-tintin-extension.js`，恢复父 session 已验证的 assembly、保留本机 Pi cwd，并在父 session 的远端 cwd 上打开独立 companion。同一进程中的第二个独立 root 会被拒绝。它不定义远端 runtime。它的本机 `isolation: "worktree"` 模式不支持远端连接态；真实 SSH smoke 仍是该 integration 的外部 acceptance gate。
 
 ```mermaid
 flowchart LR
@@ -72,15 +72,17 @@ flowchart LR
 
 ```bash
 bun run check
+bun run build:pi-worker:all
 REMOTE_ALIAS=<ssh-alias> REMOTE_CWD=<remote-path> bun run benchmark:omp
 REMOTE_ALIAS=<ssh-alias> REMOTE_CWD=<remote-path> bun run benchmark:pi
 REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_SMOKE_PLUGINS=none bun scripts/smoke-pi-assembly.ts
 REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_SMOKE_PLUGINS=aft bun scripts/smoke-pi-assembly.ts
+REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_TINTIN_SUBAGENTS_ENTRY=<tintin-entry> bun scripts/smoke-pi-tintin-subagent.ts
 ```
 
-两个 Pi smoke mode 分别通过同一套 extension、SSH deployment、worker、tool routing 和恢复生命周期验证纯 Pi 与 Pi+AFT assembly。
+Pi assembly smoke 通过同一套 extension、SSH deployment、worker、tool routing 和恢复生命周期，验证仅 Pi core 和由当前 active adapter 集合扩展的 assembly。tintin smoke 额外验证普通 in-process child 会启动自己的 companion，并在远端工作区执行 `hostname` 和 `pwd`；它不覆盖本机 worktree isolation。
 
-worker 是体积较大的生成产物，不进入 Git。源码安装必须先在本机构建 worker binary，再链接对应 package。
+worker 是体积较大的生成产物，不进入 Git。源码安装必须先执行 `bun run build:pi-worker:all` 构建 worker binary，再链接对应 package。
 
 ## 许可证
 

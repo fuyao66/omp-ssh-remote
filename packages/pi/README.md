@@ -6,7 +6,7 @@ Pi SSH Remote keeps the Pi conversation, model credentials, UI, memory, web acce
 
 ## Runtime Assembly
 
-There is no fixed `pi-aft` product profile. On each connection, the host adapter inspects the current Pi tool registry, active tool set, source provenance, and resolved package metadata. It produces a `RuntimeAssembly` containing:
+On each connection, the host adapter inspects the current Pi tool registry, active tool set, source provenance, and resolved package metadata. It produces a `RuntimeAssembly` containing:
 
 - the current Pi host descriptor;
 - zero or more detected plugin adapters, ordered by first appearance in the active tool registry;
@@ -30,21 +30,21 @@ This is capability-based compatibility, not unchecked compatibility. A changed P
 
 ## Supported Components
 
-| Kind | ID | Current responsibility |
-| --- | --- | --- |
-| Host | `pi-core` | Pi-native `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls` when Pi owns them |
-| Plugin adapter | `@cortexkit/aft-pi` | AFT-owned file/shell tools, background Bash lifecycle tools, AFT code tools, and the platform AFT binary |
-| Local integration | `pi-subagents` | Inherit the serialized assembly and SSH connection through the process environment; the child opens an independent companion on the parent remote cwd |
+| Kind              | ID                        | Current responsibility                                                                                                                    |
+| ----------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Host              | `pi-core`                 | Pi-native `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls` when Pi owns them                                                     |
+| Plugin adapter    | `@cortexkit/aft-pi`       | AFT-owned file/shell tools, background Bash lifecycle tools, AFT code tools, and the platform AFT binary                                  |
+| Local integration | `@tintinweb/pi-subagents` | Current in-process child integration; restores the serialized assembly, opens an independent companion, and keeps local orchestration cwd |
 
-With no supported plugin active, the remote runtime is pure Pi. With AFT active, AFT owns `read`, `write`, `edit`, `bash`, `grep`, `bash_status`, `bash_watch`, `bash_write`, `bash_kill`, `aft_outline`, `aft_zoom`, `aft_inspect`, `aft_conflicts`, `aft_import`, `aft_safety`, `ast_grep_search`, and `ast_grep_replace`; Pi continues to own `find` and `ls`. Other AFT tools such as `aft_search`, `lsp_diagnostics`, and `aft_callgraph` stay local until an adapter admits them.
+With no supported plugin active, the remote runtime is Pi core only. The currently included AFT adapter owns `read`, `write`, `edit`, `bash`, `grep`, `bash_status`, `bash_watch`, `bash_write`, `bash_kill`, `aft_outline`, `aft_zoom`, `aft_inspect`, `aft_conflicts`, `aft_import`, `aft_safety`, `ast_grep_search`, and `ast_grep_replace` when it is admitted; Pi core continues to own `find` and `ls`. Other AFT tools such as `aft_search`, `lsp_diagnostics`, and `aft_callgraph` stay local until an adapter admits them.
 
-Other installed plugins are not copied or inferred as remote-capable. Plugins that do not own an admitted workspace tool remain local. If an unsupported plugin replaces a Pi or AFT workspace tool that this adapter would otherwise remoteize, connection fails closed. Adding another remote workspace plugin requires an explicit adapter describing source detection, tool ownership, schemas, companion artifacts, and lifecycle behavior.
+Other installed plugins are not copied or inferred as remote-capable. Plugins that do not own an admitted workspace tool remain local. If an unsupported plugin replaces an admitted Pi-core or plugin-owned workspace tool, connection fails closed. Adding another remote workspace plugin requires an explicit adapter describing source detection, tool ownership, schemas, companion artifacts, and lifecycle behavior.
 
-Model routing, credentials, memory, web access, ask/TUI, and UI extensions always remain local. Isolated `pi-subagents` worktrees are not implemented; ordinary children inherit the parent remote cwd through the process environment.
+Model routing, credentials, memory, web access, ask/TUI, and UI extensions always remain local. The current in-process orchestrator integration targets `@tintinweb/pi-subagents`: ordinary children restore the parent-verified assembly, use a separate remote companion on the parent remote cwd, and preserve their local Pi cwd. Its `isolation: "worktree"` mode remains local-only and is not supported for remote workspaces.
 
 ## Tool Ownership
 
-Pi resolves duplicate extension tools first-wins and does not expose call-through to a superseded tool. Pi SSH Remote must therefore appear before any supported plugin whose tools it will shadow, including AFT.
+Pi resolves duplicate extension tools first-wins and does not expose call-through to a superseded tool. Pi SSH Remote must therefore appear before any supported plugin whose tools it will shadow.
 
 Before connection, the local Pi/plugin runtime owns its tools. `/remote-connect` resolves the current assembly, validates the remote manifest, and registers schema-preserving wrappers. `/remote-exit` closes the companion and reloads Pi so local ownership is reconstructed. Transport or ownership failure blocks the resolved workspace surface and never falls back to the local tool accidentally.
 
@@ -53,6 +53,21 @@ The lifecycle acceptance path is:
 ```text
 current local owners -> matching remote assembly owners -> restored local owners
 ```
+
+## Tintin Subagents
+
+Pi SSH Remote includes an in-process child integration for ordinary children created by `@tintinweb/pi-subagents`. The child must load the dedicated Pi SSH Remote **tintin child entry file** before any default extensions; it restores the parent-verified assembly and opens a separate companion. The child does not need to load AFT or another remote workspace plugin locally.
+
+```yaml
+---
+description: Remote workspace worker
+extensions:
+  - /absolute/path/to/omp-ssh-remote/packages/pi/dist/pi-tintin-extension.js
+tools: bash,read,grep,find,ls
+---
+```
+
+Use the extension entry file from the package installed for the parent session, not the package directory. The normal `Agent` invocation chooses this agent by its frontmatter name or filename. The child's local cwd remains local orchestration state; its admitted workspace tools execute against the inherited remote cwd. Tintin's local `isolation: "worktree"` mode is not supported for remote-connected sessions. Run the tintin smoke on a trusted acceptance host before depending on a new Pi or tintin release.
 
 ## Requirements
 
@@ -63,7 +78,7 @@ current local owners -> matching remote assembly owners -> restored local owners
 - an existing remote project directory;
 - no Node.js, Bun, Pi, AFT, or model credentials are required on the remote host.
 
-The current source build and tests resolve Pi `0.84.2` and AFT `0.51.3`; these are recorded build identities, not equality requirements in the runtime contract or Pi package peer dependencies.
+The current source build and tests resolve Pi `0.84.2` and AFT `0.52.0`; these are recorded build identities, not equality requirements in the runtime contract or Pi package peer dependencies.
 
 Host key verification is strict. Trust the host through normal OpenSSH `known_hosts`; do not disable checking. Agent forwarding and SSH forwarding are disabled.
 
@@ -82,6 +97,7 @@ The package must contain:
 
 ```text
 packages/pi/dist/pi-extension.js
+packages/pi/dist/pi-tintin-extension.js
 packages/pi/dist/worker-linux-x64
 packages/pi/dist/worker-linux-x64.sha256
 packages/pi/dist/aft-linux-x64
@@ -92,7 +108,7 @@ packages/pi/dist/aft-linux-arm64
 packages/pi/dist/aft-linux-arm64.sha256
 ```
 
-In `~/.pi/agent/settings.json`, keep Pi SSH Remote before AFT:
+In `~/.pi/agent/settings.json`, place Pi SSH Remote before any workspace plugin adapter it must shadow. AFT is the current example:
 
 ```json
 {
@@ -121,7 +137,7 @@ Explicit form:
 /remote-connect user@example.com /srv/project --port 22 --identity ~/.ssh/id_ed25519
 ```
 
-The model can invoke `remote_connect`, `remote_workspace_status`, and `remote_exit`. Status reports the assembly ID, local and remote component versions, tool groups, ownership verification, and transport state. After a failed or lost connection, `/remote-exit` is required before reconnecting. `pi-subagents` children inherit the serialized assembly and SSH connection through the process environment and open independent companions on the parent remote cwd.
+The model can invoke `remote_connect`, `remote_workspace_status`, and `remote_exit`. Status reports the assembly ID, local and remote component versions, tool groups, ownership verification, and transport state. After a failed or lost connection, `/remote-exit` is required before reconnecting. One connected root session may create multiple ordinary `@tintinweb/pi-subagents` children; each child must load `pi-tintin-extension.js` to restore the root assembly and open an independent companion. A second independent root in the same process is rejected. Do not enable tintin's local `isolation: "worktree"` mode for a remote-connected session. The included tintin smoke is the external acceptance gate for this integration.
 
 ## Deployment and Security
 
@@ -142,7 +158,7 @@ The worker is model-free. Shutdown aborts active calls, waits up to five seconds
 - new plugins require explicit adapters and a rebuilt worker artifact;
 - no arbitrary third-party workspace plugin inference;
 - no remote model loop, memory, web credentials, browser, or TUI;
-- no isolated `pi-subagents` worktrees or general artifact bridge;
+- no `@tintinweb/pi-subagents` local `isolation: "worktree"`, remote worktree, or general artifact bridge;
 - a failed or lost connection stays fail-closed until `/remote-exit`;
 - a Pi reload reconstructs plugin in-memory state;
 - single protocol frames are limited to 16 MiB.

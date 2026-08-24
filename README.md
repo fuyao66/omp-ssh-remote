@@ -4,10 +4,10 @@
 
 This repository contains two independently installable SSH remote-workspace plugins. They share bounded SSH transport, strict host verification, content-addressed deployment, cancellation, and fail-closed routing. Their host runtimes, package manifests, companion binaries, and lifecycle rules are separate.
 
-| Package | Host | Remote runtime | Documentation |
-| --- | --- | --- | --- |
-| `packages/omp` | Oh My Pi `17.3.3` | OMP native `ToolSession`, 11 workspace tools | [OMP SSH Remote](packages/omp/README.md) |
-| `packages/pi` | Compatible current Pi Agent | Composable Pi core plus detected supported plugin adapters | [Pi SSH Remote](packages/pi/README.md) |
+| Package        | Host                        | Remote runtime                                             | Documentation                            |
+| -------------- | --------------------------- | ---------------------------------------------------------- | ---------------------------------------- |
+| `packages/omp` | Oh My Pi `17.3.3`           | OMP native `ToolSession`, 11 workspace tools               | [OMP SSH Remote](packages/omp/README.md) |
+| `packages/pi`  | Compatible current Pi Agent | Composable Pi core plus detected supported plugin adapters | [Pi SSH Remote](packages/pi/README.md)   |
 
 Do not install the repository root. Build from the root, then link only the package for the host you use:
 
@@ -55,7 +55,7 @@ OMP and Pi deliberately use different extension models over the same transport a
 
 Pi first adapts the base host and then computes a runtime assembly from the current active tool registry and explicitly supported plugin adapters. A Pi `RuntimeAssembly` records component contracts, actual resolved versions, active tool ownership and schemas, and required artifacts. Versions are retained for identity and diagnostics but are not equality gates. The remote worker may use different Pi/plugin versions when its component contracts and exact tool schemas remain compatible. Unknown plugins are never inferred as remote-capable.
 
-The current registry supports pure Pi and Pi with the AFT adapter. `pi-subagents` is a local orchestrator: it inherits the serialized assembly and SSH connection through the process environment and opens an independent companion. It does not define the remote runtime. Ordinary child sessions use the parent remote cwd.
+The current registry supports Pi core alone and Pi core extended by whichever plugin adapters meet their independent admission contracts. `@tintinweb/pi-subagents` is the current in-process orchestrator integration: one connected root session may create multiple ordinary children; each child must load `pi-tintin-extension.js`, restore the parent-verified assembly, keep its local Pi cwd, and open an independent companion on the parent remote cwd. A second independent root in the same process is rejected. It does not define the remote runtime. Its local `isolation: "worktree"` mode is not supported for remote-connected sessions; its real SSH smoke remains the external acceptance gate.
 
 ```mermaid
 flowchart LR
@@ -72,15 +72,17 @@ flowchart LR
 
 ```bash
 bun run check
+bun run build:pi-worker:all
 REMOTE_ALIAS=<ssh-alias> REMOTE_CWD=<remote-path> bun run benchmark:omp
 REMOTE_ALIAS=<ssh-alias> REMOTE_CWD=<remote-path> bun run benchmark:pi
 REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_SMOKE_PLUGINS=none bun scripts/smoke-pi-assembly.ts
 REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_SMOKE_PLUGINS=aft bun scripts/smoke-pi-assembly.ts
+REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_TINTIN_SUBAGENTS_ENTRY=<tintin-entry> bun scripts/smoke-pi-tintin-subagent.ts
 ```
 
-The two Pi smoke modes exercise the pure Pi and Pi+AFT assemblies through the same extension, SSH deployment, worker, tool-routing, and restoration lifecycle.
+The Pi assembly smokes exercise Pi core alone and assemblies extended by the active adapter set through the same extension, SSH deployment, worker, tool-routing, and restoration lifecycle. The tintin smoke additionally verifies a normal in-process child opens its own companion and executes `hostname` and `pwd` on the remote workspace; it does not cover local worktree isolation.
 
-Workers are large generated artifacts and are ignored by Git. Source installation requires building the worker binaries locally before linking the package.
+Workers are large generated artifacts and are ignored by Git. Source installation requires running `bun run build:pi-worker:all` locally before linking the package.
 
 ## License
 

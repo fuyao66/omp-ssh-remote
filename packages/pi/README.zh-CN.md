@@ -6,7 +6,7 @@ Pi SSH Remote 将 Pi 的对话、模型凭据、UI、记忆、网络访问和任
 
 ## Runtime Assembly
 
-系统不再存在固定的 `pi-aft` 产品 profile。每次连接时，host adapter 都会检查当前 Pi 工具注册表、active tool set、source provenance 和已解析的 package metadata，并生成一个 `RuntimeAssembly`，其中包含：
+每次连接时，host adapter 都会检查当前 Pi 工具注册表、active tool set、source provenance 和已解析的 package metadata，并生成一个 `RuntimeAssembly`，其中包含：
 
 - 当前 Pi host descriptor；
 - 按当前 active tool registry 中首次出现顺序检测到的零个或多个 plugin adapter；
@@ -30,21 +30,21 @@ flowchart LR
 
 ## 已支持组件
 
-| 类型 | ID | 当前职责 |
-| --- | --- | --- |
-| Host | `pi-core` | 当工具由 Pi 持有时，执行 Pi 原生 `read`、`write`、`edit`、`bash`、`grep`、`find` 和 `ls` |
-| Plugin adapter | `@cortexkit/aft-pi` | AFT 文件/命令工具、后台 Bash 生命周期工具、AFT 代码工具及平台 AFT binary |
-| 本机 integration | `pi-subagents` | 子进程通过环境变量继承已序列化的 assembly 和 SSH 连接，并在父 session 的远端 cwd 上打开独立 companion |
+| 类型             | ID                        | 当前职责                                                                                         |
+| ---------------- | ------------------------- | ------------------------------------------------------------------------------------------------ |
+| Host             | `pi-core`                 | 当工具由 Pi 持有时，执行 Pi 原生 `read`、`write`、`edit`、`bash`、`grep`、`find` 和 `ls`         |
+| Plugin adapter   | `@cortexkit/aft-pi`       | AFT 文件/命令工具、后台 Bash 生命周期工具、AFT 代码工具及平台 AFT binary                         |
+| 本机 integration | `@tintinweb/pi-subagents` | 当前 in-process child integration；恢复已序列化 assembly、打开独立 companion，并保持本机编排 cwd |
 
-没有 active 的受支持 plugin 时，远端 runtime 是纯 Pi。AFT active 时，AFT 持有 `read`、`write`、`edit`、`bash`、`grep`、`bash_status`、`bash_watch`、`bash_write`、`bash_kill`、`aft_outline`、`aft_zoom`、`aft_inspect`、`aft_conflicts`、`aft_import`、`aft_safety`、`ast_grep_search` 和 `ast_grep_replace`；Pi 继续持有 `find` 和 `ls`。AFT 的其他工具，例如 `aft_search`、`lsp_diagnostics` 和 `aft_callgraph`，在 adapter 准入前仍留在本机。
+没有 active 的受支持 plugin 时，远端 runtime 仅为 Pi core。当前包含的 AFT adapter 在获得准入时持有 `read`、`write`、`edit`、`bash`、`grep`、`bash_status`、`bash_watch`、`bash_write`、`bash_kill`、`aft_outline`、`aft_zoom`、`aft_inspect`、`aft_conflicts`、`aft_import`、`aft_safety`、`ast_grep_search` 和 `ast_grep_replace`；Pi core 继续持有 `find` 和 `ls`。AFT 的其他工具，例如 `aft_search`、`lsp_diagnostics` 和 `aft_callgraph`，在 adapter 准入前仍留在本机。
 
-其他已安装 plugin 不会被复制，也不会被推断为可远端执行。不持有准入工作区工具的 plugin 保持本机执行。如果未支持 plugin 替换了本 adapter 原本要远端化的 Pi 或 AFT 工作区工具，连接会 fail closed。新增远端工作区 plugin 必须提供显式 adapter，描述 source detection、tool ownership、schema、companion artifacts 和 lifecycle 行为。
+其他已安装 plugin 不会被复制，也不会被推断为可远端执行。不持有准入工作区工具的 plugin 保持本机执行。如果未支持 plugin 替换了本应由 Pi core 或已准入 plugin adapter 持有的工作区工具，连接会 fail closed。新增远端工作区 plugin 必须提供显式 adapter，描述 source detection、tool ownership、schema、companion artifacts 和 lifecycle 行为。
 
-模型路由、凭据、memory、web access、ask/TUI 和 UI extensions 始终保持本机执行。不支持 `pi-subagents` 的隔离 worktree；普通子进程通过环境变量继承父 session 的远端 cwd。
+模型路由、凭据、memory、web access、ask/TUI 和 UI extensions 始终保持本机执行。当前 in-process 编排 integration 面向 `@tintinweb/pi-subagents`：普通 child 恢复父 session 已验证的 assembly，在父 session 的远端 cwd 上使用独立 remote companion，同时保留本机 Pi cwd。它的 `isolation: "worktree"` 模式只在本机运行，不能用于远端工作区。
 
 ## 工具所有权
 
-Pi 的同名 extension tool 采用 first-wins，且没有调用被覆盖工具的公开接口。因此 Pi SSH Remote 必须排在它要 shadow 的受支持 plugin 前，包括 AFT。
+Pi 的同名 extension tool 采用 first-wins，且没有调用被覆盖工具的公开接口。因此 Pi SSH Remote 必须排在它要 shadow 的受支持 plugin 前。
 
 未连接时，当前本机 Pi/plugin runtime 持有其工具。`/remote-connect` 解析当前 assembly、验证远端 manifest，并注册保留 schema 的 wrapper。`/remote-exit` 关闭 companion 并 reload Pi，以重建本机所有权。transport 或 ownership 失败时会阻止已解析工作区工具，不会意外 fallback 到本机工具。
 
@@ -53,6 +53,21 @@ Pi 的同名 extension tool 采用 first-wins，且没有调用被覆盖工具�
 ```text
 当前本机 owners -> 匹配的远端 assembly owners -> 恢复后的本机 owners
 ```
+
+## Tintin 子代理
+
+Pi SSH Remote 包含一个面向由 `@tintinweb/pi-subagents` 创建的普通 in-process child 的 integration。child 必须在任何默认 extension 之前加载专用的 Pi SSH Remote **tintin child entry file**；它会恢复父 session 已验证的 assembly，并打开独立 companion。child 不需要在本机重复加载 AFT 或其他远端工作区 plugin。
+
+```yaml
+---
+description: 远端工作区 worker
+extensions:
+  - /absolute/path/to/omp-ssh-remote/packages/pi/dist/pi-tintin-extension.js
+tools: bash,read,grep,find,ls
+---
+```
+
+使用父 session 已安装 package 中的 extension entry file，而不是 package 目录。普通 `Agent` 调用通过 frontmatter name 或文件名选择这个 agent。child 的本机 cwd 仍是本机编排状态；其准入工作区工具会在继承的远端 cwd 执行。tintin 的本机 `isolation: "worktree"` 模式不支持远端连接态。使用新的 Pi 或 tintin release 前，应在受信任 acceptance host 上运行 tintin smoke。
 
 ## 环境要求
 
@@ -63,7 +78,7 @@ Pi 的同名 extension tool 采用 first-wins，且没有调用被覆盖工具�
 - 远端项目目录已存在；
 - 远端不需要预装 Node.js、Bun、Pi、AFT 或模型凭据。
 
-当前源码构建与测试解析到 Pi `0.84.2` 和 AFT `0.51.3`；它们是本次 build identity，不是 runtime contract 或 Pi package peer dependency 的版本相等要求。
+当前源码构建与测试解析到 Pi `0.84.2` 和 AFT `0.52.0`；它们是本次 build identity，不是 runtime contract 或 Pi package peer dependency 的版本相等要求。
 
 主机密钥使用严格校验。请通过正常 OpenSSH `known_hosts` 信任主机，不要关闭校验。插件同时禁用 agent forwarding 和 SSH forwarding。
 
@@ -82,6 +97,7 @@ package 必须包含：
 
 ```text
 packages/pi/dist/pi-extension.js
+packages/pi/dist/pi-tintin-extension.js
 packages/pi/dist/worker-linux-x64
 packages/pi/dist/worker-linux-x64.sha256
 packages/pi/dist/aft-linux-x64
@@ -92,7 +108,7 @@ packages/pi/dist/aft-linux-arm64
 packages/pi/dist/aft-linux-arm64.sha256
 ```
 
-在 `~/.pi/agent/settings.json` 中，确保 Pi SSH Remote 排在 AFT 前：
+在 `~/.pi/agent/settings.json` 中，确保 Pi SSH Remote 排在它需要 shadow 的工作区 plugin adapter 前。当前示例为 AFT：
 
 ```json
 {
@@ -121,7 +137,7 @@ packages/pi/dist/aft-linux-arm64.sha256
 /remote-connect user@example.com /srv/project --port 22 --identity ~/.ssh/id_ed25519
 ```
 
-模型可以调用 `remote_connect`、`remote_workspace_status` 和 `remote_exit`。status 会报告 assembly ID、本机与远端 component 版本、工具分组、ownership verification 和 transport state。连接失败或丢失后，必须先 `/remote-exit` 才能重连。`pi-subagents` 子进程通过环境变量继承已序列化的 assembly 和 SSH 连接，并在父 session 的远端 cwd 上打开独立 companion。
+模型可以调用 `remote_connect`、`remote_workspace_status` 和 `remote_exit`。status 会报告 assembly ID、本机与远端 component 版本、工具分组、ownership verification 和 transport state。连接失败或丢失后，必须先 `/remote-exit` 才能重连。一个已连接的 root session 可以创建多个普通 `@tintinweb/pi-subagents` child；每个 child 必须加载 `pi-tintin-extension.js` 才能恢复 root assembly 并打开独立 companion。同一进程中的第二个独立 root 会被拒绝。远端连接态不要启用 tintin 的本机 `isolation: "worktree"` 模式。仓库中的 tintin smoke 是该 integration 的外部 acceptance gate。
 
 ## 部署与安全
 
@@ -142,7 +158,7 @@ worker 不运行模型。shutdown 会 abort 活跃调用并最多等待 5 秒，
 - 新 plugin 需要显式 adapter，并重新构建 worker artifact；
 - 不自动推断任意第三方工作区 plugin；
 - 不在远端运行模型 loop、memory、web 凭据、browser 或 TUI；
-- 不支持 `pi-subagents` 的隔离 worktree 或通用 artifact bridge；
+- 不支持 `@tintinweb/pi-subagents` 的本机 `isolation: "worktree"`、远端 worktree 或通用 artifact bridge；
 - 连接失败或丢失后保持 fail-closed，必须先 `/remote-exit` 才能重连；
 - Pi reload 会重建 plugin 内存状态；
 - 单个 protocol frame 限制为 16 MiB。

@@ -37,7 +37,7 @@ const components = [
 ];
 const assembly = {
   id: "assembly-test",
-  displayName: "Pi + AFT",
+  displayName: "Pi core with plugin adapters: AFT",
   host: components[0],
   plugins: [components[1]],
   components,
@@ -61,8 +61,8 @@ const assembly = {
   workerBundle: { cacheNamespace: "pi", companionArtifacts: [] },
   knownWorkspaceTools: new Set(toolOwners.map((tool) => tool.name)),
   executionRuntime: {
-    local: "local Pi + AFT runtime",
-    remote: "model-free remote Pi + AFT runtime",
+    local: "local Pi core runtime with plugin adapters: AFT",
+    remote: "model-free remote Pi core runtime with plugin adapters: AFT",
   },
 } as PiRuntimeAssembly;
 
@@ -125,7 +125,9 @@ describe("Pi remote workspace status", () => {
     };
     const status = buildPiWorkspaceStatus(state);
     expect(status.mode).toBe("remote");
-    expect(status.assembly?.displayName).toBe("Pi + AFT");
+    expect(status.assembly?.displayName).toBe(
+      "Pi core with plugin adapters: AFT",
+    );
     expect(status.remoteWorkspaceTools).toEqual([
       "read",
       "find",
@@ -148,7 +150,9 @@ describe("Pi remote workspace status", () => {
         tools: ["read", "aft_outline", "bash_status"],
       },
     ]);
-    expect(status.routing.executionRuntime).toContain("remote Pi + AFT");
+    expect(status.routing.executionRuntime).toContain(
+      "remote Pi core runtime with plugin adapters: AFT",
+    );
   });
 
   test("fails closed until transport and ownership are verified", () => {

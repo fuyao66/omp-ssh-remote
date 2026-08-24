@@ -418,8 +418,7 @@ export async function resolvePiRuntimeAssembly(
     })),
     tools: assemblyTools.map(({ name, owner }) => ({ name, owner })),
   };
-  const pluginNames = plugins.map((plugin) => plugin.displayName);
-  const displayName = ["Pi", ...pluginNames].join(" + ");
+  const displayName = assemblyDisplayName(plugins);
   const assembly: PiRuntimeAssembly = {
     id,
     displayName,
@@ -449,6 +448,160 @@ export async function resolvePiRuntimeAssembly(
     },
   };
   return assembly;
+}
+
+function assemblyDisplayName(
+  plugins: readonly Pick<PiAssemblyComponent, "displayName">[],
+): string {
+  const names = plugins.map((plugin) => plugin.displayName);
+  return names.length === 0
+    ? "Pi core"
+    : `Pi core with plugin adapters: ${names.join(", ")}`;
+}
+
+export function restorePiRuntimeAssembly(
+  request: RuntimeAssemblyRequest,
+  tools: readonly PiAssemblyTool[],
+): PiRuntimeAssembly {
+  const host = request.components[0];
+  if (
+    !host ||
+    host.id !== PI_CORE_COMPONENT_ID ||
+    host.kind !== "host" ||
+    host.contractVersion !== PI_CORE_CONTRACT_VERSION
+  ) {
+    throw new Error(
+      "Inherited Pi assembly is missing the supported Pi host contract",
+    );
+  }
+  const seenComponents = new Set<string>();
+  const adapters = new Map<string, PiPluginAdapter>();
+  const plugins: PiAssemblyComponent[] = [];
+  for (const [index, component] of request.components.entries()) {
+    if (seenComponents.has(component.id)) {
+      throw new Error(
+        `Duplicate inherited Pi assembly component: ${component.id}`,
+      );
+    }
+    seenComponents.add(component.id);
+    if (index === 0) continue;
+    if (component.kind !== "plugin") {
+      throw new Error(
+        `Unsupported inherited Pi assembly component: ${component.id}`,
+      );
+    }
+    const adapter = PI_PLUGIN_ADAPTERS.find(
+      (candidate) => candidate.id === component.id,
+    );
+    if (!adapter || adapter.contractVersion !== component.contractVersion) {
+      throw new Error(
+        `Unsupported inherited Pi plugin contract: ${component.id}`,
+      );
+    }
+    adapters.set(component.id, adapter);
+    plugins.push({
+      id: component.id,
+      kind: component.kind,
+      contractVersion: component.contractVersion,
+      version: component.version,
+      displayName: adapter.displayName,
+      tools: request.tools
+        .filter((tool) => tool.owner === component.id)
+        .map((tool) => tool.name),
+    });
+  }
+  const expectedOwners = new Map(
+    request.tools.map((tool) => [tool.name, tool.owner]),
+  );
+  for (const [name, owner] of expectedOwners) {
+    if (owner !== PI_CORE_COMPONENT_ID && !adapters.has(owner)) {
+      throw new Error(`Inherited Pi tool has unsupported owner: ${name}`);
+    }
+    if (owner === PI_CORE_COMPONENT_ID && !PI_CORE_TOOL_SET.has(name)) {
+      throw new Error(
+        `Inherited Pi tool is not a supported Pi core tool: ${name}`,
+      );
+    }
+    if (
+      owner !== PI_CORE_COMPONENT_ID &&
+      !adapters.get(owner)?.remoteTools.has(name)
+    ) {
+      throw new Error(
+        `Inherited Pi tool is not admitted by its plugin adapter: ${name}`,
+      );
+    }
+  }
+  const restoredTools = tools.map((tool) => {
+    const expectedOwner = expectedOwners.get(tool.name);
+    if (!expectedOwner || expectedOwner !== tool.owner) {
+      throw new Error(`Inherited Pi tool owner mismatch: ${tool.name}`);
+    }
+    if (!isObjectSchema(tool.parameters)) {
+      throw new Error(
+        `Inherited Pi tool ${tool.name} has an invalid parameter schema`,
+      );
+    }
+    return { ...tool, parameters: tool.parameters };
+  });
+  if (
+    restoredTools.length !== request.tools.length ||
+    expectedOwners.size !== restoredTools.length
+  ) {
+    throw new Error("Inherited Pi assembly tools are incomplete or duplicated");
+  }
+  const restoredId = computePiAssemblyId(request.components, restoredTools);
+  if (restoredId !== request.id) {
+    throw new Error(
+      `Inherited Pi assembly contract does not match its ID: expected ${request.id}, got ${restoredId}`,
+    );
+  }
+  const components: PiAssemblyComponent[] = [
+    {
+      id: host.id,
+      kind: host.kind,
+      contractVersion: host.contractVersion,
+      version: host.version,
+      displayName: "Pi Agent",
+      tools: request.tools
+        .filter((tool) => tool.owner === PI_CORE_COMPONENT_ID)
+        .map((tool) => tool.name),
+    },
+    ...plugins,
+  ];
+  const displayName = assemblyDisplayName(plugins);
+  const restoredRequest: RuntimeAssemblyRequest = {
+    id: request.id,
+    components: request.components.map((component) => ({ ...component })),
+    tools: request.tools.map((tool) => ({ ...tool })),
+  };
+  const assembly: PiRuntimeAssembly = {
+    id: request.id,
+    displayName,
+    host: components[0]!,
+    plugins,
+    components,
+    tools: restoredTools,
+    request: restoredRequest,
+    handshake: {
+      host: "pi",
+      hostVersion: host.version,
+      runtimeVersion: PI_REMOTE_RUNTIME_VERSION,
+      requestedTools: restoredTools.map((tool) => tool.name),
+      assembly: restoredRequest,
+      validateReady: (ready) => validatePiReadyMessage(assembly, ready),
+    },
+    workerBundle: {
+      cacheNamespace: "pi",
+      companionArtifacts: plugins.flatMap(
+        (plugin) => adapters.get(plugin.id)?.companionArtifacts ?? [],
+      ),
+    },
+    knownWorkspaceTools: new Set(restoredTools.map((tool) => tool.name)),
+    executionRuntime: {
+      local: `local ${displayName} runtime`,
+      remote: `model-free remote ${displayName} runtime`,
+    },
+  };
   return assembly;
 }
 

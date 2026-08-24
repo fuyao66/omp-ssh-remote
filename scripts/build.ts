@@ -31,6 +31,8 @@ if (target === "all" || target === "omp") {
 }
 if (target === "all" || target === "pi") {
   await rm(resolve(piOutdir, "extension.js"), { force: true });
+  await rm(resolve(piOutdir, "pi-extension.js"), { force: true });
+  await rm(resolve(piOutdir, "pi-tintin-extension.js"), { force: true });
 }
 
 const legacyModulePlugin: Bun.BunPlugin = {
@@ -61,9 +63,12 @@ if (target === "all" || target === "omp") {
 
 if (target === "all" || target === "pi") {
   const extension = await Bun.build({
-    entrypoints: [resolve(root, "src/pi/host-extension.ts")],
+    entrypoints: [
+      resolve(root, "src/pi/pi-extension.ts"),
+      resolve(root, "src/pi/pi-tintin-extension.ts"),
+    ],
     outdir: piOutdir,
-    naming: "pi-extension.js",
+    naming: "[name].js",
     target: "node",
     format: "esm",
     minify: false,
