@@ -16,6 +16,7 @@ import { prepareRemoteWorker, resolveRemoteHome } from "./deploy.ts";
 import { REMOTE_TOOL_NAMES, type RemoteToolName } from "./protocol.ts";
 import { createOmpRuntimeHandshake, toolParametersToWire } from "./omp/runtime-contract.ts";
 import { resolveOmpHostVersion } from "./omp/host-identity.ts";
+import { createNativeWorkerRuntime } from "./runtime.ts";
 import {
   isInternalUri,
   normalizePathArgument,
@@ -492,12 +493,19 @@ function registerWrapper(
   });
   state.wrappedTools.add(name);
 }
-async function ompHandshake(pi: ExtensionAPI) {
-  const metadata = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
+async function ompHandshake(_pi: ExtensionAPI) {
+  // Top-level getAllTools() omits setting-gated/xdev tools such as ast_grep.
+  // Admission must still compare the companion's full remote surface, so take
+  // wire schemas from the same native ToolSession the worker instantiates.
+  const hostVersion = await resolveOmpHostVersion();
+  const nativeRuntime = await createNativeWorkerRuntime(
+    process.cwd(),
+    hostVersion,
+  );
   return createOmpRuntimeHandshake({
-    hostVersion: await resolveOmpHostVersion(),
+    hostVersion,
     localTools: REMOTE_TOOL_NAMES.map((name) => {
-      const native = metadata.get(name);
+      const native = nativeRuntime.tools[name];
       if (!native)
         throw new Error(`OMP native tool metadata is unavailable: ${name}`);
       return { name, parameters: toolParametersToWire(native.parameters) };
