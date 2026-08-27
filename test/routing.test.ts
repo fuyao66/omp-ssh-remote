@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   pathShouldStayLocal,
   remoteControlPlaneBlockReason,
+  remoteSessionNavigationBlockReason,
   sessionBelongsToFamily,
   stagedProposal,
   taskRequestsIsolation,
@@ -170,6 +171,43 @@ describe("remote session boundaries", () => {
     expect(
       remoteControlPlaneBlockReason("task", { task: "read", isolated: false }),
     ).toBeUndefined();
+  });
+  test("allows navigation only after a clean remote owner state", () => {
+    expect(
+      remoteSessionNavigationBlockReason({
+        selected: false,
+        owner: false,
+        familyMemberCount: 0,
+        remoteProposalCount: 0,
+      }),
+    ).toBeUndefined();
+    expect(
+      remoteSessionNavigationBlockReason({
+        selected: true,
+        owner: true,
+        familyMemberCount: 1,
+        remoteProposalCount: 0,
+      }),
+    ).toBeUndefined();
+  });
+
+  test("blocks navigation while remote state still needs explicit cleanup", () => {
+    expect(
+      remoteSessionNavigationBlockReason({
+        selected: true,
+        owner: true,
+        familyMemberCount: 1,
+        remoteProposalCount: 1,
+      }),
+    ).toContain("proposals");
+    expect(
+      remoteSessionNavigationBlockReason({
+        selected: true,
+        owner: true,
+        familyMemberCount: 2,
+        remoteProposalCount: 0,
+      }),
+    ).toContain("subagent");
   });
 });
 

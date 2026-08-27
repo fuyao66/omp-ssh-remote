@@ -151,6 +151,26 @@ export function workspaceStatus(
   };
 }
 
+export type SessionNavigationState = {
+  selected: boolean;
+  owner: boolean;
+  familyMemberCount: number;
+  remoteProposalCount: number;
+};
+
+export function remoteSessionNavigationBlockReason(
+  input: SessionNavigationState,
+): string | undefined {
+  if (!input.selected) return undefined;
+  if (input.owner && input.remoteProposalCount > 0) {
+    return "Remote staged proposals are pending; resolve/reject them first, or run /remote-exit --force";
+  }
+  if (input.owner && input.familyMemberCount > 1) {
+    return "Remote subagent sessions are still active; wait for them or run /remote-exit --force";
+  }
+  return undefined;
+}
+
 type ExecutionTarget = "local" | "remote";
 type RemoteConnectOptions = Omit<RemoteConnectRequest, "cwd"> & {
   cwd: string;
@@ -988,22 +1008,55 @@ export default async function remoteRuntimeExtension(
     await attachFamilyMember(pi, state, family);
   });
 
-  pi.on("session_before_switch", (_event, ctx) => {
+  const closeBeforeSessionNavigation = async (
+    ctx: ExtensionContext,
+  ): Promise<{ cancel: true } | undefined> => {
     if (!state.selected) return;
-    ctx.ui.notify(
-      "Disconnect the remote runtime before switching sessions",
-      "warning",
-    );
-    return { cancel: true };
+    const family = state.family;
+    const blockReason = remoteSessionNavigationBlockReason({
+      selected: state.selected,
+      owner: state.owner,
+      familyMemberCount: family?.members.size ?? 0,
+      remoteProposalCount:
+        family && state.owner
+          ? [...family.members].reduce(
+              (count, member) =>
+                count +
+                member.proposalSources.filter((source) => source === "remote")
+                  .length,
+              0,
+            )
+          : 0,
+    });
+    if (blockReason) {
+      ctx.ui.notify(blockReason, "warning");
+      return { cancel: true };
+    }
+    try {
+      if (state.owner && family) {
+        await closeRemoteFamily(family);
+      } else {
+        await closeRemoteState(state);
+      }
+      ctx.ui.notify(
+        "Remote runtime disconnected before session navigation; workspace tools are local",
+        "info",
+      );
+    } catch (error) {
+      ctx.ui.notify(
+        `Remote runtime stopped before session navigation: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    }
+    return undefined;
+  };
+
+  pi.on("session_before_switch", async (_event, ctx) => {
+    return closeBeforeSessionNavigation(ctx);
   });
 
-  pi.on("session_before_branch", (_event, ctx) => {
-    if (!state.selected) return;
-    ctx.ui.notify(
-      "Disconnect the remote runtime before branching the session",
-      "warning",
-    );
-    return { cancel: true };
+  pi.on("session_before_branch", async (_event, ctx) => {
+    return closeBeforeSessionNavigation(ctx);
   });
 
   pi.on("tool_call", (event) => {
