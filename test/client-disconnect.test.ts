@@ -18,4 +18,16 @@ describe("remote runtime disconnects", () => {
       client.execute("read", "later-read", { path: "file.txt" }),
     ).rejects.toThrow("disconnected");
   });
+
+  test("kills a worker that ignores graceful shutdown past the deadline", async () => {
+    const client = new RemoteRuntimeClient({
+      command: ["bun", join(import.meta.dir, "fixtures/stubborn-worker.ts")],
+    });
+    await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+
+    await expect(client.close(20)).rejects.toThrow(
+      "Remote runtime shutdown timed out after 20ms",
+    );
+    expect(client.isClosed).toBe(true);
+  });
 });

@@ -186,6 +186,8 @@ const remoteFamilyGlobal = globalThis as RemoteFamilyBrokerGlobal;
 const REMOTE_FAMILIES = (remoteFamilyGlobal[REMOTE_FAMILY_BROKER_KEY] ??=
   new Map<string, RemoteFamily>());
 
+const SESSION_SHUTDOWN_REMOTE_CLOSE_TIMEOUT_MS = 1_000;
+
 function sessionFamilyRoot(sessionFile: string): string {
   const normalized = resolvePath(sessionFile);
   return normalized.endsWith(".jsonl")
@@ -549,12 +551,18 @@ function detachRemoteState(
   return current;
 }
 
-async function closeRemoteState(state: RemoteExtensionState): Promise<void> {
+async function closeRemoteState(
+  state: RemoteExtensionState,
+  timeoutMs?: number,
+): Promise<void> {
   const current = detachRemoteState(state, true);
-  if (current) await current.close();
+  if (current) await current.close(timeoutMs);
 }
 
-async function closeRemoteFamily(family: RemoteFamily): Promise<void> {
+async function closeRemoteFamily(
+  family: RemoteFamily,
+  timeoutMs?: number,
+): Promise<void> {
   family.closing = true;
   REMOTE_FAMILIES.delete(family.ownerSessionFile);
   const clients = [...family.members]
@@ -562,7 +570,7 @@ async function closeRemoteFamily(family: RemoteFamily): Promise<void> {
     .filter((client): client is RemoteRuntimeClient => client !== undefined);
   family.members.clear();
   const settled = await Promise.allSettled(
-    clients.map((client) => client.close()),
+    clients.map((client) => client.close(timeoutMs)),
   );
   const failures = settled.filter(
     (result): result is PromiseRejectedResult => result.status === "rejected",
@@ -1019,9 +1027,12 @@ export default async function remoteRuntimeExtension(
   pi.on("session_shutdown", async () => {
     state.sessionFile = undefined;
     if (state.owner && state.family) {
-      await closeRemoteFamily(state.family);
+      await closeRemoteFamily(
+        state.family,
+        SESSION_SHUTDOWN_REMOTE_CLOSE_TIMEOUT_MS,
+      );
       return;
     }
-    await closeRemoteState(state);
+    await closeRemoteState(state, SESSION_SHUTDOWN_REMOTE_CLOSE_TIMEOUT_MS);
   });
 }
