@@ -67,4 +67,27 @@ describe("OMP extension loading", () => {
       useless: true,
     });
   });
+
+  test("exposes native renderers for workspace wrappers", async () => {
+    const { toolRenderers } = await import(
+      "@oh-my-pi/pi-coding-agent/tools/renderers"
+    );
+    for (const name of [
+      "read",
+      "write",
+      "edit",
+      "bash",
+      "grep",
+      "glob",
+      "lsp",
+      "ast_grep",
+      "ast_edit",
+      "eval",
+      "debug",
+    ]) {
+      expect(toolRenderers[name]).toBeDefined();
+      expect(toolRenderers[name]?.renderCall).toBeFunction();
+      expect(toolRenderers[name]?.renderResult).toBeFunction();
+    }
+  });
 });

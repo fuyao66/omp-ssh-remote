@@ -139,6 +139,12 @@ try {
     );
   if (tools.has("ast_grep"))
     throw new Error("ast_grep was incorrectly exposed as a top-level tool");
+  for (const name of activeTools) {
+    const tool = tools.get(name);
+    if (!tool?.renderCall || !tool.renderResult) {
+      throw new Error(`Remote wrapper ${name} is missing native renderer callbacks`);
+    }
+  }
 
   const invokeContext = {
     invokeTool: async (

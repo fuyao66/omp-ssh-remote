@@ -6,6 +6,7 @@ import type {
   ExtensionContext,
   ToolInfo,
 } from "@oh-my-pi/pi-coding-agent";
+import { toolRenderers } from "@oh-my-pi/pi-coding-agent/tools/renderers";
 import {
   loadConfiguredSshHosts,
   parseConnectArgs,
@@ -480,11 +481,18 @@ function registerWrapper(
   name: RemoteToolName,
   native: ToolInfo,
 ): void {
+  const renderer = toolRenderers[name];
   pi.registerTool({
     name,
     label: TOOL_LABELS[name],
     description: native.description,
     parameters: native.parameters,
+    ...(renderer
+      ? {
+          renderCall: renderer.renderCall,
+          renderResult: renderer.renderResult,
+        }
+      : {}),
     loadMode: "essential",
     approval: approvalFor(name),
     async execute(toolCallId, rawParams, signal, rawOnUpdate, ctx) {
