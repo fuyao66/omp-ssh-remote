@@ -475,24 +475,22 @@ async function executeWithTarget(
   }
 }
 
+export function remoteWrapperRenderer(name: RemoteToolName) {
+  return toolRenderers[name] ?? {};
+}
+
 function registerWrapper(
   pi: ExtensionAPI,
   state: RemoteExtensionState,
   name: RemoteToolName,
   native: ToolInfo,
 ): void {
-  const renderer = toolRenderers[name];
   pi.registerTool({
     name,
     label: TOOL_LABELS[name],
     description: native.description,
     parameters: native.parameters,
-    ...(renderer
-      ? {
-          renderCall: renderer.renderCall,
-          renderResult: renderer.renderResult,
-        }
-      : {}),
+    ...remoteWrapperRenderer(name),
     loadMode: "essential",
     approval: approvalFor(name),
     async execute(toolCallId, rawParams, signal, rawOnUpdate, ctx) {

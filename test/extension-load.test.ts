@@ -1,6 +1,8 @@
 import type { ExtensionAPI, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { describe, expect, test } from "bun:test";
-import remoteRuntimeExtension from "../src/extension.ts";
+import remoteRuntimeExtension, {
+  remoteWrapperRenderer,
+} from "../src/extension.ts";
 
 describe("OMP extension loading", () => {
   test("registers commands and a model-visible status tool without a state handler", async () => {
@@ -68,7 +70,7 @@ describe("OMP extension loading", () => {
     });
   });
 
-  test("exposes native renderers for workspace wrappers", async () => {
+  test("preserves native renderer metadata for workspace wrappers", async () => {
     const { toolRenderers } = await import(
       "@oh-my-pi/pi-coding-agent/tools/renderers"
     );
@@ -89,5 +91,9 @@ describe("OMP extension loading", () => {
       expect(toolRenderers[name]?.renderCall).toBeFunction();
       expect(toolRenderers[name]?.renderResult).toBeFunction();
     }
+    expect(remoteWrapperRenderer("bash")).toMatchObject({
+      mergeCallAndResult: true,
+      inline: true,
+    });
   });
 });
