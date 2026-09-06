@@ -1,6 +1,7 @@
 import type { RemoteConnectRequest } from "../../connect-options.ts";
 import type { RuntimeAssemblyRequest } from "../../protocol.ts";
 import type { PiAssemblyTool } from "../assembly.ts";
+import type { PiRemoteConnectionInheritance } from "./connection-inheritance.ts";
 
 // ponytail: process-global owner slot; session-scoped spec if tintin exposes a public child context
 const INHERIT_ENV = "PI_REMOTE_CONNECTION_SPEC";
@@ -124,4 +125,16 @@ export function clearPiTintinSubagentConnectionSpec(ownerToken?: string): void {
   if (ownerToken === undefined || process.env[OWNER_ENV] !== ownerToken) return;
   delete process.env[INHERIT_ENV];
   delete process.env[OWNER_ENV];
+}
+
+/** Opt-in inheritance backend for the dedicated Tintin Pi entry. */
+export function createTintinPiConnectionInheritance(): PiRemoteConnectionInheritance {
+  return {
+    hasSpec: hasPiTintinSubagentConnectionSpec,
+    hasRootOwner: hasPiTintinSubagentRootOwner,
+    read: readPiTintinSubagentConnectionSpec,
+    claim: claimPiTintinSubagentConnectionSpec,
+    publish: publishPiTintinSubagentConnectionSpec,
+    clear: clearPiTintinSubagentConnectionSpec,
+  };
 }

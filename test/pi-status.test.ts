@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createEventBus } from "@earendil-works/pi-coding-agent";
 import {
   buildPiWorkspaceStatus,
   getPiRemoteState,
@@ -176,6 +177,7 @@ describe("Pi remote workspace status", () => {
     const commands = new Map<string, any>();
     const handlers = new Map<string, any[]>();
     const mockPi = {
+      events: createEventBus(),
       registerTool(tool: any) {
         tools.set(tool.name, tool);
       },

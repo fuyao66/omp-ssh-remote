@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  AgentSession,
   DefaultResourceLoader,
   SessionManager,
   SettingsManager,
@@ -17,6 +18,7 @@ import {
   createWriteTool,
   getPackageDir,
   type ToolDefinition,
+  type ToolInfo,
 } from "@earendil-works/pi-coding-agent";
 import {
   PROTOCOL_VERSION,
@@ -34,7 +36,14 @@ import {
   PI_REMOTE_RUNTIME_VERSION,
 } from "./assembly.ts";
 import {
-  PI_WORKER_PLUGIN_ADAPTERS,
+  executeWorkspaceTool,
+  type WorkspaceExecutableTool,
+  type WorkspacePluginHandle,
+  type WorkspaceToolRunner,
+  WORKSPACE_HOOKS,
+} from "./workspace-plugin.ts";
+import {
+  findWorkerPluginAdapter,
   type PiWorkerPluginAdapter,
 } from "./worker-plugins.ts";
 
@@ -48,12 +57,11 @@ export interface PiWorkerRuntime {
   close(): Promise<void>;
 }
 
+const PI_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 type ExecutableTool = Pick<
   ToolDefinition,
   "description" | "parameters" | "execute"
-> & {
-  prepareArguments?(input: unknown): unknown;
-};
+> & WorkspaceExecutableTool;
 
 const require = createRequire(import.meta.url);
 const CORE_TOOL_SET = new Set<string>(PI_CORE_TOOL_NAMES);
@@ -87,7 +95,9 @@ async function packageVersionFromDirectory(
       ) {
         return manifest.version;
       }
-    } catch {}
+    } catch {
+      // keep walking
+    }
     const parent = dirname(current);
     if (parent === current) return undefined;
     current = parent;
@@ -107,6 +117,11 @@ async function resolvePackageVersion(
     if (version) return version;
   }
   try {
+    const manifestPath = require.resolve(`${packageName}/package.json`);
+    const version = await packageVersionFromDirectory(dirname(manifestPath), packageName);
+    if (version) return version;
+  } catch {}
+  try {
     const entryUrl = import.meta.resolve(packageName);
     const entry = entryUrl.startsWith("file:")
       ? fileURLToPath(entryUrl)
@@ -116,7 +131,9 @@ async function resolvePackageVersion(
       packageName,
     );
     if (version) return version;
-  } catch {}
+  } catch {
+    // fall through
+  }
   try {
     const entry = require.resolve(packageName);
     const version = await packageVersionFromDirectory(
@@ -124,16 +141,25 @@ async function resolvePackageVersion(
       packageName,
     );
     if (version) return version;
-  } catch {}
+  } catch {
+    // fall through
+  }
   throw new Error(
     `Could not resolve worker package version for ${packageName}`,
   );
 }
 
-function resolveWorkerAssembly(request: RuntimeAssemblyRequest): {
+type ResolvedWorkerAssembly = {
   host: RuntimeAssemblyComponent;
-  plugins: PiWorkerPluginAdapter[];
-} {
+  plugins: Array<{
+    component: RuntimeAssemblyComponent;
+    adapter: PiWorkerPluginAdapter;
+  }>;
+};
+
+function resolveWorkerAssembly(
+  request: RuntimeAssemblyRequest,
+): ResolvedWorkerAssembly {
   const [host, ...pluginComponents] = request.components;
   if (
     !host ||
@@ -145,18 +171,18 @@ function resolveWorkerAssembly(request: RuntimeAssemblyRequest): {
       "Pi worker assembly is missing the supported Pi host contract",
     );
   }
+
   const componentIds = new Set<string>();
-  const plugins: PiWorkerPluginAdapter[] = [];
   for (const component of request.components) {
     if (componentIds.has(component.id)) {
       throw new Error(`Duplicate Pi assembly component: ${component.id}`);
     }
     componentIds.add(component.id);
   }
+
+  const plugins: ResolvedWorkerAssembly["plugins"] = [];
   for (const component of pluginComponents) {
-    const adapter = PI_WORKER_PLUGIN_ADAPTERS.find(
-      (candidate) => candidate.id === component.id,
-    );
+    const adapter = findWorkerPluginAdapter(component.id);
     if (
       component.kind !== "plugin" ||
       !adapter ||
@@ -164,7 +190,13 @@ function resolveWorkerAssembly(request: RuntimeAssemblyRequest): {
     ) {
       throw new Error(`Unsupported Pi plugin contract: ${component.id}`);
     }
-    plugins.push(adapter);
+    if (component.config !== undefined) {
+      if (!adapter.validateConfig) {
+        throw new Error(`Pi worker plugin ${component.id} does not admit configuration`);
+      }
+      adapter.validateConfig(component.config);
+    }
+    plugins.push({ component, adapter });
   }
 
   const toolNames = new Set<string>();
@@ -179,14 +211,73 @@ function resolveWorkerAssembly(request: RuntimeAssemblyRequest): {
       }
       continue;
     }
-    const plugin = plugins.find((candidate) => candidate.id === tool.owner);
-    if (!plugin || !plugin.remoteTools.has(tool.name)) {
+    const plugin = plugins.find(
+      (candidate) => candidate.adapter.id === tool.owner,
+    );
+    if (!plugin || !plugin.adapter.remoteTools.has(tool.name)) {
       throw new Error(
         `Pi assembly tool ${tool.name} has unsupported owner ${tool.owner}`,
       );
     }
   }
+
   return { host, plugins };
+}
+
+function resolveActualOwner(
+  toolName: string,
+  requestedOwner: string,
+  toolInfos: ReadonlyMap<string, ToolInfo>,
+  plugins: ResolvedWorkerAssembly["plugins"],
+): string {
+  if (requestedOwner === PI_CORE_COMPONENT_ID) {
+    const info = toolInfos.get(toolName);
+    if (info) {
+      const pluginOwners = plugins.filter(({ adapter }) =>
+        adapter.matchesSource(info.sourceInfo),
+      );
+      if (pluginOwners.length > 0) {
+        throw new Error(
+          `Pi tool ${toolName} was requested as core-owned but source matches plugin ${pluginOwners.map((item) => item.adapter.id).join(", ")}`,
+        );
+      }
+    }
+    return PI_CORE_COMPONENT_ID;
+  }
+
+  const plugin = plugins.find(
+    (candidate) => candidate.adapter.id === requestedOwner,
+  );
+  if (!plugin) {
+    throw new Error(`Pi tool ${toolName} requested unknown owner ${requestedOwner}`);
+  }
+
+  const info = toolInfos.get(toolName);
+  if (!info) {
+    throw new Error(`Pi plugin tool ${toolName} has no verified runtime source`);
+  }
+
+  if (!plugin.adapter.matchesSource(info.sourceInfo)) {
+    const actual = plugins.find(({ adapter }) =>
+      adapter.matchesSource(info.sourceInfo),
+    );
+    throw new Error(
+      `Pi tool ${toolName} requested owner ${requestedOwner} but actual source owner is ${actual?.adapter.id ?? "unknown"} (${JSON.stringify(info.sourceInfo)})`,
+    );
+  }
+
+  const conflicts = plugins.filter(
+    ({ adapter }) =>
+      adapter.id !== plugin.adapter.id &&
+      adapter.matchesSource(info.sourceInfo),
+  );
+  if (conflicts.length > 0) {
+    throw new Error(
+      `Pi tool ${toolName} has ambiguous plugin provenance: ${[plugin.adapter.id, ...conflicts.map((item) => item.adapter.id)].join(", ")}`,
+    );
+  }
+
+  return plugin.adapter.id;
 }
 
 export async function createPiWorkerRuntime(
@@ -195,11 +286,11 @@ export async function createPiWorkerRuntime(
 ): Promise<PiWorkerRuntime> {
   const selected = resolveWorkerAssembly(assembly);
   const previousCwd = process.cwd();
+  const previousAgentDir = process.env[PI_AGENT_DIR_ENV];
   let agentDir: string | undefined;
-  let session:
-    | Awaited<ReturnType<typeof createAgentSession>>["session"]
-    | undefined;
+  let session: AgentSession | undefined;
   let closed = false;
+  const handles = new Map<string, WorkspacePluginHandle>();
 
   const dispose = async (): Promise<void> => {
     try {
@@ -207,11 +298,25 @@ export async function createPiWorkerRuntime(
         await session.extensionRunner
           .emit({ type: "session_shutdown", reason: "quit" })
           .catch(() => {});
+      }
+      await Promise.allSettled(
+        [...handles.values()].map(async (handle) => {
+          try {
+            await handle.suspend?.();
+          } finally {
+            await handle.shutdown();
+          }
+        }),
+      );
+      handles.clear();
+      if (session) {
         session.dispose();
         session = undefined;
       }
     } finally {
       process.chdir(previousCwd);
+      if (previousAgentDir === undefined) delete process.env[PI_AGENT_DIR_ENV];
+      else process.env[PI_AGENT_DIR_ENV] = previousAgentDir;
       if (agentDir) {
         await rm(agentDir, { recursive: true, force: true });
         agentDir = undefined;
@@ -221,18 +326,31 @@ export async function createPiWorkerRuntime(
 
   try {
     process.chdir(cwd);
+
     if (selected.plugins.length > 0) {
       agentDir = await mkdtemp(join(tmpdir(), "pi-ssh-remote-worker-"));
+      process.env[PI_AGENT_DIR_ENV] = agentDir;
       const settingsManager = SettingsManager.create(cwd, agentDir);
+      const extensionFactories = selected.plugins.map(
+        ({ component, adapter }) => ({
+          name: adapter.id,
+          factory: adapter.createFactory({
+            config: component.config,
+            onHandle: (handle) => {
+              if (handles.has(adapter.id)) {
+                throw new Error(`Pi worker plugin ${adapter.id} registered multiple handles`);
+              }
+              handles.set(adapter.id, handle);
+            },
+          }),
+          hidden: true,
+        }),
+      );
       const resourceLoader = new DefaultResourceLoader({
         cwd,
         agentDir,
         settingsManager,
-        extensionFactories: selected.plugins.map((plugin) => ({
-          name: plugin.id,
-          factory: plugin.factory,
-          hidden: true,
-        })),
+        extensionFactories,
         noExtensions: true,
         noSkills: true,
         noPromptTemplates: true,
@@ -252,15 +370,28 @@ export async function createPiWorkerRuntime(
     }
 
     const nativeTools = nativeToolMap(cwd);
+    const toolInfos = new Map<string, ToolInfo>(
+      (session?.getAllTools() ?? []).map((tool) => [tool.name, tool]),
+    );
     const tools = new Map<string, ExecutableTool>();
+    const actualOwners = new Map<string, string>();
+
     for (const requested of assembly.tools) {
+      const owner = resolveActualOwner(
+        requested.name,
+        requested.owner,
+        toolInfos,
+        selected.plugins,
+      );
+      actualOwners.set(requested.name, owner);
+
       const tool =
-        requested.owner === PI_CORE_COMPONENT_ID
+        owner === PI_CORE_COMPONENT_ID
           ? nativeTools.get(requested.name)
           : session?.getToolDefinition(requested.name);
       if (!tool) {
         throw new Error(
-          `Pi component ${requested.owner} did not provide tool ${requested.name}`,
+          `Pi component ${owner} did not provide tool ${requested.name}`,
         );
       }
       tools.set(requested.name, tool as ExecutableTool);
@@ -273,15 +404,19 @@ export async function createPiWorkerRuntime(
     const remoteComponents: RuntimeAssemblyComponent[] = [
       { ...selected.host, version: coreVersion },
     ];
-    for (const plugin of selected.plugins) {
+    for (const { component, adapter } of selected.plugins) {
+      const handle = handles.get(adapter.id);
       remoteComponents.push({
-        id: plugin.id,
+        id: adapter.id,
         kind: "plugin",
-        contractVersion: plugin.contractVersion,
+        contractVersion: adapter.contractVersion,
         version: await resolvePackageVersion(
-          plugin.packageName,
-          plugin.bundledVersion,
+          adapter.packageName,
+          adapter.bundledVersion,
         ),
+        ...(handle?.getConfigSnapshot
+          ? { config: handle.getConfigSnapshot() }
+          : component.config ? { config: component.config } : {}),
       });
     }
 
@@ -290,17 +425,26 @@ export async function createPiWorkerRuntime(
       description: tool.description,
       parameters: tool.parameters,
     }));
-    const owners = new Map(
-      assembly.tools.map((tool) => [tool.name, tool.owner]),
-    );
+    const ownershipTools = manifestTools.map((tool) => ({
+      name: tool.name,
+      owner: actualOwners.get(tool.name)!,
+      parameters: tool.parameters,
+    }));
     const remoteAssemblyId = computePiAssemblyId(
       remoteComponents,
-      manifestTools.map((tool) => ({
-        name: tool.name,
-        owner: owners.get(tool.name)!,
-        parameters: tool.parameters,
-      })),
+      ownershipTools,
     );
+
+    const workspaceServices: Record<string, string[]> = {};
+    for (const { adapter } of selected.plugins) {
+      if (!adapter.workspaceServices?.length) continue;
+      if (!handles.has(adapter.id)) {
+        throw new Error(`Pi worker plugin ${adapter.id} declared workspace services without registering a handle`);
+      }
+      workspaceServices[adapter.id] = [...adapter.workspaceServices];
+    }
+
+    const workspaceHooks = [...WORKSPACE_HOOKS];
     const manifest: ReadyMessage = {
       type: "ready",
       protocolVersion: PROTOCOL_VERSION,
@@ -313,10 +457,14 @@ export async function createPiWorkerRuntime(
         assembly: {
           id: remoteAssemblyId,
           components: remoteComponents,
-          tools: assembly.tools,
+          tools: ownershipTools.map(({ name, owner }) => ({ name, owner })),
         },
+        ...(Object.keys(workspaceServices).length > 0
+          ? { workspaceServices }
+          : {}),
         artifacts: false,
         lsp: false,
+        workspaceHooks,
         ast: tools.has("ast_grep_search"),
         eval: false,
         debug: false,
@@ -331,18 +479,30 @@ export async function createPiWorkerRuntime(
       signal?: AbortSignal,
       onUpdate?: (update: unknown) => void,
     ): Promise<unknown> {
+      const servicePrefix = "/service/";
+      const serviceIndex = request.tool.indexOf(servicePrefix);
+      if (serviceIndex > 0) {
+        const pluginId = request.tool.slice(0, serviceIndex);
+        const serviceName = request.tool.slice(serviceIndex + servicePrefix.length);
+        const adapter = selected.plugins.find(({ adapter }) => adapter.id === pluginId)?.adapter;
+        const handle = handles.get(pluginId);
+        if (!adapter?.workspaceServices?.includes(serviceName) || !handle) {
+          throw new Error(`Unadmitted Pi workspace service: ${request.tool}`);
+        }
+        return handle.service(serviceName, request.args, signal);
+      }
+
       const tool = tools.get(request.tool);
       if (!tool) throw new Error(`Unknown Pi tool: ${request.tool}`);
-      const prepared = tool.prepareArguments
-        ? tool.prepareArguments(request.args)
-        : request.args;
-      return tool.execute(
-        request.toolCallId,
-        prepared as never,
+      return executeWorkspaceTool({
+        runner: session?.extensionRunner as unknown as WorkspaceToolRunner,
+        tool,
+        toolName: request.tool,
+        toolCallId: request.toolCallId,
+        args: request.args,
         signal,
-        onUpdate as never,
-        session?.extensionRunner.createContext() as never,
-      );
+        onUpdate,
+      });
     }
 
     async function close(): Promise<void> {

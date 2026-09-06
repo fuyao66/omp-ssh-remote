@@ -59,7 +59,6 @@ async function basePiAssembly(cwd: string): Promise<PiRuntimeAssembly> {
   );
   return resolvePiRuntimeAssembly({
     tools,
-    activeTools: [...PI_CORE_TOOL_NAMES],
   });
 }
 

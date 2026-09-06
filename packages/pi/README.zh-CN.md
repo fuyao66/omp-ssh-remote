@@ -2,163 +2,116 @@
 
 简体中文 | [English](README.md)
 
-Pi SSH Remote 将 Pi 的对话、模型凭据、UI、记忆、网络访问和任务编排保留在本机，同时通过 SSH 在远端 Linux 主机执行受支持的工作区工具。它首先适配 Pi 本身，再根据当前 session 组合已明确支持的 Pi plugin adapter。本 package 只适配 Pi；OMP 使用独立的 [`../omp`](../omp/README.zh-CN.md) package。
+Pi core 加独立、可插拔的工作区插件 adapters。对话、模型请求、凭据、记忆和 UI 留在本地；远端工作区扩展宿主执行选中的工具、执行钩子和已准入插件服务。OMP 是独立且不变的运行时。
 
-## Runtime Assembly
+## 执行边界
 
-每次连接时，host adapter 都会检查当前 Pi 工具注册表、active tool set、source provenance 和已解析的 package metadata，并生成一个 `RuntimeAssembly`，其中包含：
+- `RuntimeAssembly` 描述已核验来源的完整组件能力、有效配置、工具归属与 schema。模型当前 active tools 是独立权限过滤，不决定运行组件身份。
+- `PiWorkspaceBinding` 管理 local/connecting/remote/unavailable/closing 状态。切换后旧工作区的工具和补全结果被拒绝。
+- 插件 integration 将工具、命令和 UI 查询接入同一个 binding。不会拦截或沙箱化任意插件直接调用的 Node 文件/进程 API。
+- companion 加载真实 Pi 工具与选中的插件 factory，核验实际工具来源，报告自己的 schema 与配置。未知或不兼容组件 fail-closed。
+- 无模型宿主驱动 `session_start`、`tool_call`、`tool_execution_start/update/end`、`tool_result` 和 `session_shutdown`。命令改写、拦截、错误状态、流式输出和压缩都属于执行域；不伪造模型/provider 事件。混合型插件需要显式本地控制入口。
+- 只有钩子、不注册工具的插件也能按包来源和配置显式准入；不是自动部署任意已安装插件。
+- 版本与二进制校验和用于构建身份；组件契约、配置和 schema 决定兼容性。
 
-- 当前 Pi host descriptor；
-- 按当前 active tool registry 中首次出现顺序检测到的零个或多个 plugin adapter；
-- 每个准入 active tool 的远端 owner 和本机参数 schema；
-- 这些 plugin 实际需要的 companion artifacts；
-- 用于诊断和部署身份的本机精确解析版本。
+## 支持组件
 
-Assembly ID 由 component contract、工具所有权和 schema 计算，不包含 package version 字符串。远端 worker 会报告自己的实际 Pi/plugin 版本和 schema。只要 component contract、owner 和每个工具 schema 一致，连接就可以成功；本机与远端 package 的版本字符串不要求相等。
+| 组件 | 范围 |
+| --- | --- |
+| Pi core | 原生 `read`、`write`、`edit`、`bash`、`grep`、`find`、`ls` |
+| `@ff-labs/pi-fff` | 默认 `fffind/ffgrep`、override 模式 `find/grep`、可选 multi-grep；原生渲染与提示元信息；远端 `@` 补全、health、rescan |
+| `pi-rtk-optimizer` 0.9.0 | 工作区宿主执行真实上游改写和结果钩子；本地 `/rtk` 查询远端配置、可用性和压缩统计 |
+| `@cortexkit/aft-pi` | 可选的既有工具 adapter 和独立制品；构建 core/FFF 不需要 AFT |
+| Tintin subagents | 显式选择的继承 integration；普通远端 scope，不支持远端 worktree |
 
-```mermaid
-flowchart LR
-  Pi[当前本机 Pi] --> Resolver[Runtime assembly resolver]
-  Plugins[Active 且受支持的 plugins] --> Resolver
-  Resolver --> Assembly[Pi host + 已选 plugin adapters]
-  Assembly <--> SSH[持久有界 SSH NDJSON]
-  SSH <--> Worker[远端无模型 Pi runtime]
-  Worker --> Workspace[远端文件、索引、备份与进程]
-```
+FFF 对象是 `@ff-labs/pi-fff`，不是另一个名为 `pi-fff` 的包。已验证的构建身份为 Pi 0.85.1、FFF 0.10.6。companion 使用 FFF 原生 Bun 后端；本地托管入口使用真实插件选择的后端。
 
-这是 capability-based compatibility，不是无检查兼容。新版 Pi/plugin 只有在仍满足 adapter contract 和精确 active tool schema 时才会被接纳。缺失、重复、未知、冲突或 schema 不兼容的远端工具都会在 wrapper 注册前被拒绝。
+## 构建
 
-## 已支持组件
-
-| 类型             | ID                        | 当前职责                                                                                         |
-| ---------------- | ------------------------- | ------------------------------------------------------------------------------------------------ |
-| Host             | `pi-core`                 | 当工具由 Pi 持有时，执行 Pi 原生 `read`、`write`、`edit`、`bash`、`grep`、`find` 和 `ls`         |
-| Plugin adapter   | `@cortexkit/aft-pi`       | AFT 文件/命令工具、后台 Bash 生命周期工具、AFT 代码工具及平台 AFT binary                         |
-| 本机 integration | `@tintinweb/pi-subagents` | 当前 in-process child integration；恢复已序列化 assembly、打开独立 companion，并保持本机编排 cwd |
-
-没有 active 的受支持 plugin 时，远端 runtime 仅为 Pi core。当前包含的 AFT adapter 在获得准入时持有 `read`、`write`、`edit`、`bash`、`grep`、`bash_status`、`bash_watch`、`bash_write`、`bash_kill`、`aft_outline`、`aft_zoom`、`aft_inspect`、`aft_conflicts`、`aft_import`、`aft_safety`、`ast_grep_search` 和 `ast_grep_replace`；Pi core 继续持有 `find` 和 `ls`。AFT 的其他工具，例如 `aft_search`、`lsp_diagnostics` 和 `aft_callgraph`，在 adapter 准入前仍留在本机。
-
-其他已安装 plugin 不会被复制，也不会被推断为可远端执行。不持有准入工作区工具的 plugin 保持本机执行。如果未支持 plugin 替换了本应由 Pi core 或已准入 plugin adapter 持有的工作区工具，连接会 fail closed。新增远端工作区 plugin 必须提供显式 adapter，描述 source detection、tool ownership、schema、companion artifacts 和 lifecycle 行为。
-
-模型路由、凭据、memory、web access、ask/TUI 和 UI extensions 始终保持本机执行。当前 in-process 编排 integration 面向 `@tintinweb/pi-subagents`：普通 child 恢复父 session 已验证的 assembly，在父 session 的远端 cwd 上使用独立 remote companion，同时保留本机 Pi cwd。它的 `isolation: "worktree"` 模式只在本机运行，不能用于远端工作区。
-
-## 工具所有权
-
-Pi 的同名 extension tool 采用 first-wins，且没有调用被覆盖工具的公开接口。因此 Pi SSH Remote 必须排在它要 shadow 的受支持 plugin 前。
-
-未连接时，当前本机 Pi/plugin runtime 持有其工具。`/remote-connect` 解析当前 assembly、验证远端 manifest，并注册保留 schema 的 wrapper。`/remote-exit` 关闭 companion 并 reload Pi，以重建本机所有权。transport 或 ownership 失败时会阻止已解析工作区工具，不会意外 fallback 到本机工具。
-
-生命周期验收路径为：
-
-```text
-当前本机 owners -> 匹配的远端 assembly owners -> 恢复后的本机 owners
-```
-
-## Tintin 子代理
-
-Pi SSH Remote 包含一个面向由 `@tintinweb/pi-subagents` 创建的普通 in-process child 的 integration。child 必须在任何默认 extension 之前加载专用的 Pi SSH Remote **tintin child entry file**；它会恢复父 session 已验证的 assembly，并打开独立 companion。child 不需要在本机重复加载 AFT 或其他远端工作区 plugin。
-
-```yaml
----
-description: 远端工作区 worker
-extensions:
-  - /absolute/path/to/omp-ssh-remote/packages/pi/dist/pi-tintin-extension.js
-tools: bash,read,grep,find,ls
----
-```
-
-使用父 session 已安装 package 中的 extension entry file，而不是 package 目录。普通 `Agent` 调用通过 frontmatter name 或文件名选择这个 agent。child 的本机 cwd 仍是本机编排状态；其准入工作区工具会在继承的远端 cwd 执行。tintin 的本机 `isolation: "worktree"` 模式不支持远端连接态。使用新的 Pi 或 tintin release 前，应在受信任 acceptance host 上运行 tintin smoke。
-
-## 环境要求
-
-- 本机 Linux 或 WSL，安装兼容的当前 Pi Agent、Node.js、Bun `1.3+`、npm、OpenSSH 和 SCP；
-- 工作区 plugin 必须有显式 adapter 才能在远端运行；控制面 plugin 保持本机；
-- 远端为 glibc Linux `x86_64` 或 `aarch64`；
-- 公钥 SSH 可在 batch mode 下登录；
-- 远端项目目录已存在；
-- 远端不需要预装 Node.js、Bun、Pi、AFT 或模型凭据。
-
-当前源码构建与测试解析到 Pi `0.84.2` 和 AFT `0.52.0`；它们是本次 build identity，不是 runtime contract 或 Pi package peer dependency 的版本相等要求。
-
-主机密钥使用严格校验。请通过正常 OpenSSH `known_hosts` 信任主机，不要关闭校验。插件同时禁用 agent forwarding 和 SSH forwarding。
-
-## 构建与安装
-
-在仓库根目录执行：
+仓库根目录：
 
 ```bash
 bun install --frozen-lockfile
 bun run build:pi
-bun run build:pi-worker:all
+bun scripts/compile-pi-worker.ts x64 --plugins=fff
+bun scripts/compile-pi-worker.ts arm64 --plugins=fff
 pi install "$PWD/packages/pi"
 ```
 
-package 必须包含：
+`--plugins=none` 构建无插件的 Pi core；可组合 `aft`、`fff`、`rtk`，例如 `--plugins=fff,rtk`。worker 可运行其内嵌组件的子集。缺失组件或执行钩子能力不兼容时拒绝握手，不回退本地。
 
-```text
-packages/pi/dist/pi-extension.js
-packages/pi/dist/pi-tintin-extension.js
-packages/pi/dist/worker-linux-x64
-packages/pi/dist/worker-linux-x64.sha256
-packages/pi/dist/aft-linux-x64
-packages/pi/dist/aft-linux-x64.sha256
-packages/pi/dist/worker-linux-arm64
-packages/pi/dist/worker-linux-arm64.sha256
-packages/pi/dist/aft-linux-arm64
-packages/pi/dist/aft-linux-arm64.sha256
-```
+FFF 平台共享库内嵌到独立 worker，不在运行时下载。交叉编译需要对应的 `@ff-labs/fff-bin-linux-<arch>-gnu` 制品；包管理器跳过非本机架构包时，将对应 npm 包解压至 `vendor/fff-linux-<arch>-gnu/`。只有选择 AFT 才需要 AFT 制品。生成的 worker 不提交 Git。
 
-在 `~/.pi/agent/settings.json` 中，确保 Pi SSH Remote 排在它需要 shadow 的工作区 plugin adapter 前。当前示例为 AFT：
+## 安装托管 FFF
+
+保留上游 npm 包，但禁用其直接扩展入口；显式按顺序加载 remote 与托管 FFF：
 
 ```json
 {
   "packages": [
-    "/absolute/path/to/omp-ssh-remote/packages/pi",
-    "npm:@cortexkit/aft-pi"
+    { "source": "npm:@ff-labs/pi-fff", "extensions": [] }
+  ],
+  "extensions": [
+    "/absolute/path/to/omp-ssh-remote/packages/pi/dist/pi-extension.js",
+    "/absolute/path/to/omp-ssh-remote/packages/pi/dist/pi-fff-extension.js"
   ]
 }
 ```
 
-其他本机控制面和 UI plugin 可以继续保留。在 Pi SSH Remote 前加入其他工作区工具 replacement 前，应先审查 ownership。安装后重启 Pi 或执行 `/reload-plugins`。连接状态下 reload 会关闭该 session 的 companion，之后需要重新连接。
+把托管入口统一放在顶层 `extensions` 数组，remote host 在前。不要同时把 remote 包列在 `packages`：Pi 0.85.1 会保留包发现的 host 的较低优先级，导致顶层 FFF/RTK 即使排在数组后面也先加载。删除重复的 package 配置项即可，不删除构建文件；也不要改成 `extensions: []`，否则会禁用同路径 host。上游 FFF/RTK npm 包继续安装，只禁用原始入口。
 
-## 连接与操作
+其他已有插件可以保留。不要同时加载原始 FFF 与托管 FFF factory。托管入口通过公开 ExtensionAPI facade 调用真实上游插件，不修改 node_modules、不重写搜索算法。原生工具定义、补全、health/rescan 回调被保留，连接远端前关闭本地 finder。未经托管的 FFF 会被拒绝远端激活，而不是静默查询本地。
 
-使用标准 `~/.ssh/config` alias：
+修改配置后 `/reload` 或重启 Pi。连接中 reload 保留远端绑定，不启动本地 FFF finder；`/remote-exit` 关闭 companion，并重建本地插件生命周期。
+
+## 可选托管 RTK
+
+使用 `--plugins=fff,rtk` 或 `--plugins=rtk` 构建。保留 `pi-rtk-optimizer@0.9.0` 包，禁用其直接入口（`{"source":"npm:pi-rtk-optimizer","extensions":[]}`），再在 remote host 后追加 `/absolute/path/to/omp-ssh-remote/packages/pi/dist/pi-rtk-extension.js`。不能同时启用原始与托管 RTK 钩子。
+
+worker 内嵌上游 JavaScript 和延迟加载的压缩器，不内嵌原生 `rtk` 可执行文件。命令改写需要 RTK 位于**远端 worker 的 PATH**。缺失时准确报告不可用；上游默认保护保留原命令，结果压缩仍可执行。本地 RTK 可用不能证明远端可用。
+
+`/rtk show`、`config`、`path`、`verify`、`status`、`stats`、`clear-stats` 查询当前执行域。本地模式保留上游设置界面；远端修改配置需先退出，在本地设置后重连，以重新协商不可变装配。worker 使用私有临时 agent 目录，不覆盖远端用户的 Pi 配置。默认不压缩 `read`；只处理上游支持的 `bash/read/grep`，不自动处理任意 FFF 工具。不会向 RTK 传递主对话或模型凭据。
+
+
+## 使用
 
 ```text
 /remote-connect gpu-box /srv/project
 /remote-status
+/fff-health
+/fff-rescan
 /remote-exit
 ```
 
-显式形式：
+模型也能调用 `remote_connect`、`remote_workspace_status`、`remote_exit`。使用已显式信任的 OpenSSH alias 与公钥认证。强制 `StrictHostKeyChecking=yes`，不复制模型凭据。
 
-```text
-/remote-connect user@example.com /srv/project --port 22 --identity ~/.ssh/id_ed25519
+FFF 模式、multi-grep、扫描选项按有效配置协商。数据库路径留在各自执行域。切换模式需先退出远端，在本地修改并按上游提示 reload，再连接；远端模式修改会拒绝执行，不会静默改变工具归属。断连时搜索与 `@` 补全不回退本地候选。
+
+## 其他插件
+
+Ask、Goal 控制、模型请求设置、Web 凭据和上下文管理通常留在本地，但不代表插件内部文件访问已经远端化：
+
+- Brainstorm 直接导出总结文件仍写本地。
+- Web Access 的本地媒体输入仍属于本地。
+- Magic Context 项目身份与直接 Git/文件检查仍跟随本地会话。
+- 项目级模型/插件配置默认仍是本地配置。
+
+以上是明确边界，不是整套插件完全兼容的声明。不能把远端文件路径交给未适配本地插件并假设 SSH 会接管。
+
+## 可选继承
+
+普通 `pi-extension.js` 不占用或发布进程级 subagent 环境状态。需要 Tintin 时，root 改用 `pi-tintin-extension.js`，受限 child 也显式加载该入口。继承后端由参数注入，与默认工作区绑定分开。不支持远端 worktree 隔离。
+
+## 验证
+
+```bash
+bun run typecheck
+bun test
+REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-project> bun scripts/smoke-pi-fff.ts
+PI_WORKSPACE_RTK=1 REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-project> bun scripts/smoke-pi-fff.ts
 ```
 
-模型可以调用 `remote_connect`、`remote_workspace_status` 和 `remote_exit`。status 会报告 assembly ID、本机与远端 component 版本、工具分组、ownership verification 和 transport state。连接失败或丢失后，必须先 `/remote-exit` 才能重连。一个已连接的 root session 可以创建多个普通 `@tintinweb/pi-subagents` child；默认 Pi extension 会在 root owner 存在时自动识别新的同进程 child。限制 extension 加载的自定义 agent 必须显式加载 `pi-tintin-extension.js`。同一进程中的第二个独立 root 会被拒绝。远端连接态不要启用 tintin 的本机 `isolation: "worktree"` 模式。仓库中的 tintin smoke 是该 integration 的外部 acceptance gate。
+FFF smoke 验证同相对路径的不同本地/远端内容、远端 hostname、原生 renderer、health/rescan、连接中 reload、补全、强制断开 transport 后搜索与补全 fail-closed，以及退出恢复本地。ARM64 构建成功不等于在真实 ARM64 主机验收通过。
+RTK 分支核验远端输出压缩、统计和控制服务；原生可执行文件存在时，对比自动改写、显式 RTK 和原始透传结果。`PI_RTK_REQUIRE_BINARY=1` 强制验收原生命令分支。搜索/RTK 已在 x64 与 ARM64 实机执行验收。官方 RTK 0.48.0 ARM64 二进制要求 glibc 2.39；旧系统需要兼容构建，不应为此升级系统 glibc。
 
-## 部署与安全
-
-adapter 部署按内容寻址的 worker，以及已选 plugin 实际需要的 artifacts。所有文件均使用 SHA-256 sidecar、UUID 临时上传、远端 hash 校验和原子启用。worker 缓存到：
-
-```text
-~/.cache/omp-ssh-remote/pi/<worker-sha256>/worker-linux-<arch>
-```
-
-选择 AFT 时，其 binary 会按架构和 hash 缓存、链接到 worker 旁，并加入 `PATH` 最前面。真实 AFT plugin 因而解析 package 自带 binary，不依赖网络下载或用户 cache。
-
-worker 不运行模型。shutdown 会 abort 活跃调用并最多等待 5 秒，再给 plugin-owned resources 最多 5 秒关闭。AFT 后台 Bash 属于远端 AFT 状态，不是本机编排 job；detached process 可能在 companion 退出后继续运行，由远端用户自行管理。
-
-## 限制
-
-- 仅支持 Linux glibc x86_64 和 ARM64；
-- AFT 是当前 worker registry 唯一包含的远端 plugin adapter；
-- 新 plugin 需要显式 adapter，并重新构建 worker artifact；
-- 不自动推断任意第三方工作区 plugin；
-- 不在远端运行模型 loop、memory、web 凭据、browser 或 TUI；
-- 不支持 `@tintinweb/pi-subagents` 的本机 `isolation: "worktree"`、远端 worktree 或通用 artifact bridge；
-- 连接失败或丢失后保持 fail-closed，必须先 `/remote-exit` 才能重连；
-- Pi reload 会重建 plugin 内存状态；
-- 单个 protocol frame 限制为 16 MiB。
+原生工具使用远端用户权限，不是沙箱。协议帧有上限，取消是协作式的。脱离进程的命令不是托管持久任务；无自动重连/重放，无远端 worktree。

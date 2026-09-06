@@ -13,9 +13,16 @@
     "README.md",
     "README.zh-CN.md"
   ],
+  "dependencies": {
+    "pi-rtk-optimizer": "0.9.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.84.2",
-    "@earendil-works/pi-agent-core": ">=0.84.2"
+    "@earendil-works/pi-agent-core": ">=0.84.2",
+    "@ff-labs/pi-fff": ">=0.10.6"
+  },
+  "peerDependenciesMeta": {
+    "@ff-labs/pi-fff": { "optional": true }
   },
   "pi": {
     "extensions": [

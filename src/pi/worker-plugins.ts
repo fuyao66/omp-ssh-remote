@@ -1,23 +1,31 @@
-import aftExtension from "@cortexkit/aft-pi";
-import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { AFT_PLUGIN_ADAPTER } from "./plugins/aft.ts";
+import type {
+  ExtensionFactory,
+  ToolInfo,
+} from "@earendil-works/pi-coding-agent";
+import type { WorkspacePluginHandle } from "./workspace-plugin.ts";
+import { PI_WORKER_PLUGIN_ADAPTERS } from "./worker-plugin-registry.ts";
 
 export interface PiWorkerPluginAdapter {
   id: string;
   packageName: string;
   contractVersion: string;
   remoteTools: ReadonlySet<string>;
-  factory: ExtensionFactory;
+  matchesSource(sourceInfo: ToolInfo["sourceInfo"]): boolean;
+  validateConfig?(config: Record<string, unknown>): void;
+  workspaceServices?: readonly string[];
+  createFactory(input: {
+    config?: Record<string, unknown>;
+    onHandle?: (handle: WorkspacePluginHandle) => void;
+  }): ExtensionFactory;
   bundledVersion?: string;
+  companionArtifactIds?: readonly string[];
+  optional?: boolean;
 }
 
-export const PI_WORKER_PLUGIN_ADAPTERS: readonly PiWorkerPluginAdapter[] = [
-  {
-    id: AFT_PLUGIN_ADAPTER.id,
-    packageName: AFT_PLUGIN_ADAPTER.packageName,
-    contractVersion: AFT_PLUGIN_ADAPTER.contractVersion,
-    remoteTools: AFT_PLUGIN_ADAPTER.remoteTools,
-    factory: aftExtension,
-    bundledVersion: process.env.PI_BUNDLED_AFT_VERSION,
-  },
-];
+export { PI_WORKER_PLUGIN_ADAPTERS };
+
+export function findWorkerPluginAdapter(
+  id: string,
+): PiWorkerPluginAdapter | undefined {
+  return PI_WORKER_PLUGIN_ADAPTERS.find((adapter) => adapter.id === id);
+}

@@ -15,8 +15,9 @@ import type {
   RemoteWorkerBundle,
 } from "../runtime-contract.ts";
 import { PI_PLUGIN_ADAPTERS } from "./plugins/index.ts";
+import { WORKSPACE_HOOKS } from "./workspace-plugin.ts";
 
-export const PI_REMOTE_RUNTIME_VERSION = "0.2.0" as const;
+export const PI_REMOTE_RUNTIME_VERSION = "0.3.0" as const;
 export const PI_CORE_COMPONENT_ID = "pi-core" as const;
 export const PI_CORE_CONTRACT_VERSION = "1" as const;
 export const PI_CORE_TOOL_NAMES = [
@@ -44,6 +45,22 @@ export interface PiPluginAdapter {
   remoteTools: ReadonlySet<string>;
   companionArtifacts: readonly RemoteCompanionArtifact[];
   matchesSource(sourceInfo: ToolInfo["sourceInfo"]): boolean;
+  resolveConfig?(input: {
+    pluginId: string;
+    captured?: Record<string, unknown>;
+    tools: readonly PiToolSnapshot[];
+  }): Record<string, unknown> | undefined;
+  validateConfig?(config: Record<string, unknown>): void;
+  /** Exact capability names advertised under ready.capabilities.workspaceServices[id]. */
+  workspaceServices?: readonly string[];
+}
+
+/** Explicitly loaded workspace components, including plugins that only install hooks. */
+export interface PiManagedPluginSnapshot {
+  id: string;
+  sourcePath: string;
+  version: string;
+  config: Record<string, unknown>;
 }
 
 export interface PiAssemblyTool extends ToolManifest {
@@ -75,9 +92,11 @@ export interface PiRuntimeAssembly {
 
 export interface ResolvePiRuntimeAssemblyOptions {
   tools: readonly PiToolSnapshot[];
-  activeTools: readonly string[];
   hostVersion?: string;
   pluginAdapters?: readonly PiPluginAdapter[];
+  /** Host-captured effective plugin configs keyed by plugin id. */
+  pluginConfigs?: Readonly<Record<string, Record<string, unknown>>>;
+  managedPlugins?: readonly PiManagedPluginSnapshot[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -187,12 +206,21 @@ function parseReadyAssembly(ready: ReadyMessage): RuntimeAssemblyRequest {
           "Remote Pi runtime reported an invalid assembly component",
         );
       }
-      return {
+      const component: RuntimeAssemblyRequest["components"][number] = {
         id: item.id,
         kind: item.kind,
         contractVersion: item.contractVersion,
         version: item.version,
       };
+      if ("config" in item && item.config !== undefined) {
+        if (!isRecord(item.config) || Array.isArray(item.config)) {
+          throw new Error(
+            `Remote Pi runtime reported invalid config for ${item.id}`,
+          );
+        }
+        component.config = item.config;
+      }
+      return component;
     },
   );
   const tools = value.tools.map((item) => {
@@ -241,7 +269,8 @@ export function validatePiReadyMessage(
     if (
       actual.id !== expected.id ||
       actual.kind !== expected.kind ||
-      actual.contractVersion !== expected.contractVersion
+      actual.contractVersion !== expected.contractVersion ||
+      stableJson(actual.config) !== stableJson(expected.config)
     ) {
       throw new Error(
         `Remote Pi component contract mismatch at ${expected.id}`,
@@ -291,6 +320,64 @@ export function validatePiReadyMessage(
       `Remote Pi runtime is missing tools: ${missing.join(", ")}`,
     );
   }
+
+  if (stableJson(ready.capabilities?.workspaceHooks) !== stableJson(WORKSPACE_HOOKS)) {
+    throw new Error("Remote Pi workspace hook lifecycle is incompatible");
+  }
+  validateReadyWorkspaceServices(assembly.request.components, ready);
+}
+
+function validateReadyWorkspaceServices(
+  components: readonly RuntimeAssemblyComponent[],
+  ready: ReadyMessage,
+): void {
+  const servicesValue = ready.capabilities?.workspaceServices;
+  const services =
+    servicesValue === undefined
+      ? undefined
+      : isRecord(servicesValue)
+        ? servicesValue
+        : null;
+  if (servicesValue !== undefined && services === null) {
+    throw new Error(
+      "Remote Pi runtime reported invalid workspaceServices capabilities",
+    );
+  }
+
+  const expected = new Map<string, readonly string[]>();
+  for (const component of components) {
+    if (component.kind !== "plugin") continue;
+    const adapter = PI_PLUGIN_ADAPTERS.find(
+      (candidate) => candidate.id === component.id,
+    );
+    if (adapter?.workspaceServices && adapter.workspaceServices.length > 0) {
+      expected.set(adapter.id, adapter.workspaceServices);
+    }
+  }
+
+  for (const [pluginId, names] of expected) {
+    const actual = services?.[pluginId];
+    if (!Array.isArray(actual) || !actual.every((item) => typeof item === "string")) {
+      throw new Error(
+        `Remote Pi runtime is missing workspaceServices for ${pluginId}`,
+      );
+    }
+    if (stableJson([...actual].sort()) !== stableJson([...names].sort())) {
+      throw new Error(
+        `Remote Pi workspaceServices for ${pluginId} must be exactly ${names.join(", ")}`,
+      );
+    }
+  }
+
+  if (services) {
+    for (const pluginId of Object.keys(services)) {
+      if (!expected.has(pluginId)) {
+        throw new Error(
+          `Remote Pi runtime exposed unexpected workspaceServices for ${pluginId}`,
+        );
+      }
+    }
+  }
 }
 
 export async function resolvePiRuntimeAssembly(
@@ -298,45 +385,69 @@ export async function resolvePiRuntimeAssembly(
 ): Promise<PiRuntimeAssembly> {
   const hostVersion = options.hostVersion ?? (await resolvePiHostVersion());
   const adapters = options.pluginAdapters ?? PI_PLUGIN_ADAPTERS;
-  const active = new Set(options.activeTools);
   const declaredPluginTools = new Set(
     adapters.flatMap((adapter) => [...adapter.remoteTools]),
   );
-  const activeSnapshots = options.tools.filter((tool) => active.has(tool.name));
+  const snapshots = options.tools;
   const detected = [] as Array<{
     adapter: PiPluginAdapter;
     version: string;
     tools: PiToolSnapshot[];
     order: number;
+    config?: Record<string, unknown>;
   }>;
+  const managed = new Map<string, PiManagedPluginSnapshot>();
+  for (const plugin of options.managedPlugins ?? []) {
+    if (managed.has(plugin.id)) throw new Error(`Duplicate managed Pi plugin: ${plugin.id}`);
+    const adapter = adapters.find((candidate) => candidate.id === plugin.id);
+    if (!adapter) throw new Error(`Unsupported managed Pi workspace plugin: ${plugin.id}`);
+    const version = await packageVersionFromEntry(plugin.sourcePath, adapter.packageName);
+    if (!version || version !== plugin.version) {
+      throw new Error(`Managed Pi plugin package provenance mismatch: ${plugin.id}`);
+    }
+    managed.set(plugin.id, plugin);
+  }
 
   for (const adapter of adapters) {
-    const owned = activeSnapshots.filter((tool) =>
+    const owned = snapshots.filter((tool) =>
       adapter.matchesSource(tool.sourceInfo),
     );
-    if (owned.length === 0) continue;
+    const declaration = managed.get(adapter.id);
+    if (owned.length === 0 && !declaration) continue;
     const unsupported = owned
       .map((tool) => tool.name)
       .filter((name) => !adapter.remoteTools.has(name));
     if (unsupported.length > 0) {
       throw new Error(
-        `Pi plugin ${adapter.id} exposes active tools not admitted by its remote adapter: ${unsupported.join(", ")}`,
+        `Pi plugin ${adapter.id} exposes tools not admitted by its remote adapter: ${unsupported.join(", ")}`,
       );
+    }
+    const captured = declaration?.config ?? options.pluginConfigs?.[adapter.id];
+    const config = adapter.resolveConfig?.({
+      pluginId: adapter.id,
+      captured,
+      tools: owned,
+    });
+    if (config !== undefined) {
+      adapter.validateConfig?.(config);
     }
     detected.push({
       adapter,
-      version: await resolvePackageVersionFromSources(
+      version: declaration?.version ?? await resolvePackageVersionFromSources(
         adapter.packageName,
         owned,
       ),
       tools: owned,
-      order: Math.min(...owned.map((tool) => activeSnapshots.indexOf(tool))),
+      order: owned.length > 0
+        ? Math.min(...owned.map((tool) => snapshots.indexOf(tool)))
+        : snapshots.length + [...managed.keys()].indexOf(adapter.id),
+      ...(config === undefined ? {} : { config }),
     });
   }
   detected.sort((left, right) => left.order - right.order);
 
   const assemblyTools: PiAssemblyTool[] = [];
-  for (const tool of activeSnapshots) {
+  for (const tool of snapshots) {
     const pluginOwners = detected.filter(({ adapter }) =>
       adapter.matchesSource(tool.sourceInfo),
     );
@@ -354,13 +465,13 @@ export async function resolvePiRuntimeAssembly(
     } else if (PI_CORE_TOOL_SET.has(tool.name)) {
       if (!isBuiltinTool(tool)) {
         throw new Error(
-          `Active Pi workspace tool ${tool.name} is owned by an unsupported extension`,
+          `Pi workspace tool ${tool.name} is owned by an unsupported extension`,
         );
       }
       owner = PI_CORE_COMPONENT_ID;
     } else if (declaredPluginTools.has(tool.name)) {
       throw new Error(
-        `Active Pi plugin tool ${tool.name} has unsupported source provenance`,
+        `Pi plugin tool ${tool.name} has unsupported source provenance`,
       );
     }
     if (!owner) continue;
@@ -379,7 +490,7 @@ export async function resolvePiRuntimeAssembly(
 
   if (assemblyTools.length === 0) {
     throw new Error(
-      "The current Pi runtime exposes no supported active workspace tools",
+      "The current Pi runtime exposes no supported workspace tools",
     );
   }
   assemblyTools.sort((left, right) => left.name.localeCompare(right.name));
@@ -395,27 +506,31 @@ export async function resolvePiRuntimeAssembly(
       .map((tool) => tool.name),
   };
   const plugins: PiAssemblyComponent[] = detected.map(
-    ({ adapter, version }) => ({
+    ({ adapter, version, config }) => ({
       id: adapter.id,
-      kind: "plugin",
+      kind: "plugin" as const,
       contractVersion: adapter.contractVersion,
       version,
       displayName: adapter.displayName,
       tools: assemblyTools
         .filter((tool) => tool.owner === adapter.id)
         .map((tool) => tool.name),
+      ...(config === undefined ? {} : { config }),
     }),
   );
   const components = [host, ...plugins];
   const id = computePiAssemblyId(components, assemblyTools);
   const request: RuntimeAssemblyRequest = {
     id,
-    components: components.map(({ id, kind, contractVersion, version }) => ({
-      id,
-      kind,
-      contractVersion,
-      version,
-    })),
+    components: components.map(
+      ({ id, kind, contractVersion, version, config }) => ({
+        id,
+        kind,
+        contractVersion,
+        version,
+        ...(config === undefined ? {} : { config }),
+      }),
+    ),
     tools: assemblyTools.map(({ name, owner }) => ({ name, owner })),
   };
   const displayName = assemblyDisplayName(plugins);
@@ -499,6 +614,14 @@ export function restorePiRuntimeAssembly(
       );
     }
     adapters.set(component.id, adapter);
+    if (component.config !== undefined) {
+      if (!adapter.validateConfig) {
+        throw new Error(
+          `Inherited Pi plugin ${component.id} does not admit configuration`,
+        );
+      }
+      adapter.validateConfig(component.config);
+    }
     plugins.push({
       id: component.id,
       kind: component.kind,
@@ -508,6 +631,7 @@ export function restorePiRuntimeAssembly(
       tools: request.tools
         .filter((tool) => tool.owner === component.id)
         .map((tool) => tool.name),
+      ...(component.config === undefined ? {} : { config: component.config }),
     });
   }
   const expectedOwners = new Map(
@@ -565,6 +689,7 @@ export function restorePiRuntimeAssembly(
       tools: request.tools
         .filter((tool) => tool.owner === PI_CORE_COMPONENT_ID)
         .map((tool) => tool.name),
+      ...(host.config === undefined ? {} : { config: host.config }),
     },
     ...plugins,
   ];
@@ -608,17 +733,18 @@ export function restorePiRuntimeAssembly(
 export function computePiAssemblyId(
   components: readonly Pick<
     RuntimeAssemblyComponent,
-    "id" | "kind" | "contractVersion"
+    "id" | "kind" | "contractVersion" | "config"
   >[],
   tools: readonly Pick<PiAssemblyTool, "name" | "owner" | "parameters">[],
 ): string {
   return createHash("sha256")
     .update(
       stableJson({
-        components: components.map(({ id, kind, contractVersion }) => ({
+        components: components.map(({ id, kind, contractVersion, config }) => ({
           id,
           kind,
           contractVersion,
+          ...(config === undefined ? {} : { config }),
         })),
         tools: tools.map(({ name, owner, parameters }) => ({
           name,

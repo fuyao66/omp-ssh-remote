@@ -1,6 +1,7 @@
 import { mkdir, readdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { resolveOmpHostVersion } from "../src/omp/host-identity.ts";
+import { rtkBundlePlugin } from "./pi-worker-build/rtk.ts";
 type BuildTarget = "all" | "omp" | "pi";
 const target = (process.argv[2] ?? "all") as BuildTarget;
 if (target !== "all" && target !== "omp" && target !== "pi") {
@@ -33,6 +34,7 @@ if (target === "all" || target === "pi") {
   await rm(resolve(piOutdir, "extension.js"), { force: true });
   await rm(resolve(piOutdir, "pi-extension.js"), { force: true });
   await rm(resolve(piOutdir, "pi-tintin-extension.js"), { force: true });
+  await rm(resolve(piOutdir, "pi-rtk-extension.js"), { force: true });
 }
 
 const legacyModulePlugin: Bun.BunPlugin = {
@@ -48,6 +50,7 @@ const legacyModulePlugin: Bun.BunPlugin = {
     }));
   },
 };
+
 
 if (target === "all" || target === "omp") {
   const hostVersion = await resolveOmpHostVersion();
@@ -76,15 +79,20 @@ if (target === "all" || target === "pi") {
     entrypoints: [
       resolve(root, "src/pi/pi-extension.ts"),
       resolve(root, "src/pi/pi-tintin-extension.ts"),
+      resolve(root, "src/pi/pi-fff-extension.ts"),
+      resolve(root, "src/pi/pi-rtk-extension.ts"),
     ],
     outdir: piOutdir,
     naming: "[name].js",
+    plugins: [rtkBundlePlugin],
+    define: { "process.env.PI_RTK_BUNDLED": JSON.stringify("true") },
     target: "node",
     format: "esm",
     minify: false,
     external: [
       "@earendil-works/pi-coding-agent",
       "@earendil-works/pi-agent-core",
+      "@ff-labs/pi-fff",
     ],
   });
   if (!extension.success)

@@ -53,9 +53,9 @@ test/                          shared-core and host-specific contracts
 
 OMP and Pi deliberately use different extension models over the same transport and deployment core. OMP has one native workspace runtime: local OMP and the companion admit each other by runtime contract and exact native tool schemas. Host package versions are retained as identity metadata, not equality gates. The remote host does not install OMP.
 
-Pi first adapts the base host and then computes a runtime assembly from the current active tool registry and explicitly supported plugin adapters. A Pi `RuntimeAssembly` records component contracts, actual resolved versions, active tool ownership and schemas, and required artifacts. Versions are retained for identity and diagnostics but are not equality gates. The remote worker may use different Pi/plugin versions when its component contracts and exact tool schemas remain compatible. Unknown plugins are never inferred as remote-capable.
+Pi composes source-verified component surfaces and effective plugin configuration into a RuntimeAssembly; model active-tool permissions are separate. Workspace bindings own transitions and reject stale results. The companion verifies actual owners, schemas and configuration. Versions remain reproducible build identity, not equality gates.
 
-The current registry supports Pi core alone and Pi core extended by whichever plugin adapters meet their independent admission contracts. `@tintinweb/pi-subagents` is the current in-process orchestrator integration: one connected root session may create multiple ordinary children. The default Pi extension recognizes new in-process children from the active root owner; custom agents with restricted extension loading use `pi-tintin-extension.js`. Each child restores the parent-verified assembly, keeps its local Pi cwd, and opens an independent companion on the parent remote cwd. A second independent root in the same process is rejected. The orchestrator does not define the remote runtime. Its local `isolation: "worktree"` mode is not supported for remote-connected sessions; its real SSH smoke remains the external acceptance gate.
+Pi core and independently selected FFF/AFT adapters use the same companion. Managed FFF preserves native tools, presentation, remote completion and index commands. Default Pi sessions do not publish inheritance state; Tintin is explicit opt-in via its dedicated entry. Arbitrary plugin-internal filesystem calls remain local unless an integration covers them. See the Pi package README for the managed FFF installation and exact boundaries.
 
 ```mermaid
 flowchart LR
@@ -77,6 +77,7 @@ REMOTE_ALIAS=<ssh-alias> REMOTE_CWD=<remote-path> bun run benchmark:omp
 REMOTE_ALIAS=<ssh-alias> REMOTE_CWD=<remote-path> bun run benchmark:pi
 REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_SMOKE_PLUGINS=none bun scripts/smoke-pi-assembly.ts
 REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_SMOKE_PLUGINS=aft bun scripts/smoke-pi-assembly.ts
+REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> bun scripts/smoke-pi-fff.ts
 REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_TINTIN_SUBAGENTS_ENTRY=<tintin-entry> bun scripts/smoke-pi-tintin-subagent.ts
 ```
 

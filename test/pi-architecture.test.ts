@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createEventBus } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import {
   claimPiTintinSubagentConnectionSpec,
   clearPiTintinSubagentConnectionSpec,
+  createTintinPiConnectionInheritance,
   publishPiTintinSubagentConnectionSpec,
   readPiTintinSubagentConnectionSpec,
 } from "../src/pi/integrations/tintin-subagents.ts";
@@ -15,11 +17,16 @@ import {
   type PiToolSnapshot,
 } from "../src/pi/assembly.ts";
 import { AFT_PLUGIN_ID } from "../src/pi/plugins/aft.ts";
+import {
+  FFF_PLUGIN_ID,
+  FFF_PLUGIN_ADAPTER,
+} from "../src/pi/plugins/fff.ts";
 import { PiRemoteWorkspaceScope } from "../src/pi/scope.ts";
 import {
   filterStaleRemoteWrappers,
   getPiRemoteOwnershipErrors,
   getPiRemoteStateForSession,
+  installPiRemoteExtension,
 } from "../src/pi/host-extension.ts";
 import piTintinExtension from "../src/pi/pi-tintin-extension.ts";
 
@@ -34,16 +41,21 @@ const aftEntry = join(
 
 function tool(
   name: string,
-  source: "builtin" | "aft" | "inline" | "unknown" = "builtin",
+  source: "builtin" | "aft" | "fff" | "inline" | "unknown" = "builtin",
 ): PiToolSnapshot {
   const sourceInfo =
     source === "builtin"
       ? { source: "builtin", path: `<builtin:${name}>` }
       : source === "aft"
         ? { source: "local", path: aftEntry, baseDir: join(aftEntry, "..") }
-        : source === "inline"
-          ? { source: "inline", path: `<inline:${AFT_PLUGIN_ID}>` }
-          : { source: "local", path: "/tmp/unknown-extension.ts" };
+        : source === "fff"
+          ? {
+              source: "inline",
+              path: join(import.meta.dir, "../node_modules/@ff-labs/pi-fff/src/index.ts"),
+            }
+          : source === "inline"
+            ? { source: "inline", path: `<inline:${AFT_PLUGIN_ID}>` }
+            : { source: "local", path: "/tmp/unknown-extension.ts" };
   return {
     name,
     description: `${name} description`,
@@ -56,7 +68,6 @@ async function coreAssembly(): Promise<PiRuntimeAssembly> {
   const tools = PI_CORE_TOOL_NAMES.map((name) => tool(name));
   return resolvePiRuntimeAssembly({
     tools,
-    activeTools: tools.map((item) => item.name),
     hostVersion: "0.99.0",
   });
 }
@@ -83,6 +94,36 @@ describe("Pi runtime assembly resolver", () => {
     );
   });
 
+  test("admits explicit hook-only components and binds their configuration to identity", async () => {
+    const packageVersion = (await Bun.file(join(aftEntry, "../../package.json")).json()).version;
+    const adapter = {
+      id: "example/workspace-hooks",
+      packageName: AFT_PLUGIN_ID,
+      displayName: "Workspace hooks",
+      contractVersion: "1",
+      remoteTools: new Set<string>(),
+      companionArtifacts: [],
+      matchesSource: () => false,
+      resolveConfig: ({ captured }: { captured?: Record<string, unknown> }) => captured,
+    };
+    const options = {
+      tools: [tool("bash")],
+      hostVersion: "1.0.0",
+      pluginAdapters: [adapter],
+    };
+    const declaration = { id: adapter.id, sourcePath: aftEntry, version: packageVersion, config: { enabled: true } };
+    const selected = await resolvePiRuntimeAssembly({ ...options, managedPlugins: [declaration] });
+    const unselected = await resolvePiRuntimeAssembly(options);
+    const changed = await resolvePiRuntimeAssembly({ ...options, managedPlugins: [{ ...declaration, config: { enabled: false } }] });
+    expect(selected.request.components.map(({ id }) => id)).toEqual([PI_CORE_COMPONENT_ID, adapter.id]);
+    expect(selected.tools.map(({ owner }) => owner)).toEqual([PI_CORE_COMPONENT_ID]);
+    expect(selected.id).not.toBe(unselected.id);
+    expect(selected.id).not.toBe(changed.id);
+    await expect(resolvePiRuntimeAssembly({ ...options, managedPlugins: [{ ...declaration, version: "forged" }] })).rejects.toThrow("provenance mismatch");
+    await expect(resolvePiRuntimeAssembly({ ...options, managedPlugins: [declaration, declaration] })).rejects.toThrow("Duplicate managed");
+    await expect(resolvePiRuntimeAssembly({ ...options, managedPlugins: [{ ...declaration, id: "unknown" }] })).rejects.toThrow("Unsupported managed");
+  });
+
   test("composes independently detected plugin adapters with Pi core tools", async () => {
     const tools = [
       tool("read", "aft"),
@@ -93,10 +134,8 @@ describe("Pi runtime assembly resolver", () => {
     ];
     const assembly = await resolvePiRuntimeAssembly({
       tools,
-      activeTools: ["read", "aft_outline", "find", "bash_status"],
       hostVersion: "1.2.3",
     });
-
     expect(assembly.displayName).toBe("Pi core with plugin adapters: AFT");
     expect(assembly.components.map((component) => component.id)).toEqual([
       PI_CORE_COMPONENT_ID,
@@ -107,8 +146,12 @@ describe("Pi runtime assembly resolver", () => {
       ["aft_outline", AFT_PLUGIN_ID],
       ["bash_status", AFT_PLUGIN_ID],
       ["find", PI_CORE_COMPONENT_ID],
+      ["ls", PI_CORE_COMPONENT_ID],
       ["read", AFT_PLUGIN_ID],
     ]);
+    expect([...assembly.handshake.requestedTools].sort()).toEqual(
+      assembly.tools.map((item) => item.name).sort(),
+    );
     expect(assembly.workerBundle.companionArtifacts).toEqual([
       {
         id: "aft",
@@ -125,7 +168,6 @@ describe("Pi runtime assembly resolver", () => {
     await expect(
       resolvePiRuntimeAssembly({
         tools: [tool("read", "unknown")],
-        activeTools: ["read"],
         hostVersion: "1.0.0",
       }),
     ).rejects.toThrow("unsupported extension");
@@ -133,7 +175,6 @@ describe("Pi runtime assembly resolver", () => {
     await expect(
       resolvePiRuntimeAssembly({
         tools: [tool("new_aft_tool", "aft")],
-        activeTools: ["new_aft_tool"],
         hostVersion: "1.0.0",
       }),
     ).rejects.toThrow("not admitted by its remote adapter");
@@ -163,6 +204,41 @@ describe("Pi runtime assembly resolver", () => {
     expect(invoked).toBe(false);
   });
 });
+describe("Pi connection inheritance contract", () => {
+  test("Tintin factory wraps existing env claim/publish ops", async () => {
+    const inheritance = createTintinPiConnectionInheritance();
+    const assembly = await coreAssembly();
+    const spec = {
+      ownerToken: OWNER_TOKEN,
+      assembly: assembly.request,
+      tools: assembly.tools,
+      connectOptions: { target: "gpu-box", displayTarget: "gpu-box" },
+      workerPath: "/remote/worker",
+      cwd: "/remote/project",
+    };
+
+    expect(inheritance.hasSpec()).toBe(false);
+    inheritance.publish(spec);
+    expect(inheritance.hasSpec()).toBe(true);
+    expect(inheritance.hasRootOwner()).toBe(true);
+    expect(inheritance.read()).toEqual(spec);
+    expect(readPiTintinSubagentConnectionSpec()).toEqual(spec);
+
+    inheritance.clear("other-root");
+    expect(inheritance.read()).toEqual(spec);
+    inheritance.clear(OWNER_TOKEN);
+    expect(inheritance.hasSpec()).toBe(false);
+  });
+
+  test("dedicated Tintin entry is root when inheritance env is absent", async () => {
+    const mock = createPiMock();
+    const state = getPiRemoteStateForSession(mock.pi.events as object);
+    await piTintinExtension(mock.pi as never);
+    // Until host migrates options.inheritance, entry still passes inheritedChild=false.
+    expect(state.isInheritedChild).toBeUndefined();
+  });
+});
+
 
 describe("tintin subagent assembly inheritance", () => {
   test("round-trips the computed assembly and connection scope", async () => {
@@ -192,7 +268,7 @@ describe("tintin subagent assembly inheritance", () => {
     expect(process.env[OWNER_KEY]).toBe("root-a");
   });
 
-  test("lets a fresh default entry inherit the active root connection", async () => {
+  test("does not let an unrelated default session inherit another root connection", async () => {
     const assembly = await coreAssembly();
     publishPiTintinSubagentConnectionSpec({
       ownerToken: OWNER_TOKEN,
@@ -205,8 +281,8 @@ describe("tintin subagent assembly inheritance", () => {
     const mock = createPiMock();
     await (await import("../src/pi/pi-extension.ts")).default(mock.pi as never);
     const state = getPiRemoteStateForSession(mock.pi.events as object);
-    expect(state.isInheritedChild).toBe(true);
-    expect(state.inheritanceOwnerToken).toBeUndefined();
+    expect(state.isInheritedChild).toBeUndefined();
+    expect(state.inheritanceOwnerToken).toBeDefined();
     expect(state.selected).toBe(false);
   });
 
@@ -258,19 +334,17 @@ describe("Pi assembly compatibility identity", () => {
     const tools = PI_CORE_TOOL_NAMES.map((name) => tool(name));
     const first = await resolvePiRuntimeAssembly({
       tools,
-      activeTools: tools.map((item) => item.name),
       hostVersion: "0.84.2",
     });
     const second = await resolvePiRuntimeAssembly({
       tools,
-      activeTools: tools.map((item) => item.name),
       hostVersion: "9.0.0",
     });
     expect(first.id).toBe(second.id);
     expect(first.host.version).not.toBe(second.host.version);
   });
 
-  test("derives plugin order from the active tool registry", async () => {
+  test("derives plugin order from first appearance in the tool registry", async () => {
     const adapters = [
       {
         id: "example/first",
@@ -309,7 +383,6 @@ describe("Pi assembly compatibility identity", () => {
     ];
     const assembly = await resolvePiRuntimeAssembly({
       tools,
-      activeTools: tools.map((item) => item.name),
       hostVersion: "1.0.0",
       pluginAdapters: adapters,
     });
@@ -326,7 +399,6 @@ describe("Pi plugin provenance boundary", () => {
     await expect(
       resolvePiRuntimeAssembly({
         tools: [tool("find"), tool("aft_outline", "unknown")],
-        activeTools: ["find", "aft_outline"],
         hostVersion: "1.0.0",
       }),
     ).rejects.toThrow("unsupported source provenance");
@@ -337,13 +409,195 @@ describe("Pi package provenance", () => {
   test("recognizes the inline source used by loaded Pi packages", async () => {
     const assembly = await resolvePiRuntimeAssembly({
       tools: [tool("aft_outline", "inline")],
-      activeTools: ["aft_outline"],
       hostVersion: "1.0.0",
     });
     expect(assembly.plugins.map((plugin) => plugin.id)).toEqual([
       AFT_PLUGIN_ID,
     ]);
     expect(assembly.tools[0]?.owner).toBe(AFT_PLUGIN_ID);
+  });
+});
+
+describe("FFF plugin assembly adapter", () => {
+  test("admits default fffind/ffgrep tools with serializable config", async () => {
+    const assembly = await resolvePiRuntimeAssembly({
+      tools: [
+        tool("read"),
+        tool("fffind", "fff"),
+        tool("ffgrep", "fff"),
+        tool("find"),
+      ],
+      hostVersion: "1.0.0",
+      pluginConfigs: {
+        [FFF_PLUGIN_ID]: {
+          mode: "tools-and-ui",
+          followSymlinks: false,
+        },
+      },
+    });
+
+    expect(assembly.plugins.map((plugin) => plugin.id)).toEqual([FFF_PLUGIN_ID]);
+    expect(assembly.tools.map(({ name, owner }) => [name, owner])).toEqual([
+      ["fffind", FFF_PLUGIN_ID],
+      ["ffgrep", FFF_PLUGIN_ID],
+      ["find", PI_CORE_COMPONENT_ID],
+      ["read", PI_CORE_COMPONENT_ID],
+    ]);
+    expect(assembly.request.components[1]?.config).toEqual({
+      mode: "tools-and-ui",
+      followSymlinks: false,
+    });
+    expect(FFF_PLUGIN_ADAPTER.remoteTools.has("multi_grep")).toBe(true);
+  });
+
+  test("admits override find/grep and optional multi_grep", async () => {
+    const assembly = await resolvePiRuntimeAssembly({
+      tools: [
+        tool("find", "fff"),
+        tool("grep", "fff"),
+        tool("multi_grep", "fff"),
+        tool("bash"),
+      ],
+      hostVersion: "1.0.0",
+      pluginConfigs: {
+        [FFF_PLUGIN_ID]: { mode: "override", multiGrep: true },
+      },
+    });
+
+    expect(assembly.plugins[0]?.config).toEqual({
+      mode: "override",
+      multiGrep: true,
+    });
+    expect(assembly.tools.map(({ name, owner }) => [name, owner])).toEqual([
+      ["bash", PI_CORE_COMPONENT_ID],
+      ["find", FFF_PLUGIN_ID],
+      ["grep", FFF_PLUGIN_ID],
+      ["multi_grep", FFF_PLUGIN_ID],
+    ]);
+  });
+
+  test("rejects missing or invalid captured FFF mode", async () => {
+    await expect(
+      resolvePiRuntimeAssembly({
+        tools: [tool("fffind", "fff"), tool("ffgrep", "fff")],
+        hostVersion: "1.0.0",
+      }),
+    ).rejects.toThrow("host-captured effective configuration");
+
+    await expect(
+      resolvePiRuntimeAssembly({
+        tools: [tool("fffind", "fff"), tool("ffgrep", "fff")],
+        hostVersion: "1.0.0",
+        pluginConfigs: {
+          [FFF_PLUGIN_ID]: { followSymlinks: true },
+        },
+      }),
+    ).rejects.toThrow('"mode" must be one of');
+
+    await expect(
+      resolvePiRuntimeAssembly({
+        tools: [tool("fffind", "fff"), tool("ffgrep", "fff")],
+        hostVersion: "1.0.0",
+        pluginConfigs: {
+          [FFF_PLUGIN_ID]: { mode: "nope" },
+        },
+      }),
+    ).rejects.toThrow('"mode" must be one of');
+
+    await expect(
+      resolvePiRuntimeAssembly({
+        tools: [tool("fffind", "fff"), tool("ffgrep", "fff")],
+        hostVersion: "1.0.0",
+        pluginConfigs: {
+          [FFF_PLUGIN_ID]: {
+            mode: "tools-and-ui",
+            frecencyDbPath: "/tmp/ignored",
+          },
+        },
+      }),
+    ).rejects.toThrow("unsupported key");
+  });
+
+  test("rejects mixed default/override FFF tools and multiGrep mismatches", async () => {
+    await expect(
+      resolvePiRuntimeAssembly({
+        tools: [
+          tool("fffind", "fff"),
+          tool("ffgrep", "fff"),
+          tool("find", "fff"),
+        ],
+        hostVersion: "1.0.0",
+        pluginConfigs: {
+          [FFF_PLUGIN_ID]: { mode: "tools-and-ui" },
+        },
+      }),
+    ).rejects.toThrow("mix default and override");
+
+    await expect(
+      resolvePiRuntimeAssembly({
+        tools: [tool("fffind", "fff"), tool("ffgrep", "fff")],
+        hostVersion: "1.0.0",
+        pluginConfigs: {
+          [FFF_PLUGIN_ID]: { mode: "override" },
+        },
+      }),
+    ).rejects.toThrow("override mode cannot expose default tools");
+
+    await expect(
+      resolvePiRuntimeAssembly({
+        tools: [
+          tool("find", "fff"),
+          tool("grep", "fff"),
+          tool("multi_grep", "fff"),
+        ],
+        hostVersion: "1.0.0",
+        pluginConfigs: {
+          [FFF_PLUGIN_ID]: { mode: "override" },
+        },
+      }),
+    ).rejects.toThrow("must set multiGrep=true");
+  });
+
+  test("fails closed on unknown FFF-sourced tools", async () => {
+    await expect(
+      resolvePiRuntimeAssembly({
+        tools: [tool("fff_unknown", "fff")],
+        hostVersion: "1.0.0",
+        pluginConfigs: {
+          [FFF_PLUGIN_ID]: { mode: "tools-and-ui" },
+        },
+      }),
+    ).rejects.toThrow("not admitted by its remote adapter");
+  });
+
+  test("hashes and restores component config", async () => {
+    const parent = await resolvePiRuntimeAssembly({
+      tools: [tool("fffind", "fff"), tool("ffgrep", "fff")],
+      hostVersion: "1.0.0",
+      pluginConfigs: {
+        [FFF_PLUGIN_ID]: {
+          mode: "tools-only",
+          enableHomeDirScanning: false,
+        },
+      },
+    });
+    const withoutConfig = {
+      ...parent.request,
+      components: parent.request.components.map((component) => {
+        const { config: _config, ...rest } = component;
+        return rest;
+      }),
+    };
+    expect(() => restorePiRuntimeAssembly(withoutConfig, parent.tools)).toThrow(
+      "contract does not match its ID",
+    );
+
+    const restored = restorePiRuntimeAssembly(parent.request, parent.tools);
+    expect(restored.id).toBe(parent.id);
+    expect(restored.plugins[0]?.config).toEqual({
+      mode: "tools-only",
+      enableHomeDirScanning: false,
+    });
   });
 });
 
@@ -402,10 +656,9 @@ describe("stale remote wrapper filtering", () => {
 });
 
 describe("restored Pi runtime assemblies", () => {
-  test("restores a parent assembly when the child has a smaller active tool set", async () => {
+  test("restores a parent assembly with the full verified tool surface", async () => {
     const parent = await resolvePiRuntimeAssembly({
       tools: [tool("read", "aft"), tool("aft_outline", "aft"), tool("find")],
-      activeTools: ["read", "aft_outline", "find"],
       hostVersion: "0.99.0",
     });
     const child = restorePiRuntimeAssembly(parent.request, parent.tools);
@@ -531,7 +784,7 @@ function createPiMock(
   const handlers = new Map<string, (event?: unknown) => unknown>();
   const controlSource = { source: "extension", path: "pi-ssh-remote" };
   const pi = {
-    events: {},
+    events: createEventBus(),
     registerTool(tool: Record<string, unknown>) {
       tools.set(String(tool.name), tool);
     },
@@ -550,6 +803,9 @@ function createPiMock(
         sourceInfo: tool.sourceInfo ?? controlSource,
       }));
     },
+    getCommands() {
+      return [...commands.keys()].map((name) => ({ name, source: "extension", sourceInfo: controlSource }));
+    },
     getActiveTools() {
       return [...tools.keys()];
     },
@@ -559,11 +815,22 @@ function createPiMock(
   return { commands, handlers, tools, pi };
 }
 
+test("rejects an unmanaged RTK hook before opening any remote workspace", async () => {
+  const mock = createPiMock();
+  mock.pi.getCommands = () => [{ name: "rtk:2", source: "extension", sourceInfo: { path: "/plugins/pi-rtk-optimizer/index.ts" } }];
+  await installPiRemoteExtension(mock.pi as never);
+  const connect = mock.tools.get("remote_connect") as { execute: (id: string, args: unknown) => Promise<unknown> };
+  await expect(connect.execute("reject-rtk", { target: "unused-host" })).rejects.toThrow("managed pi-rtk-extension");
+  const state = getPiRemoteStateForSession(mock.pi.events as object);
+  expect(state.selected).toBe(false);
+  expect(state.scope).toBeUndefined();
+});
+
 describe("inherited child ownership", () => {
-  test("refuses a child entry without a parent connection spec", async () => {
+  test("refuses an explicit child entry without a parent connection spec", async () => {
     const mock = createPiMock();
     const state = getPiRemoteStateForSession(mock.pi.events as object);
-    await piTintinExtension(mock.pi as never);
+    await installPiRemoteExtension(mock.pi as never, { inheritedChild: true });
 
     expect(state.isInheritedChild).toBe(true);
     expect(state.selected).toBe(true);

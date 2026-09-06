@@ -2,163 +2,116 @@
 
 [简体中文](README.zh-CN.md) | English
 
-Pi SSH Remote keeps the Pi conversation, model credentials, UI, memory, web access, and orchestration local while executing supported workspace tools on a remote Linux host over SSH. It first adapts Pi itself, then composes explicitly supported Pi plugins into the remote runtime detected for the current session. OMP support is a separate package at [`../omp`](../omp/README.md).
+Pi core plus independently pluggable workspace adapters. Conversation, model requests, credentials, memory and UI remain local; the remote workspace extension host executes selected tools, their execution hooks and admitted plugin services. OMP is a separate, unchanged runtime.
 
-## Runtime Assembly
+## Execution boundaries
 
-On each connection, the host adapter inspects the current Pi tool registry, active tool set, source provenance, and resolved package metadata. It produces a `RuntimeAssembly` containing:
+- `RuntimeAssembly` describes the available source-verified component surface, effective plugin configuration, owners and schemas. The model's active-tool allowlist is a separate permission filter, not runtime identity.
+- `PiWorkspaceBinding` owns local/connecting/remote/unavailable/closing transitions. Tool results and completion results from an obsolete workspace generation are rejected.
+- Plugin integrations connect tools, commands and UI queries to the same binding. Arbitrary plugin calls to Node filesystem/process APIs are not intercepted or sandboxed.
+- The companion loads real Pi tools and selected plugin factories, verifies actual tool provenance, and reports its own schemas and configuration. Unknown or incompatible components fail closed.
+- The model-free host drives `session_start`, `tool_call`, `tool_execution_start/update/end`, `tool_result` and `session_shutdown`. Command mutation, blocking, result errors, streaming and compaction stay in the execution domain. Model/provider hooks are not synthesized; mixed plugins require an explicit local control entry.
+- Hook-only plugins are explicitly admitted by verified package provenance and configuration even when they register no tools. This is not automatic deployment of arbitrary installed plugins.
+- Versions and binary checksums identify reproducible builds; matching component contracts, configuration and schemas determine compatibility.
 
-- the current Pi host descriptor;
-- zero or more detected plugin adapters, ordered by first appearance in the active tool registry;
-- the active remote tool owner and local parameter schema for every admitted tool;
-- only the companion artifacts required by those plugins;
-- exact resolved local versions for diagnostics and deployment identity.
+## Supported components
 
-The assembly ID is derived from component contracts, tool ownership, and schemas, not from package version strings. The remote worker reports its actual Pi/plugin versions and schemas. Connection succeeds when component contracts, ownership, and every tool schema match; local and remote package version strings do not need to be equal.
+| Component | Scope |
+| --- | --- |
+| Pi core | Native `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls` |
+| `@ff-labs/pi-fff` | Native `fffind`/`ffgrep`, or `find`/`grep` in override mode; optional multi-grep; native renderers and prompt metadata; remote `@` completion, health and rescan |
+| `pi-rtk-optimizer` 0.9.0 | Actual upstream rewrite/result hooks in the workspace host; local `/rtk` controls query remote config, availability and compaction stats |
+| `@cortexkit/aft-pi` | Optional existing tool adapter and separate native artifact; not required to build core or FFF workers |
+| Tintin subagents | Explicit optional inheritance entry; ordinary remote scopes only, no remote worktrees |
 
-```mermaid
-flowchart LR
-  Pi[Current local Pi] --> Resolver[Runtime assembly resolver]
-  Plugins[Active supported plugins] --> Resolver
-  Resolver --> Assembly[Pi host + selected plugin adapters]
-  Assembly <--> SSH[Persistent bounded SSH NDJSON]
-  SSH <--> Worker[Model-free remote Pi runtime]
-  Worker --> Workspace[Remote files, indexes, backups, and processes]
-```
+The FFF adapter targets `@ff-labs/pi-fff`, not the unrelated `pi-fff` package. Validated build identities: Pi 0.85.1 and FFF 0.10.6. The companion uses FFF's native Bun backend; the local managed entry uses the backend selected by the real plugin.
 
-This is capability-based compatibility, not unchecked compatibility. A changed Pi/plugin release is accepted only while it still satisfies the adapter contract and exact active tool schemas. Missing, duplicate, unknown, conflicting, or schema-incompatible remote tools are rejected before wrappers are registered.
-
-## Supported Components
-
-| Kind              | ID                        | Current responsibility                                                                                                                    |
-| ----------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| Host              | `pi-core`                 | Pi-native `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls` when Pi owns them                                                     |
-| Plugin adapter    | `@cortexkit/aft-pi`       | AFT-owned file/shell tools, background Bash lifecycle tools, AFT code tools, and the platform AFT binary                                  |
-| Local integration | `@tintinweb/pi-subagents` | Current in-process child integration; restores the serialized assembly, opens an independent companion, and keeps local orchestration cwd |
-
-With no supported plugin active, the remote runtime is Pi core only. The currently included AFT adapter owns `read`, `write`, `edit`, `bash`, `grep`, `bash_status`, `bash_watch`, `bash_write`, `bash_kill`, `aft_outline`, `aft_zoom`, `aft_inspect`, `aft_conflicts`, `aft_import`, `aft_safety`, `ast_grep_search`, and `ast_grep_replace` when it is admitted; Pi core continues to own `find` and `ls`. Other AFT tools such as `aft_search`, `lsp_diagnostics`, and `aft_callgraph` stay local until an adapter admits them.
-
-Other installed plugins are not copied or inferred as remote-capable. Plugins that do not own an admitted workspace tool remain local. If an unsupported plugin replaces an admitted Pi-core or plugin-owned workspace tool, connection fails closed. Adding another remote workspace plugin requires an explicit adapter describing source detection, tool ownership, schemas, companion artifacts, and lifecycle behavior.
-
-Model routing, credentials, memory, web access, ask/TUI, and UI extensions always remain local. The current in-process orchestrator integration targets `@tintinweb/pi-subagents`: ordinary children restore the parent-verified assembly, use a separate remote companion on the parent remote cwd, and preserve their local Pi cwd. Its `isolation: "worktree"` mode remains local-only and is not supported for remote workspaces.
-
-## Tool Ownership
-
-Pi resolves duplicate extension tools first-wins and does not expose call-through to a superseded tool. Pi SSH Remote must therefore appear before any supported plugin whose tools it will shadow.
-
-Before connection, the local Pi/plugin runtime owns its tools. `/remote-connect` resolves the current assembly, validates the remote manifest, and registers schema-preserving wrappers. `/remote-exit` closes the companion and reloads Pi so local ownership is reconstructed. Transport or ownership failure blocks the resolved workspace surface and never falls back to the local tool accidentally.
-
-The lifecycle acceptance path is:
-
-```text
-current local owners -> matching remote assembly owners -> restored local owners
-```
-
-## Tintin Subagents
-
-Pi SSH Remote includes an in-process child integration for ordinary children created by `@tintinweb/pi-subagents`. The child must load the dedicated Pi SSH Remote **tintin child entry file** before any default extensions; it restores the parent-verified assembly and opens a separate companion. The child does not need to load AFT or another remote workspace plugin locally.
-
-```yaml
----
-description: Remote workspace worker
-extensions:
-  - /absolute/path/to/omp-ssh-remote/packages/pi/dist/pi-tintin-extension.js
-tools: bash,read,grep,find,ls
----
-```
-
-Use the extension entry file from the package installed for the parent session, not the package directory. The normal `Agent` invocation chooses this agent by its frontmatter name or filename. The child's local cwd remains local orchestration state; its admitted workspace tools execute against the inherited remote cwd. Tintin's local `isolation: "worktree"` mode is not supported for remote-connected sessions. Run the tintin smoke on a trusted acceptance host before depending on a new Pi or tintin release.
-
-## Requirements
-
-- local Linux or WSL with a compatible current Pi Agent, Node.js, Bun `1.3+`, npm, OpenSSH, and SCP;
-- a workspace plugin needs an explicit adapter to run remotely; control-plane plugins stay local;
-- remote glibc Linux `x86_64` or `aarch64`;
-- public-key SSH that succeeds in batch mode;
-- an existing remote project directory;
-- no Node.js, Bun, Pi, AFT, or model credentials are required on the remote host.
-
-The current source build and tests resolve Pi `0.84.2` and AFT `0.52.0`; these are recorded build identities, not equality requirements in the runtime contract or Pi package peer dependencies.
-
-Host key verification is strict. Trust the host through normal OpenSSH `known_hosts`; do not disable checking. Agent forwarding and SSH forwarding are disabled.
-
-## Build and Install
+## Build
 
 From the repository root:
 
 ```bash
 bun install --frozen-lockfile
 bun run build:pi
-bun run build:pi-worker:all
+bun scripts/compile-pi-worker.ts x64 --plugins=fff
+bun scripts/compile-pi-worker.ts arm64 --plugins=fff
 pi install "$PWD/packages/pi"
 ```
 
-The package must contain:
+`--plugins=none` builds Pi core without plugin runtime imports. Combine `aft`, `fff` and `rtk`, for example `--plugins=fff,rtk`. A worker can run a subset of its bundled components. A missing requested component or incompatible workspace hook capability fails admission, never by local fallback.
 
-```text
-packages/pi/dist/pi-extension.js
-packages/pi/dist/pi-tintin-extension.js
-packages/pi/dist/worker-linux-x64
-packages/pi/dist/worker-linux-x64.sha256
-packages/pi/dist/aft-linux-x64
-packages/pi/dist/aft-linux-x64.sha256
-packages/pi/dist/worker-linux-arm64
-packages/pi/dist/worker-linux-arm64.sha256
-packages/pi/dist/aft-linux-arm64
-packages/pi/dist/aft-linux-arm64.sha256
-```
+FFF's platform shared library is embedded in the standalone worker, without runtime downloads. Cross-compilation requires the corresponding `@ff-labs/fff-bin-linux-<arch>-gnu` artifact. When a package manager skips an off-platform package, extract that npm package into `vendor/fff-linux-<arch>-gnu/` before building. AFT artifacts are only required when AFT is selected. Generated workers are ignored by Git.
 
-In `~/.pi/agent/settings.json`, place Pi SSH Remote before any workspace plugin adapter it must shadow. AFT is the current example:
+## Install managed FFF
+
+Keep the upstream npm package installed but disable its direct extension entry. Load the managed entry after Pi SSH Remote:
 
 ```json
 {
   "packages": [
-    "/absolute/path/to/omp-ssh-remote/packages/pi",
-    "npm:@cortexkit/aft-pi"
+    { "source": "npm:@ff-labs/pi-fff", "extensions": [] }
+  ],
+  "extensions": [
+    "/absolute/path/to/omp-ssh-remote/packages/pi/dist/pi-extension.js",
+    "/absolute/path/to/omp-ssh-remote/packages/pi/dist/pi-fff-extension.js"
   ]
 }
 ```
 
-Other local control-plane and UI plugins may remain installed. Review ownership before placing another workspace-tool replacement ahead of Pi SSH Remote. Restart Pi or run `/reload-plugins` after installation. Reloading a connected session closes that companion; reconnect afterward.
+**Ordering matters:** keep managed entries together in the top-level `extensions` array, host first. Do not also list this remote package in `packages`: Pi 0.85.1 retains the package-discovered host's lower precedence, allowing top-level FFF/RTK entries to load first despite the explicit array order. Remove that redundant package entry (not the package files); do not replace it with `extensions: []`, which disables the same host path. Keep upstream FFF/RTK npm packages installed with their direct entries filtered.
 
-## Connect and Operate
+The managed entry invokes the actual upstream factory through a public ExtensionAPI facade. It does not patch installed files or reimplement search. It preserves native tool definitions, captures native completion/health/rescan callbacks, and stops the local finder before remote activation. An unmanaged FFF installation is rejected for remote activation instead of silently searching local files.
 
-Use a standard `~/.ssh/config` alias:
+Use `/reload` or restart Pi after changing extension configuration. During an active remote connection, reload retains the remote binding without starting a local FFF finder. `/remote-exit` closes the companion and reloads the local plugin lifecycle.
+
+## Optional managed RTK
+
+Build with `--plugins=fff,rtk` (or `--plugins=rtk`). Keep `pi-rtk-optimizer@0.9.0` installed with its direct extension disabled (`{"source":"npm:pi-rtk-optimizer","extensions":[]}`), then append `/absolute/path/to/omp-ssh-remote/packages/pi/dist/pi-rtk-extension.js` after the remote host entry. Do not enable both raw and managed RTK hooks.
+
+The worker embeds upstream JavaScript, including its lazy compactor, not the native `rtk` executable. Install RTK in the **remote worker PATH** to enable rewriting. Missing RTK is reported accurately; upstream's default missing-binary guard leaves original commands unchanged, while result compaction still works. Local RTK availability is not evidence of remote availability.
+
+`/rtk show`, `config`, `path`, `verify`, `status`, `stats` and `clear-stats` query the selected execution domain. The upstream settings UI remains available while local; remote configuration changes require exiting, changing settings locally and reconnecting to negotiate a new immutable assembly. Worker configuration uses a private temporary agent directory, not the remote user's Pi settings. Defaults keep `read` exact; RTK only compacts its supported names (`bash/read/grep`), not arbitrary FFF tools. No main conversation or model credentials are sent to RTK.
+
+
+## Connect and operate
 
 ```text
 /remote-connect gpu-box /srv/project
 /remote-status
+/fff-health
+/fff-rescan
 /remote-exit
 ```
 
-Explicit form:
+The model can also use `remote_connect`, `remote_workspace_status`, and `remote_exit`. Use a pretrusted OpenSSH alias and public-key authentication. `StrictHostKeyChecking=yes` remains mandatory; credentials are not copied into the companion.
 
-```text
-/remote-connect user@example.com /srv/project --port 22 --identity ~/.ssh/id_ed25519
+FFF mode, multi-grep and scan settings are negotiated as effective configuration. Database paths remain execution-domain-local. Change FFF mode while local, apply `/reload` when requested by upstream, then reconnect. Remote mode changes are rejected rather than silently changing tool ownership. On disconnect, searches and `@` completion never fall back to local candidates.
+
+## Other plugins
+
+Ask, goal control, model request settings, web credentials, and context management normally remain local. This does not automatically remoteize plugin-internal file access:
+
+- Brainstorm's direct summary-file export remains local.
+- Web Access local-media inputs remain local.
+- Magic Context's project identity and direct Git/file checks remain tied to the local session context.
+- Project-scoped model/plugin configuration is local unless explicitly integrated.
+
+These are boundaries, not claims of full plugin compatibility. Do not pass remote file paths to an unadapted local plugin and assume SSH routing applies.
+
+## Optional inheritance
+
+Normal `pi-extension.js` does not claim or publish process-level subagent environment state. To opt into Tintin inheritance, load `pi-tintin-extension.js` instead of the normal entry for the root and explicitly for restricted children. Its injected inheritance backend is separate from the default workspace binding. Remote worktree isolation is unsupported.
+
+## Verification
+
+```bash
+bun run typecheck
+bun test
+REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-project> bun scripts/smoke-pi-fff.ts
+PI_WORKSPACE_RTK=1 REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-project> bun scripts/smoke-pi-fff.ts
 ```
 
-The model can invoke `remote_connect`, `remote_workspace_status`, and `remote_exit`. Status reports the assembly ID, local and remote component versions, tool groups, ownership verification, and transport state. After a failed or lost connection, `/remote-exit` is required before reconnecting. One connected root session may create multiple ordinary `@tintinweb/pi-subagents` children; the default Pi extension automatically recognizes a new in-process child while the root owner is active. Custom agents that restrict extension loading must explicitly load `pi-tintin-extension.js`. A second independent root in the same process is rejected. Do not enable tintin's local `isolation: "worktree"` mode for a remote-connected session. The included tintin smoke is the external acceptance gate for this integration.
+The FFF smoke checks different local/remote contents at the same relative path, remote hostname, native renderer preservation, health/rescan, remote reload, completion, forced transport loss with fail-closed search/completion, and local restoration. ARM64 builds need separate real-host acceptance; an ARM64 build alone is not execution proof.
+The RTK option checks remote output compaction and stats, control services, and—when the native executable is available—compares automatic rewriting against explicit RTK and raw passthrough. Set `PI_RTK_REQUIRE_BINARY=1` to require that native branch. Search/RTK execution has been verified on both x64 and ARM64. The official RTK 0.48.0 ARM64 binary requires glibc 2.39; older systems need a compatible build, not a system glibc upgrade.
 
-## Deployment and Security
-
-The adapter deploys a content-addressed worker plus only the selected plugin artifacts. All files use SHA-256 sidecars, UUID temporary uploads, remote hash verification, and atomic activation. Workers are cached under:
-
-```text
-~/.cache/omp-ssh-remote/pi/<worker-sha256>/worker-linux-<arch>
-```
-
-When AFT is selected, its binary is cached by architecture and hash, linked beside the worker, and prepended to `PATH`. The real AFT plugin resolves that package-owned binary without network download or user cache.
-
-The worker is model-free. Shutdown aborts active calls, waits up to five seconds, then gives plugin-owned resources up to five seconds to close. AFT background Bash is remote AFT state rather than a local orchestration job; detached processes can outlive the companion and remain the remote user's responsibility.
-
-## Limits
-
-- Linux glibc x86_64 and ARM64 only;
-- AFT is currently the only remote plugin adapter included in the worker registry;
-- new plugins require explicit adapters and a rebuilt worker artifact;
-- no arbitrary third-party workspace plugin inference;
-- no remote model loop, memory, web credentials, browser, or TUI;
-- no `@tintinweb/pi-subagents` local `isolation: "worktree"`, remote worktree, or general artifact bridge;
-- a failed or lost connection stays fail-closed until `/remote-exit`;
-- a Pi reload reconstructs plugin in-memory state;
-- single protocol frames are limited to 16 MiB.
+Native tools run with the remote user's privileges, not in a sandbox. Protocol frames are bounded; cancellation is cooperative. Detached commands are not durable managed jobs, remote worktrees are unsupported, and no automatic reconnect/replay is performed.

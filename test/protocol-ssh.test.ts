@@ -14,6 +14,7 @@ import {
   validatePiReadyMessage,
 } from "../src/pi/assembly.ts";
 import { AFT_PLUGIN_ID } from "../src/pi/plugins/aft.ts";
+import { WORKSPACE_HOOKS } from "../src/pi/workspace-plugin.ts";
 import {
   buildScpBaseCommand,
   buildSshWorkerCommand,
@@ -86,6 +87,7 @@ function validReady(): ReadyMessage {
       parameters,
     })),
     capabilities: {
+      workspaceHooks: [...WORKSPACE_HOOKS],
       assembly: {
         id: assemblyRequest.id,
         components: [
@@ -162,6 +164,12 @@ describe("Pi runtime assembly boundary", () => {
     expect(() =>
       validatePiReadyMessage(validationAssembly, validReady()),
     ).not.toThrow();
+  });
+
+  test("rejects companions that bypass workspace plugin hooks", () => {
+    const ready = validReady();
+    delete ready.capabilities!.workspaceHooks;
+    expect(() => validatePiReadyMessage(validationAssembly, ready)).toThrow("workspace hook lifecycle");
   });
 
   test("rejects missing, unknown, duplicate, and incompatible tools", () => {

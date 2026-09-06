@@ -5,6 +5,12 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
   ToolInfo,
+  ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import {
+  createReadToolDefinition, createWriteToolDefinition, createEditToolDefinition,
+  createBashToolDefinition, createGrepToolDefinition, createFindToolDefinition,
+  createLsToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
 import { resolveRemoteHome, prepareRemoteWorker } from "../deploy.ts";
@@ -14,14 +20,7 @@ import {
   type RemoteConnectRequest,
 } from "../connect-options.ts";
 import type { ReadyMessage, ToolManifest } from "../protocol.ts";
-import {
-  claimPiTintinSubagentConnectionSpec,
-  clearPiTintinSubagentConnectionSpec,
-  hasPiTintinSubagentConnectionSpec,
-  hasPiTintinSubagentRootOwner,
-  publishPiTintinSubagentConnectionSpec,
-  readPiTintinSubagentConnectionSpec,
-} from "./integrations/tintin-subagents.ts";
+import type { PiRemoteConnectionInheritance, PiRemoteConnectionInheritanceSpec } from "./integrations/connection-inheritance.ts";
 import {
   PI_CORE_TOOL_NAMES,
   resolvePiRuntimeAssembly,
@@ -30,6 +29,9 @@ import {
 } from "./assembly.ts";
 import { PiRemoteWorkspaceScope } from "./scope.ts";
 import { PI_PLUGIN_ADAPTERS } from "./plugins/index.ts";
+import { workspaceBinding } from "./workspace-binding.ts";
+import { managedPlugins, managedToolSnapshots } from "./managed-plugins.ts";
+import { publishSessionContext, restoreSessionContext, releaseSessionContext } from "./session-context.ts";
 const STATE_KEY = Symbol.for("pi-ssh-remote/state");
 
 type PendingReload = {
@@ -63,6 +65,8 @@ export interface PiRemoteWorkspaceStatus {
   remoteCwd: string | null;
   connectionError: string | null;
   remoteWorkspaceTools: string[];
+  workspaceHooks: unknown;
+  workspaceServices: unknown;
   componentToolGroups: Array<{
     id: string;
     displayName: string;
@@ -100,13 +104,15 @@ export interface PiRemoteExtensionState {
   inheritanceDisabled?: boolean;
   inheritanceOwnerToken?: string;
 }
+const SESSION_STATES_KEY = Symbol.for("pi-ssh-remote/session-states");
 type GlobalWithPiRemoteState = typeof globalThis & {
   [STATE_KEY]?: PiRemoteExtensionState;
+  [SESSION_STATES_KEY]?: WeakMap<object, PiRemoteExtensionState>;
 };
 
 const globalScope = globalThis as GlobalWithPiRemoteState;
 const globalState = (globalScope[STATE_KEY] ??= { selected: false });
-const stateByEventBus = new WeakMap<object, PiRemoteExtensionState>();
+const stateByEventBus = globalScope[SESSION_STATES_KEY] ??= new WeakMap<object, PiRemoteExtensionState>();
 
 export function getPiRemoteStateForSession(
   eventBus: object,
@@ -123,12 +129,8 @@ export function getPiRemoteStateForSession(
 function beginPendingReload(state: PiRemoteExtensionState): PendingReload {
   const existing = state.pendingReload;
   if (existing) return existing;
-  let resolve!: () => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  void promise.catch(() => {});
   const pending = { promise, resolve, reject };
   state.pendingReload = pending;
   return pending;
@@ -216,6 +218,8 @@ export function buildPiWorkspaceStatus(
           "Remote tool ownership has not been verified")
         : null,
     remoteWorkspaceTools: mode === "remote" ? toolNames : [],
+    workspaceHooks: mode === "remote" ? state.ready?.capabilities?.workspaceHooks ?? [] : [],
+    workspaceServices: mode === "remote" ? state.ready?.capabilities?.workspaceServices ?? {} : {},
     componentToolGroups:
       mode === "remote" && assembly
         ? assembly.components.map((component) => ({
@@ -245,7 +249,7 @@ export function buildPiWorkspaceStatus(
     },
     note:
       mode === "remote"
-        ? "Runtime assembly ownership and the current SSH transport are verified."
+        ? "Workspace tools, execution hooks and admitted plugin services run remotely; conversation, model requests and UI remain local."
         : mode === "unavailable"
           ? "Workspace tools fail closed until reconnection or /remote-exit."
           : "Local Pi tools are active.",
@@ -288,13 +292,17 @@ function manifestSchema(tool: ToolManifest): TSchema {
 
 export async function installPiRemoteExtension(
   pi: ExtensionAPI,
-  options: { inheritedChild?: boolean } = {},
+  options: { inheritedChild?: boolean; inheritance?: PiRemoteConnectionInheritance } = {},
 ): Promise<void> {
-  const state = pi.events ? getPiRemoteStateForSession(pi.events) : globalState;
+  let sessionKey: object = pi.events ?? globalScope;
+  let state = getPiRemoteStateForSession(sessionKey);
+  let binding = workspaceBinding(sessionKey);
+  publishSessionContext(pi, () => sessionKey);
+  const inheritance = options.inheritance;
   if (
     options.inheritedChild ||
     (state.inheritanceOwnerToken === undefined &&
-      hasPiTintinSubagentRootOwner())
+      inheritance?.hasRootOwner())
   ) {
     state.isInheritedChild = true;
   } else {
@@ -303,19 +311,19 @@ export async function installPiRemoteExtension(
   const inheritedConnectionRequested =
     state.isInheritedChild === true &&
     !state.inheritanceDisabled &&
-    hasPiTintinSubagentConnectionSpec();
-  let inheritedSpec: ReturnType<typeof readPiTintinSubagentConnectionSpec>;
+    inheritance?.hasSpec();
+  let inheritedSpec: PiRemoteConnectionInheritanceSpec | undefined;
   if (!inheritedConnectionRequested || state.inheritanceDisabled) {
     inheritedSpec = undefined;
     if (state.isInheritedChild && !state.inheritanceDisabled) {
       state.selected = true;
       state.ownershipVerified = false;
       state.connectionError =
-        "Tintin child requires a valid inherited Pi remote connection";
+        "Child requires a valid inherited Pi remote connection";
     }
   } else {
     try {
-      inheritedSpec = readPiTintinSubagentConnectionSpec();
+      inheritedSpec = inheritance?.read();
     } catch (error) {
       state.isInheritedChild = true;
       state.selected = true;
@@ -326,13 +334,43 @@ export async function installPiRemoteExtension(
   }
 
   let registeredRemoteTools = new Set<string>();
+  // Pi marks non-throwing tool returns successful; carry the worker's hook outcome through its result hook.
+  const remoteResultErrors = new WeakMap<object, boolean>();
+  const coreDefinitions = {
+    read: createReadToolDefinition,
+    write: createWriteToolDefinition,
+    edit: createEditToolDefinition,
+    bash: createBashToolDefinition,
+    grep: createGrepToolDefinition,
+    find: createFindToolDefinition,
+    ls: createLsToolDefinition,
+  };
 
-  const resolveCurrentAssembly = (): Promise<PiRuntimeAssembly> => {
-    const tools = filterStaleRemoteWrappers(pi.getAllTools());
-    return resolvePiRuntimeAssembly({
-      tools,
-      activeTools: pi.getActiveTools(),
+  const resolveCurrentAssembly = async (): Promise<PiRuntimeAssembly> => {
+    for (const command of pi.getCommands()) {
+      if (command.source !== "extension" || (command.name !== "rtk" && !command.name.startsWith("rtk:"))) continue;
+      const path = command.sourceInfo?.path?.replace(/\\/g, "/") ?? "";
+      if (!managedPlugins(sessionKey).has("pi-rtk-optimizer") || !/\/pi-rtk-extension\.(?:ts|js)$/.test(path)) {
+        throw new Error("RTK remote execution requires only the managed pi-rtk-extension entry; disable the ordinary pi-rtk-optimizer extension to avoid local workspace hooks");
+      }
+    }
+    const managed = managedToolSnapshots(sessionKey);
+    const managedNames = new Set(managed.map((tool) => tool.name));
+    const tools = filterStaleRemoteWrappers(pi.getAllTools()).filter((tool) => !managedNames.has(tool.name));
+    const assembly = await resolvePiRuntimeAssembly({
+      tools: [...tools, ...managed],
+      managedPlugins: [...managedPlugins(sessionKey).values()].map((plugin) => ({
+        id: plugin.id,
+        sourcePath: plugin.sourcePath,
+        version: plugin.version,
+        config: plugin.config(),
+      })),
     });
+    if (assembly.plugins.some((plugin) => plugin.id === "@ff-labs/pi-fff") &&
+        !managedPlugins(sessionKey).has("@ff-labs/pi-fff")) {
+      throw new Error("FFF remote execution requires the managed pi-fff-extension entry so tools, completion and index commands share one workspace");
+    }
+    return assembly;
   };
 
   const verifyOwnership = (): void => {
@@ -365,7 +403,15 @@ export async function installPiRemoteExtension(
         continue;
       }
       registeredRemoteTools.add(tool.name);
+      const native = [...managedPlugins(sessionKey).values()]
+        .flatMap((plugin) => [...plugin.tools()]).find((candidate) => candidate.name === tool.name)
+        ?? (tool.owner === "pi-core" && tool.name in coreDefinitions
+          ? coreDefinitions[tool.name as keyof typeof coreDefinitions](state.cwd ?? process.cwd())
+          : undefined);
+      // Each renderer retains its verified native schema; erase only the heterogeneous generic here.
+      const nativeDefinition = native as ToolDefinition | undefined;
       pi.registerTool({
+        ...nativeDefinition,
         name: tool.name,
         label: tool.name,
         description: `[Remote on ${state.connectOptions?.displayTarget ?? "SSH host"}] ${tool.description}`,
@@ -389,7 +435,7 @@ export async function installPiRemoteExtension(
             params && typeof params === "object"
               ? (params as Record<string, unknown>)
               : {};
-          return (await state.scope.execute(
+          const result = await binding.execute(
             tool.name,
             toolCallId,
             args,
@@ -397,7 +443,11 @@ export async function installPiRemoteExtension(
             onUpdate
               ? (update: unknown) => onUpdate(update as never)
               : undefined,
-          )) as never;
+          );
+          if (result && typeof result === "object" && "content" in result && Array.isArray(result.content) && "isError" in result && typeof result.isError === "boolean") {
+            remoteResultErrors.set(result.content, result.isError);
+          }
+          return result as never;
         },
       });
     }
@@ -433,6 +483,7 @@ export async function installPiRemoteExtension(
 
     let openedScope: PiRemoteWorkspaceScope | undefined;
     try {
+      const generation = await binding.begin();
       openedScope = await PiRemoteWorkspaceScope.open({
         assembly,
         connectOptions: parsed,
@@ -443,8 +494,9 @@ export async function installPiRemoteExtension(
       state.ready = openedScope.ready;
       registerRemoteWrappers(openedScope.ready, assembly);
       if (!state.isInheritedChild) verifyOwnership();
+      binding.commit(openedScope, generation);
       if (!state.isInheritedChild) {
-        publishPiTintinSubagentConnectionSpec({
+        inheritance?.publish({
           ownerToken: state.inheritanceOwnerToken!,
           assembly: assembly.request,
           tools: assembly.tools,
@@ -455,6 +507,7 @@ export async function installPiRemoteExtension(
       }
       return openedScope.ready;
     } catch (error) {
+      binding.fail(error);
       try {
         await openedScope?.close(true);
       } catch {}
@@ -473,7 +526,7 @@ export async function installPiRemoteExtension(
   ): Promise<ReadyMessage> => {
     if (state.isInheritedChild) {
       throw new Error(
-        "Tintin child sessions can only restore a parent Pi remote connection",
+        "Child sessions can only restore a parent Pi remote connection",
       );
     }
     await state.pendingReload?.promise;
@@ -494,7 +547,7 @@ export async function installPiRemoteExtension(
             configuredHosts,
           );
     if (!state.isInheritedChild) {
-      claimPiTintinSubagentConnectionSpec(state.inheritanceOwnerToken!);
+      inheritance?.claim(state.inheritanceOwnerToken!);
     }
     try {
       const remoteHome = await resolveRemoteHome({
@@ -522,7 +575,7 @@ export async function installPiRemoteExtension(
       );
     } catch (error) {
       if (!state.selected) {
-        clearPiTintinSubagentConnectionSpec(state.inheritanceOwnerToken);
+        inheritance?.clear(state.inheritanceOwnerToken);
       }
       throw error;
     }
@@ -655,7 +708,7 @@ export async function installPiRemoteExtension(
       beginPendingReload(state);
       try {
         const inheritedChild = state.isInheritedChild;
-        await state.scope?.close(force);
+        await binding.close(force);
         state.selected = false;
         state.scope = undefined;
         state.ready = undefined;
@@ -666,7 +719,7 @@ export async function installPiRemoteExtension(
         state.ownershipVerified = undefined;
         if (inheritedChild) state.inheritanceDisabled = true;
         if (!inheritedChild) {
-          clearPiTintinSubagentConnectionSpec(state.inheritanceOwnerToken);
+          inheritance?.clear(state.inheritanceOwnerToken);
         }
         ctx.ui?.notify?.(
           "Disconnected. Reloading the local Pi tool set.",
@@ -702,6 +755,13 @@ export async function installPiRemoteExtension(
     },
   });
 
+  pi.on("tool_result", (event) => {
+    const isError = remoteResultErrors.get(event.content);
+    if (isError === undefined) return;
+    remoteResultErrors.delete(event.content);
+    return { isError };
+  });
+
   pi.on("tool_call", (event) => {
     const guardedNames = new Set([
       ...PI_CORE_TOOL_NAMES,
@@ -729,7 +789,13 @@ export async function installPiRemoteExtension(
     }
   });
 
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
+    if (ctx) {
+      sessionKey = restoreSessionContext(ctx, sessionKey);
+      state = getPiRemoteStateForSession(sessionKey);
+      binding = workspaceBinding(sessionKey);
+      if (state.selected && state.ready && state.assembly) registerRemoteWrappers(state.ready, state.assembly);
+    }
     registeredRemoteTools = new Set();
     if (inheritedSpec && !state.selected && !state.scope) {
       state.isInheritedChild = true;
@@ -770,11 +836,12 @@ export async function installPiRemoteExtension(
     }
   });
 
-  pi.on("session_shutdown", async (event) => {
+  pi.on("session_shutdown", async (event, ctx) => {
     if (event.reason === "reload") return;
+    if (ctx) releaseSessionContext(ctx);
     const inheritedChild = state.isInheritedChild;
     try {
-      await state.scope?.close(true);
+      await binding.close(true);
     } finally {
       state.scope = undefined;
       state.selected = false;
@@ -787,7 +854,7 @@ export async function installPiRemoteExtension(
       state.ownershipVerified = undefined;
       state.localActiveTools = undefined;
       if (!inheritedChild) {
-        clearPiTintinSubagentConnectionSpec(state.inheritanceOwnerToken);
+        inheritance?.clear(state.inheritanceOwnerToken);
       }
     }
   });

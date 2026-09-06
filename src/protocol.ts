@@ -33,6 +33,8 @@ export type RuntimeAssemblyComponent = {
   kind: RuntimeComponentKind;
   contractVersion: string;
   version: string;
+  /** Effective serializable plugin/host config; identity metadata, not a compatibility lock. */
+  config?: Record<string, unknown>;
 };
 export type RuntimeAssemblyTool = {
   name: string;
@@ -133,12 +135,21 @@ function parseAssembly(value: unknown): RuntimeAssemblyRequest {
       if (kind !== "host" && kind !== "plugin") {
         throw new Error(`Unknown runtime assembly component kind: ${kind}`);
       }
-      return {
+      const parsed: RuntimeAssemblyComponent = {
         id: stringField(item, "id"),
         kind,
         contractVersion: stringField(item, "contractVersion"),
         version: stringField(item, "version"),
       };
+      if ("config" in item && item.config !== undefined) {
+        if (!isRecord(item.config) || Array.isArray(item.config)) {
+          throw new Error(
+            `Assembly component ${parsed.id} config must be a plain object`,
+          );
+        }
+        parsed.config = item.config;
+      }
+      return parsed;
     }),
     tools: tools.map((tool) => {
       const item = asRecord(tool, "assembly tool");

@@ -77,6 +77,23 @@ export class PiRemoteWorkspaceScope {
     return this.client.execute(tool, toolCallId, args, signal, onUpdate);
   }
 
+  service(
+    plugin: string,
+    name: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const services = this.ready.capabilities?.workspaceServices;
+    const admitted = services && typeof services === "object"
+      ? (services as Record<string, unknown>)[plugin]
+      : undefined;
+    if (!this.assembly.plugins.some((component) => component.id === plugin) ||
+        !Array.isArray(admitted) || !admitted.includes(name)) {
+      throw new Error(`Workspace service ${plugin}/${name} was not admitted`);
+    }
+    return this.client.execute(`${plugin}/service/${name}`, `service-${name}`, args, signal);
+  }
+
   async close(force = false): Promise<void> {
     if (this.client.isClosed) return;
     try {
