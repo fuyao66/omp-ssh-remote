@@ -34,7 +34,10 @@ const activeTools = [
   "ast_edit",
   "eval",
   "debug",
+  "hub",
 ];
+const hubOwner = `smoke-owner-${process.pid}`;
+const launchCompletions: unknown[] = [];
 type CapturedCommand = {
   handler(args: string, ctx: ExtensionCommandContext): Promise<void>;
 };
@@ -70,6 +73,9 @@ const apiHarness = {
   on(event: string) {
     events.add(event);
   },
+  sendMessage(message: { customType?: string; details?: unknown }) {
+    if (message.customType === "launch-completion") launchCompletions.push(message.details);
+  },
 };
 await remoteRuntimeExtension(apiHarness as unknown as ExtensionAPI);
 
@@ -101,6 +107,7 @@ const commandContext = {
   cwd: process.cwd(),
   sessionManager: {
     getSessionFile: () => "/tmp/omp-ssh-remote-smoke/extension.jsonl",
+    getSessionId: () => hubOwner,
   },
   ui: {
     setWorkingMessage() {},
@@ -112,9 +119,9 @@ const commandContext = {
 } as unknown as ExtensionCommandContext;
 const connect = commands.get("remote-connect");
 if (!connect) throw new Error("remote-connect was not registered");
-const connectArgs =
-  alias ??
-  `${target} ${cwd} --port ${port} --identity ${identityFile} --known-hosts ${knownHostsFile}`;
+const connectArgs = alias
+  ? `${alias} ${cwd}`
+  : `${target} ${cwd} --port ${port} --identity ${identityFile} --known-hosts ${knownHostsFile}`;
 await connect.handler(connectArgs, commandContext);
 if (events.has("context"))
   throw new Error(
@@ -122,6 +129,37 @@ if (events.has("context"))
   );
 const exit = commands.get("remote-exit");
 if (!exit) throw new Error("remote-exit was not registered");
+
+/**
+ * Count still-running instances of the smoke service on the remote host after
+ * remote-exit. Uses a plain SSH probe (same auth material as the connection)
+ * so the check does not depend on the just-closed companion.
+ */
+async function remoteServiceSurvivors(serviceName: string): Promise<number> {
+  const sshArgs = alias
+    ? [alias]
+    : [
+        "-p",
+        port,
+        "-i",
+        identityFile!,
+        "-o",
+        `UserKnownHostsFile=${knownHostsFile}`,
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "BatchMode=yes",
+        target!,
+      ];
+  // The service argv embeds `marker=<serviceName> `. The probe shell's own
+  // command line carries the split form `"marker=""<name> "`, so it never
+  // matches itself; pgrep excludes its own process.
+  const probe = `pgrep -fc -- "marker=""${serviceName} " || true`;
+  const proc = Bun.spawn(["ssh", ...sshArgs, probe], { stdout: "pipe", stderr: "pipe" });
+  const out = await new Response(proc.stdout).text();
+  await proc.exited;
+  return Number.parseInt(out.trim() || "0", 10);
+}
 let disconnected = false;
 try {
   const expectedToolNames = new Set([
@@ -172,7 +210,8 @@ try {
   const lsp = tools.get("lsp");
   const evalTool = tools.get("eval");
   const debug = tools.get("debug");
-  if (!write || !read || !bash || !astEdit || !lsp || !evalTool || !debug) {
+  const hub = tools.get("hub");
+  if (!write || !read || !bash || !astEdit || !lsp || !evalTool || !debug || !hub) {
     throw new Error("Active remote wrappers were not registered");
   }
 
@@ -192,7 +231,7 @@ try {
     connectedDetails.remoteCwd !== cwd
   ) {
     throw new Error(
-      "Workspace status did not report the connected remote runtime",
+      `Workspace status did not report the connected remote runtime: ${JSON.stringify(connectedStatus.details)}`,
     );
   }
 
@@ -413,6 +452,77 @@ try {
     }
   }
 
+  // hub: process supervision runs in the remote project broker; messaging/jobs
+  // are local control-plane ops and must never leave the host.
+  const localHub = await hub.execute(
+    "adapter-hub-list",
+    { op: "list" },
+    AbortSignal.timeout(10_000),
+    undefined,
+    invokeContext,
+  );
+  if (!JSON.stringify(localHub).includes("local fallback"))
+    throw new Error("hub list did not stay on the local control plane");
+  const serviceName = `smoke-svc-${process.pid}`;
+  const started = await hub.execute(
+    "adapter-hub-start",
+    {
+      op: "start",
+      name: serviceName,
+      application: "sh",
+      args: ["-c", `marker=${serviceName} ; echo smoke-ready; hostname; sleep 120`],
+      ready: { log: "smoke-ready", timeout: 20 },
+    },
+    AbortSignal.timeout(30_000),
+    undefined,
+    invokeContext,
+  );
+  if (!JSON.stringify(started).includes(serviceName))
+    throw new Error("Remote hub start did not report the service");
+  const remoteHostname = JSON.stringify(
+    await bash.execute(
+      "adapter-hub-hostname",
+      { command: "hostname" },
+      AbortSignal.timeout(15_000),
+      undefined,
+      invokeContext,
+    ),
+  );
+  const serviceLogs = await hub.execute(
+    "adapter-hub-logs",
+    { op: "logs", name: serviceName },
+    AbortSignal.timeout(15_000),
+    undefined,
+    invokeContext,
+  );
+  const serviceLogText = JSON.stringify(serviceLogs);
+  const remoteHost = /"text":"([^"\\]+)/.exec(remoteHostname)?.[1]?.trim();
+  if (!serviceLogText.includes("smoke-ready") || !remoteHost || !serviceLogText.includes(remoteHost))
+    throw new Error(`Remote service logs did not come from the remote host (${remoteHost ?? "?"}): ${serviceLogText.slice(0, 300)}`);
+  // A short-lived service exits on its own; the owner must be told.
+  const shortName = `smoke-short-${process.pid}`;
+  const completionSeen = new Promise<void>((resolve) => {
+    const poll = () => {
+      if (launchCompletions.some((entry) => JSON.stringify(entry).includes(shortName))) resolve();
+      else setTimeout(poll, 100);
+    };
+    poll();
+  });
+  await hub.execute(
+    "adapter-hub-start-short",
+    { op: "start", name: shortName, application: "sh", args: ["-c", "exit 7"] },
+    AbortSignal.timeout(30_000),
+    undefined,
+    invokeContext,
+  );
+  await Promise.race([
+    completionSeen,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("No launch-completion delivered for the exited remote service")), 20_000),
+    ),
+  ]);
+  const remoteHub = "ok";
+
   await exit.handler("", commandContext);
   disconnected = true;
   const localStatus = await workspaceStatus.execute(
@@ -438,6 +548,8 @@ try {
     throw new Error(
       "Extension did not restore native fallback after remote-exit",
     );
+  // Non-persist services started by this session must be gone after exit.
+  const survivors = await remoteServiceSurvivors(serviceName);
   console.log(
     JSON.stringify({
       commands: [...commands.keys()],
@@ -447,10 +559,13 @@ try {
       remoteLsp: "ok",
       remoteEval: "ok",
       remoteDebug,
+      remoteHub,
+      remoteHubCleanupAfterExit: survivors === 0 ? "ok" : `FAILED: ${survivors} still running`,
       localFallback: "ok",
       notices,
     }),
   );
+  if (survivors !== 0) throw new Error("Remote non-persist service survived remote-exit");
 } finally {
   if (!disconnected)
     await exit.handler("--force", commandContext).catch(() => undefined);

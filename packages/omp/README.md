@@ -6,20 +6,27 @@ OMP SSH Remote keeps the Oh My Pi control plane local while executing stateful n
 
 ## Runtime Boundary
 
-Local OMP retains the TUI, conversation, model credentials, sessions, Magic Context, `task`, `hub`, `todo`, browser/computer, and other control-plane tools. One remote companion per OMP session owns the remote filesystem, foreground processes, hashline snapshots, AST proposals, LSP clients, eval kernels, and debugger sessions.
+Local OMP retains the TUI, conversation, model credentials, sessions, Magic Context, `task`, `todo`, browser/computer, peer messaging, and background-job bookkeeping. One remote companion per OMP session owns the remote filesystem, foreground processes, hashline snapshots, AST proposals, LSP clients, eval kernels, debugger sessions, and the project's supervised-process broker.
 
 Remote native tools:
 
-`read`, `write`, `edit`, foreground `bash`, `grep`, `glob`, `lsp`, `ast_grep`, `ast_edit`, constrained `eval`, and `debug`.
+`read`, `write`, `edit`, `bash`, `grep`, `glob`, `lsp`, `ast_grep`, `ast_edit`, constrained `eval`, `debug`, and the process-supervision half of `hub`.
 
-Ordinary non-isolated subagents inherit the connection configuration but receive independent companion processes. The remote host does not install OMP; the companion reports the host package version it was compiled against as identity metadata. Admission compares the remote runtime contract and exact native tool schemas rather than requiring equal OMP package versions. `task isolated:true`, remote async Bash, and artifact transfer are not supported and fail closed.
+Background execution is split by ownership rather than by tool name:
+
+- `bash async:true` creates a local OMP background job that owns the id, status, logs, cancellation, and `hub jobs` visibility while the companion runs the command in the foreground; `hub cancel`, session exit, or transport loss aborts the remote command.
+- `hub start/ps/logs/stop/restart/describe`, and `send`/`wait` addressed to a process `name`, run in the native OMP broker on the remote host, so the service starts beside the project with the remote environment. Process exit notifications reach the local model exactly as native launch completions do. `hub list/inbox/jobs/cancel` and peer `send`/`wait` never leave the local host.
+- On `/remote-exit`, session shutdown, or transport loss the companion stops the supervised processes this session started unless they were launched with `persist` or `detached`; those survive by explicit request, like native OMP.
+
+Ordinary non-isolated subagents inherit the connection configuration but receive independent companion processes. The remote host does not install OMP; the companion reports the host package version it was compiled against as identity metadata. Admission compares the remote runtime contract and exact native tool schemas rather than requiring equal OMP package versions. `task isolated:true` and artifact transfer are not supported and fail closed.
 
 ```mermaid
 flowchart LR
   OMP[Local OMP] --> Adapter[OMP package adapter]
   Adapter <--> SSH[Persistent bounded SSH NDJSON]
   SSH <--> Worker[Remote OMP companion]
-  Worker --> Tools[Native ToolSession: files, AST, LSP, eval, debug]
+  Worker --> Tools[Native ToolSession: files, AST, LSP, eval, debug, hub launch]
+  Worker --> Broker[Remote project broker: supervised services]
   Tools --> RemoteFS[Remote workspace]
 ```
 

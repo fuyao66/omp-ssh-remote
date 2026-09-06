@@ -1,4 +1,5 @@
 import type { RemoteToolName } from "./protocol.ts";
+import { isHubLaunchOperation } from "./omp/hub-ops.ts";
 
 const URI_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 
@@ -30,6 +31,9 @@ export function pathShouldStayLocal(
   params: Record<string, unknown>,
 ): boolean {
   if (tool === "bash" || tool === "eval") return false;
+  // hub: supervised-process ops run where the project lives; peer messaging
+  // and job control are local control-plane operations.
+  if (tool === "hub") return !isHubLaunchOperation(params);
   if (tool === "debug") {
     const paths = [params.program, params.cwd, params.file].filter(
       (path): path is string => typeof path === "string",

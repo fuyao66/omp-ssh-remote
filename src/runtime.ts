@@ -13,11 +13,13 @@ import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
+import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import {
   REMOTE_TOOL_NAMES,
   type RemoteToolName,
 } from "./protocol.ts";
 import { pathShouldStayLocal } from "./path-domain.ts";
+import { createRemoteHubLaunchTool } from "./omp/hub-launch.ts";
 export interface RemoteNativeTool {
   readonly name: string;
   readonly description: string;
@@ -82,6 +84,7 @@ class PendingInvokerQueueAdapter {
 const WORKER_OVERRIDES = {
   "async.enabled": false,
   "bash.autoBackground.enabled": false,
+  "launch.enabled": true,
   "bash.direnv": "auto",
   "lsp.enabled": true,
   "lsp.lazy": true,
@@ -104,9 +107,17 @@ export type NativeWorkerRuntime = {
   session: ToolSession;
 };
 
+export type NativeWorkerRuntimeOptions = {
+  /** Owner identity for remote supervised processes (local OMP session id). */
+  sessionId?: string;
+  /** Receives broker completion notifications for daemons this owner started. */
+  onLaunchCompletion?: (notification: DaemonCompletionNotification) => void;
+};
+
 export async function createNativeWorkerRuntime(
   cwd: string,
   hostVersion: string,
+  options: NativeWorkerRuntimeOptions = {},
 ): Promise<NativeWorkerRuntime> {
   const resolvedCwd = resolve(cwd);
   const cwdStat = await stat(resolvedCwd);
@@ -119,6 +130,8 @@ export async function createNativeWorkerRuntime(
   const xdevTools = new Map<string, RemoteNativeTool>();
   const xdevMountedNames = new Set<string>(["lsp", "ast_grep", "ast_edit"]);
   const callableTools = new Map<string, RemoteNativeTool>();
+  const sessionId = options.sessionId ?? `omp-ssh-remote:${hostVersion}`;
+  const disposeCallbacks = new Set<() => void>();
   const session: ToolSession = {
     cwd: absoluteCwd,
     hasUI: false,
@@ -130,8 +143,21 @@ export async function createNativeWorkerRuntime(
     settings,
     getSessionFile: () => null,
     getSessionSpawns: () => "",
-    getSessionId: () => `omp-ssh-remote:${hostVersion}`,
+    getSessionId: () => sessionId,
     getArtifactsDir: () => null,
+    registerDisposeCallback: (callback) => {
+      disposeCallbacks.add(callback);
+      return () => {
+        disposeCallbacks.delete(callback);
+      };
+    },
+    ...(options.onLaunchCompletion
+      ? {
+          queueLaunchCompletion: async (notification) => {
+            options.onLaunchCompletion?.(notification);
+          },
+        }
+      : {}),
     xdev: {
       tools: xdevTools,
       mountedNames: xdevMountedNames,
@@ -169,9 +195,10 @@ export async function createNativeWorkerRuntime(
     ast_edit: asRemoteNativeTool(new AstEditTool(session)),
     eval: asRemoteNativeTool(new EvalTool(session)),
     debug: asRemoteNativeTool(new DebugTool(session)),
+    hub: createRemoteHubLaunchTool(session),
   };
   const evalCallableNames = REMOTE_TOOL_NAMES.filter(
-    (name) => name !== "eval" && name !== "ast_edit",
+    (name) => name !== "eval" && name !== "ast_edit" && name !== "hub",
   );
   for (const name of evalCallableNames) {
     const tool = tools[name];

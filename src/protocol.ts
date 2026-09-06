@@ -8,7 +8,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.3.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.4.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
@@ -23,6 +23,7 @@ export const REMOTE_TOOL_NAMES = [
   "ast_edit",
   "eval",
   "debug",
+  "hub",
 ] as const;
 export type RemoteToolName = (typeof REMOTE_TOOL_NAMES)[number];
 export type AnyRemoteToolName = string;
@@ -56,6 +57,8 @@ export type InitializeRequest = {
   cwd: string;
   tools: string[];
   assembly?: RuntimeAssemblyRequest;
+  /** Local OMP session id; owner identity for remote supervised processes. */
+  sessionId?: string;
 };
 
 export type ExecuteRequest = {
@@ -100,11 +103,18 @@ export type ErrorMessage = {
   id?: string;
   error: { name: string; message: string; stack?: string };
 };
+/** Unsolicited worker-originated notification (no request id). */
+export type EventMessage = {
+  type: "event";
+  event: "launch-completion";
+  payload: Record<string, unknown>;
+};
 export type Message =
   | ReadyMessage
   | UpdateMessage
   | ResultMessage
-  | ErrorMessage;
+  | ErrorMessage
+  | EventMessage;
 
 function stringField(value: Record<string, unknown>, key: string): string {
   const field = value[key];
@@ -191,6 +201,9 @@ export function parseRequest(raw: unknown): Request {
       ...(value.assembly === undefined
         ? {}
         : { assembly: parseAssembly(value.assembly) }),
+      ...(typeof value.sessionId === "string"
+        ? { sessionId: value.sessionId }
+        : {}),
     };
   }
   if (type === "execute") {
@@ -250,6 +263,12 @@ export function parseMessage(line: string): Message {
     if (!("result" in value))
       throw new Error(`Protocol ${type} message is missing result`);
     return { type, id: stringField(value, "id"), result: value.result };
+  }
+  if (type === "event") {
+    const event = stringField(value, "event");
+    if (event !== "launch-completion")
+      throw new Error(`Unknown protocol event: ${event}`);
+    return { type, event, payload: asRecord(value.payload, "payload") };
   }
   if (type === "error") {
     if (!isRecord(value.error))

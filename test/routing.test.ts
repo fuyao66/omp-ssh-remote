@@ -103,6 +103,23 @@ describe("workspace path routing", () => {
       }),
     ).toThrow("cannot mix local internal URIs with remote filesystem paths");
   });
+
+  test("routes hub process supervision remotely and control-plane ops locally", () => {
+    for (const op of ["start", "ps", "logs", "stop", "restart", "describe"]) {
+      expect(pathShouldStayLocal("hub", { op, name: "web" })).toBe(false);
+    }
+    // send/wait address a process only when `name` is given without a peer.
+    expect(pathShouldStayLocal("hub", { op: "send", name: "web", text: "q" })).toBe(false);
+    expect(pathShouldStayLocal("hub", { op: "wait", name: "web", for: "ready" })).toBe(false);
+    expect(pathShouldStayLocal("hub", { op: "send", to: "Main", message: "hi" })).toBe(true);
+    expect(pathShouldStayLocal("hub", { op: "send", name: "web", to: "Main", message: "hi" })).toBe(true);
+    expect(pathShouldStayLocal("hub", { op: "wait" })).toBe(true);
+    expect(pathShouldStayLocal("hub", { op: "wait", from: "Scout" })).toBe(true);
+    for (const op of ["list", "inbox", "jobs", "cancel"]) {
+      expect(pathShouldStayLocal("hub", { op })).toBe(true);
+    }
+    expect(pathShouldStayLocal("hub", {})).toBe(true);
+  });
 });
 
 describe("remote session boundaries", () => {
@@ -162,12 +179,15 @@ describe("remote session boundaries", () => {
     expect(
       remoteControlPlaneBlockReason("task", { task: "edit", isolated: true }),
     ).toContain("isolated worktrees");
+    // No AsyncJobManager singleton in the test process: fail closed with a
+    // clear reason. When OMP installs its manager the block is lifted and the
+    // wrapper bridges the job (covered by test/async-bash.test.ts).
     expect(
       remoteControlPlaneBlockReason("bash", {
         command: "sleep 1",
         async: true,
       }),
-    ).toContain("local hub");
+    ).toContain("background job manager");
     expect(
       remoteControlPlaneBlockReason("task", { task: "read", isolated: false }),
     ).toBeUndefined();
@@ -262,7 +282,8 @@ describe("remote workspace status", () => {
         ordinaryFilesystemPaths: "remote native runtime",
         internalUris: "local control plane",
         controlPlane: "local control plane",
-        asyncBash: "rejected; remote job bridge is not available",
+        asyncBash:
+          "local OMP job owns lifecycle; remote companion runs the command in the foreground; cancel or disconnect aborts it",
         isolatedTasks: "rejected; remote isolated worktrees are not available",
       },
     });

@@ -6,20 +6,27 @@ OMP SSH Remote 将 Oh My Pi 控制面保留在本机，同时通过 SSH 在远�
 
 ## Runtime 边界
 
-本机 OMP 继续负责 TUI、对话、模型凭据、session、Magic Context、`task`、`hub`、`todo`、browser/computer 等控制面工具。每个 OMP session 使用一个独立远端 companion，持有远端文件系统、前台进程、hashline snapshot、AST proposal、LSP client、eval kernel 和 debugger session。
+本机 OMP 继续负责 TUI、对话、模型凭据、session、Magic Context、`task`、`todo`、browser/computer、peer 消息以及后台任务簿记。每个 OMP session 使用一个独立远端 companion，持有远端文件系统、前台进程、hashline snapshot、AST proposal、LSP client、eval kernel、debugger session，以及该项目的受监管进程 broker。
 
 远端原生工具：
 
-`read`、`write`、`edit`、前台 `bash`、`grep`、`glob`、`lsp`、`ast_grep`、`ast_edit`、受限 `eval` 和 `debug`。
+`read`、`write`、`edit`、`bash`、`grep`、`glob`、`lsp`、`ast_grep`、`ast_edit`、受限 `eval`、`debug`，以及 `hub` 的进程监管部分。
 
-普通非隔离子代理继承连接配置，但各自使用独立 companion。远端主机不安装 OMP；companion 报告编译时所针对的宿主包版本，仅作为身份元数据。准入比较远端 runtime 契约与精确原生工具 schema，而不是要求 OMP 包版本完全相等。`task isolated:true`、远端 async Bash 和 artifact transfer 尚不支持，并采用 fail-closed。
+后台执行按归属划分，而不是按工具名划分：
+
+- `bash async:true` 创建本机 OMP 后台 job，由本机拥有 id、状态、日志、取消和 `hub jobs` 可见性；companion 在远端前台执行命令。`hub cancel`、session 退出或传输丢失都会中止远端命令。
+- `hub start/ps/logs/stop/restart/describe`，以及指向进程 `name` 的 `send`/`wait`，在远端主机上的 OMP 原生 broker 中执行，服务与项目同机启动并使用远端环境。进程退出通知会像原生 launch completion 一样送达本机模型。`hub list/inbox/jobs/cancel` 与 peer `send`/`wait` 永不离开本机。
+- `/remote-exit`、session 关闭或传输丢失时，companion 会停止本 session 启动的受监管进程；以 `persist` 或 `detached` 启动的进程按显式要求存活，与原生 OMP 一致。
+
+普通非隔离子代理继承连接配置，但各自使用独立 companion。远端主机不安装 OMP；companion 报告编译时所针对的宿主包版本，仅作为身份元数据。准入比较远端 runtime 契约与精确原生工具 schema，而不是要求 OMP 包版本完全相等。`task isolated:true` 和 artifact transfer 尚不支持，并采用 fail-closed。
 
 ```mermaid
 flowchart LR
   OMP[本机 OMP] --> Adapter[OMP package adapter]
   Adapter <--> SSH[持久有界 SSH NDJSON]
   SSH <--> Worker[远端 OMP companion]
-  Worker --> Tools[原生 ToolSession: 文件、AST、LSP、eval、debug]
+  Worker --> Tools[原生 ToolSession: 文件、AST、LSP、eval、debug、hub launch]
+  Worker --> Broker[远端项目 broker: 受监管服务]
   Tools --> RemoteFS[远端工作区]
 ```
 

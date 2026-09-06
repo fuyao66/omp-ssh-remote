@@ -4,6 +4,7 @@ import {
   decodeFrames,
   encodeMessage,
   parseMessage,
+  type EventMessage,
   type Message,
   type ReadyMessage,
   type Request,
@@ -47,6 +48,15 @@ export class RemoteRuntimeClient {
   #closed = false;
   #nextId = 1;
   readonly #exitPromise: Promise<number | null>;
+  readonly #eventListeners = new Set<(event: EventMessage) => void>();
+
+  /** Subscribe to unsolicited worker events; returns an unsubscribe. */
+  onEvent(listener: (event: EventMessage) => void): () => void {
+    this.#eventListeners.add(listener);
+    return () => {
+      this.#eventListeners.delete(listener);
+    };
+  }
 
   get isClosed(): boolean {
     return this.#closed;
@@ -78,6 +88,7 @@ export class RemoteRuntimeClient {
     cwd: string,
     handshake: RemoteRuntimeHandshake,
     timeoutMs = 15_000,
+    options: { sessionId?: string } = {},
   ): Promise<ReadyMessage> {
     this.#send({
       type: "initialize",
@@ -91,6 +102,7 @@ export class RemoteRuntimeClient {
       cwd,
       tools: [...handshake.requestedTools],
       ...(handshake.assembly ? { assembly: handshake.assembly } : {}),
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
     });
     try {
       const ready = await withTimeout(
@@ -211,6 +223,14 @@ export class RemoteRuntimeClient {
       this.#rejectReady = undefined;
       return;
     }
+    if (message.type === "event") {
+      for (const listener of this.#eventListeners) {
+        try {
+          listener(message);
+        } catch {}
+      }
+      return;
+    }
     if (message.type === "update") {
       this.#pending.get(message.id)?.onUpdate?.(message.result);
       return;
@@ -246,5 +266,6 @@ export class RemoteRuntimeClient {
     this.#rejectReady?.(error);
     for (const pending of this.#pending.values()) pending.reject(error);
     this.#pending.clear();
+    this.#eventListeners.clear();
   }
 }

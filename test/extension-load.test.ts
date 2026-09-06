@@ -62,6 +62,7 @@ describe("OMP extension loading", () => {
           internalUris: "local control plane",
           controlPlane: "local control plane",
           asyncBash: "local OMP policy",
+          hubProcesses: "local OMP policy",
           isolatedTasks: "local OMP policy",
         },
         note: "Current in-process SSH transport state only; this tool does not send an SSH health probe.",
@@ -86,6 +87,7 @@ describe("OMP extension loading", () => {
       "ast_edit",
       "eval",
       "debug",
+      "hub",
     ]) {
       expect(toolRenderers[name]).toBeDefined();
       expect(toolRenderers[name]?.renderCall).toBeFunction();

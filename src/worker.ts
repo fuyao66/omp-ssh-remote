@@ -6,7 +6,10 @@ import { dapSessionManager } from "@oh-my-pi/pi-coding-agent/dap";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { disposeAllKernelSessions } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import { shutdownAll as shutdownAllLspClients } from "@oh-my-pi/pi-coding-agent/lsp/client";
+import { DAEMON_BROKER_WORKER_ARG } from "@oh-my-pi/pi-coding-agent/launch/protocol";
+import { closeDaemonClients } from "@oh-my-pi/pi-coding-agent/launch/client";
 import { createNativeWorkerRuntime, type NativeWorkerRuntime } from "./runtime.ts";
+import { stopOwnedRemoteDaemons } from "./omp/hub-cleanup.ts";
 import {
   PROTOCOL_VERSION,
   TOOL_RUNTIME_VERSION,
@@ -63,6 +66,7 @@ async function runJsEvalProcessHost(): Promise<void> {
 }
 
 let runtime: NativeWorkerRuntime | undefined;
+let launchOwner: string | undefined;
 const active = new Map<string, { controller: AbortController; done: Promise<void> }>();
 let cleanupPromise: Promise<void> | undefined;
 
@@ -81,10 +85,17 @@ async function cleanupWorker(reason: Error): Promise<void> {
       await dapSessionManager.terminate(AbortSignal.timeout(remaining), remaining).catch(() => undefined);
       if (dapSessionManager.listSessions().length >= before) break;
     }
+    if (runtime && launchOwner) {
+      await Promise.race([
+        stopOwnedRemoteDaemons(runtime.cwd, launchOwner).catch(() => undefined),
+        Bun.sleep(8_000),
+      ]);
+    }
     await Promise.race([
       Promise.allSettled([disposeAllKernelSessions(), disposeAllVmContexts(), shutdownAllLspClients()]),
       Bun.sleep(5_000),
     ]);
+    await closeDaemonClients().catch(() => undefined);
   })();
   return cleanupPromise;
 }
@@ -110,7 +121,16 @@ async function initialize(request: InitializeRequest): Promise<void> {
     throw new Error(`Runtime version mismatch: client=${request.runtimeVersion}, worker=${TOOL_RUNTIME_VERSION}`);
   }
   const hostVersion = await resolveOmpHostVersion();
-  runtime = await createNativeWorkerRuntime(request.cwd, hostVersion);
+  launchOwner = request.sessionId;
+  runtime = await createNativeWorkerRuntime(request.cwd, hostVersion, {
+    sessionId: request.sessionId,
+    onLaunchCompletion: (notification) =>
+      send({
+        type: "event",
+        event: "launch-completion",
+        payload: notification as unknown as Record<string, unknown>,
+      }),
+  });
   const requested = new Set(request.tools);
   const tools = Object.values(runtime.tools)
     .filter(tool => requested.has(tool.name))
@@ -179,6 +199,11 @@ async function dispatch(request: Request): Promise<boolean> {
 
 if (process.argv[2] === JS_EVAL_PROCESS_ARG) {
   await runJsEvalProcessHost();
+} else if (process.argv[2] === DAEMON_BROKER_WORKER_ARG) {
+  // The native launch client re-enters this executable to host the project
+  // broker (same binary as the OMP CLI would). Dispatch before anything else.
+  const { startDaemonBrokerFromEnvironment } = await import("@oh-my-pi/pi-coding-agent/launch/broker");
+  await startDaemonBrokerFromEnvironment();
 } else {
   const stopForSignal = (signal: string): void => {
     void cleanupWorker(new Error(`Remote worker received ${signal}`)).finally(() => process.exit(0));

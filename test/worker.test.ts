@@ -24,6 +24,7 @@ beforeAll(async () => {
     "eval",
     "glob",
     "grep",
+    "hub",
     "lsp",
     "read",
     "write",
@@ -193,4 +194,111 @@ describe("native worker round trip", () => {
       }),
     ).rejects.toThrow("Async bash execution is disabled");
   });
+  test("remote hub rejects messaging and job ops (local control plane)", async () => {
+    await expect(
+      client.execute("hub", "hub-list", { op: "list" }),
+    ).rejects.toThrow("Remote hub only supervises processes");
+    await expect(
+      client.execute("hub", "hub-jobs", { op: "jobs" }),
+    ).rejects.toThrow("Remote hub only supervises processes");
+    await expect(
+      client.execute("hub", "hub-send-peer", { op: "send", to: "Main", message: "x" }),
+    ).rejects.toThrow("Remote hub only supervises processes");
+  });
+
+  test("remote hub supervises a process through the worker-hosted broker", async () => {
+    const name = `probe-${process.pid}`;
+    const started = await client.execute("hub", "hub-start", {
+      op: "start",
+      name,
+      application: "sh",
+      args: ["-c", "echo booted; sleep 30"],
+      ready: { log: "booted", timeout: 20 },
+    });
+    const startedText = JSON.stringify(started);
+    expect(startedText).toContain(name);
+    expect(startedText).not.toContain("disabled");
+
+    const listed = await client.execute("hub", "hub-ps", { op: "ps" });
+    expect(JSON.stringify(listed)).toContain(name);
+
+    const logs = await client.execute("hub", "hub-logs", { op: "logs", name });
+    expect(JSON.stringify(logs)).toContain("booted");
+
+    const stopped = await client.execute("hub", "hub-stop", { op: "stop", name });
+    expect(JSON.stringify(stopped)).toContain(name);
+  }, 60_000);
+});
+
+describe("hub launch ownership", () => {
+  test("worker teardown stops the owner's non-persist daemons", async () => {
+    const ownedCwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-hub-"));
+    const owner = "session-owner-test";
+    const first = new RemoteRuntimeClient({
+      command: ["bun", join(import.meta.dir, "../src/worker.ts")],
+    });
+    try {
+      await first.initialize(ownedCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: owner });
+      const name = `owned-${process.pid}`;
+      await first.execute("hub", "hub-start-owned", {
+        op: "start",
+        name,
+        application: "sh",
+        args: ["-c", "echo up; sleep 60"],
+        ready: { log: "up", timeout: 20 },
+      });
+      await first.close();
+
+      const second = new RemoteRuntimeClient({
+        command: ["bun", join(import.meta.dir, "../src/worker.ts")],
+      });
+      try {
+        await second.initialize(ownedCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: owner });
+        const listed = JSON.stringify(
+          await second.execute("hub", "hub-ps-after", { op: "ps" }),
+        );
+        // Either gone from the table or in a terminal state; never still running.
+        const stillRunning = new RegExp(`"name":"${name}"[^}]*"state":"(running|ready|starting)"`);
+        expect(stillRunning.test(listed)).toBe(false);
+      } finally {
+        await second.close().catch(() => {});
+      }
+    } finally {
+      await first.close().catch(() => {});
+      await rm(ownedCwd, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("owner receives a launch-completion event when its daemon exits", async () => {
+    const eventCwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-hub-evt-"));
+    const owner = "session-owner-events";
+    const worker = new RemoteRuntimeClient({
+      command: ["bun", join(import.meta.dir, "../src/worker.ts")],
+    });
+    try {
+      await worker.initialize(eventCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: owner });
+      const name = `short-${process.pid}`;
+      const completion = new Promise<Record<string, unknown>>((resolve) => {
+        worker.onEvent((event) => {
+          if (event.event === "launch-completion") resolve(event.payload);
+        });
+      });
+      await worker.execute("hub", "hub-start-short", {
+        op: "start",
+        name,
+        application: "sh",
+        args: ["-c", "echo done; exit 3"],
+      });
+      // The test-level timeout bounds this; the awaited signal is the real event.
+      const payload = await completion;
+      const daemon = payload.daemon as Record<string, unknown>;
+      expect(daemon.name).toBe(name);
+      expect(daemon.owner).toBe(owner);
+      expect(["exited", "failed"]).toContain(String(daemon.state));
+      expect(daemon.exitCode).toBe(3);
+    } finally {
+      await worker.close().catch(() => {});
+      await rm(eventCwd, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

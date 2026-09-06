@@ -25,6 +25,18 @@ import {
 } from "./path-domain.ts";
 export { pathShouldStayLocal } from "./path-domain.ts";
 import { buildSshWorkerCommand } from "./ssh.ts";
+import {
+  resolveJobOwnerId,
+  resolveLocalAsyncJobManager,
+  startRemoteAsyncBashJob,
+} from "./omp/async-bash.ts";
+import { isHubLaunchOperation } from "./omp/hub-ops.ts";
+import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
+import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
+
+function asyncBashAvailable(): boolean {
+  return resolveLocalAsyncJobManager() !== undefined;
+}
 
 const REMOTE_TOOL_SET = new Set<string>(REMOTE_TOOL_NAMES);
 const REMOTE_XDEV_TOOLS = new Set<RemoteToolName>([
@@ -68,6 +80,7 @@ const TOOL_LABELS: Record<RemoteToolName, string> = {
   ast_edit: "ast replace",
   eval: "eval",
   debug: "debug",
+  hub: "hub",
 };
 
 const REMOTE_WORKSPACE_STATUS_TOOL = "remote_workspace_status";
@@ -85,6 +98,7 @@ export type RemoteWorkspaceStatus = {
     internalUris: string;
     controlPlane: string;
     asyncBash: string;
+    hubProcesses: string;
     isolatedTasks: string;
   };
   note: string;
@@ -142,7 +156,15 @@ export function workspaceStatus(
       asyncBash:
         mode === "local"
           ? "local OMP policy"
-          : "rejected; remote job bridge is not available",
+          : mode === "remote"
+            ? "local OMP job owns lifecycle; remote companion runs the command in the foreground; cancel or disconnect aborts it"
+            : "rejected (fail closed)",
+      hubProcesses:
+        mode === "local"
+          ? "local OMP policy"
+          : mode === "remote"
+            ? "hub start/ps/logs/stop/restart/describe and process send/wait run in the remote project broker; peer messaging and job ops stay local; non-persist services stop on remote exit"
+            : "rejected (fail closed)",
       isolatedTasks:
         mode === "local"
           ? "local OMP policy"
@@ -257,8 +279,8 @@ export function remoteControlPlaneBlockReason(
   if (toolName === "task" && taskRequestsIsolation(params)) {
     return "Remote runtime does not support OMP local isolated worktrees. Use isolated:false or disconnect first.";
   }
-  if (toolName === "bash" && params.async === true) {
-    return "Remote async bash is disabled until its job lifecycle is bridged to the local hub.";
+  if (toolName === "bash" && params.async === true && !asyncBashAvailable()) {
+    return "Remote async bash requires the local OMP background job manager, which is unavailable in this session.";
   }
   return undefined;
 }
@@ -342,6 +364,16 @@ function approvalFor(name: RemoteToolName): ToolApproval {
       }
       if (isInternalUri(path)) return "exec";
       return "write";
+    };
+  }
+  if (name === "hub") {
+    return (args) => {
+      const input = asRecord(args);
+      const op = input.op;
+      if (!isHubLaunchOperation(input)) return "read";
+      if (op === "ps" || op === "logs" || op === "describe" || op === "wait")
+        return "read";
+      return "exec";
     };
   }
   return "exec";
@@ -479,6 +511,55 @@ export function remoteWrapperRenderer(name: RemoteToolName) {
   return toolRenderers[name] ?? {};
 }
 
+function startRemoteAsyncBash(
+  toolCallId: string,
+  params: Record<string, unknown>,
+  state: RemoteExtensionState,
+  ctx: ExtensionContext,
+): AgentToolResult {
+  const client = state.client;
+  if (!client) throw new Error("Remote runtime is disconnected");
+  const manager = resolveLocalAsyncJobManager();
+  if (!manager) {
+    throw new Error(
+      "Remote async bash requires the local OMP background job manager, which is unavailable in this session.",
+    );
+  }
+  const command = typeof params.command === "string" ? params.command : "";
+  if (!command) throw new Error("bash requires a command");
+  const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? state.sessionFile;
+  const ownerId = resolveJobOwnerId(
+    sessionFile ? resolvePath(sessionFile) : undefined,
+  );
+  if (!ownerId) {
+    throw new Error(
+      "Remote async bash could not resolve the owning OMP agent; run it in the foreground instead.",
+    );
+  }
+  const remoteCwd = state.remoteCwd ?? "remote";
+  return startRemoteAsyncBashJob({
+    manager,
+    ownerId,
+    command,
+    params,
+    remoteCwd,
+    execute: async (remoteParams, signal, onUpdate) => {
+      if (state.client !== client || client.isClosed) {
+        throw new Error(
+          `Remote bash job lost its runtime (${remoteCwd}); the connection was closed`,
+        );
+      }
+      return (await client.execute(
+        "bash",
+        `${toolCallId}:async`,
+        remoteParams,
+        signal,
+        onUpdate,
+      )) as AgentToolResult;
+    },
+  });
+}
+
 function registerWrapper(
   pi: ExtensionAPI,
   state: RemoteExtensionState,
@@ -496,6 +577,9 @@ function registerWrapper(
     async execute(toolCallId, rawParams, signal, rawOnUpdate, ctx) {
       const params = rawParams as Record<string, unknown>;
       const target = await executionTarget(name, params, state, ctx, signal);
+      if (name === "bash" && target === "remote" && params.async === true) {
+        return startRemoteAsyncBash(toolCallId, params, state, ctx);
+      }
       const result = await executeWithTarget(
         target,
         name,
@@ -609,10 +693,45 @@ async function closeRemoteFamily(
   }
 }
 
+/**
+ * Deliver remote broker completions the way the native hub does: one
+ * model-visible custom message per terminal daemon exit. `followUp` queues
+ * during streaming and starts a turn when idle, matching the yield-queue
+ * semantics of the native `queueLaunchCompletion` path closely enough for the
+ * model to react to a remote service exiting.
+ */
+function bindLaunchCompletionDelivery(
+  pi: ExtensionAPI,
+  client: RemoteRuntimeClient,
+): void {
+  client.onEvent((event) => {
+    if (event.event !== "launch-completion") return;
+    const notification = event.payload as unknown as DaemonCompletionNotification;
+    if (!notification?.daemon || typeof notification.daemon !== "object") return;
+    const message = buildLaunchCompletionBatchMessage([notification]);
+    pi.sendMessage(
+      {
+        customType: message.customType,
+        content: message.content,
+        display: message.display,
+        details: message.details,
+        attribution: message.attribution,
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+  });
+}
+
+function launchOwnerId(ctx: ExtensionContext | undefined): string | undefined {
+  const id = ctx?.sessionManager?.getSessionId?.();
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
 async function attachFamilyMember(
   pi: ExtensionAPI,
   state: RemoteExtensionState,
   family: RemoteFamily,
+  ctx?: ExtensionContext,
 ): Promise<void> {
   if (state.selected) return;
   state.selected = true;
@@ -636,7 +755,10 @@ async function attachFamilyMember(
     next = new RemoteRuntimeClient({
       command: buildSshWorkerCommand(family.connection),
     });
-    const ready = await next.initialize(family.remoteCwd, handshake);
+    const ready = await next.initialize(family.remoteCwd, handshake, undefined, {
+      sessionId: launchOwnerId(ctx),
+    });
+    bindLaunchCompletionDelivery(pi, next);
     if (family.closing)
       throw new Error(
         "Remote session family disconnected during subagent initialization",
@@ -753,7 +875,10 @@ export default async function remoteRuntimeExtension(
         next = new RemoteRuntimeClient({
           command: buildSshWorkerCommand(connection),
         });
-        const ready = await next.initialize(options.cwd, handshake);
+        const ready = await next.initialize(options.cwd, handshake, undefined, {
+          sessionId: launchOwnerId(ctx),
+        });
+        bindLaunchCompletionDelivery(pi, next);
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
           ownerSessionFile: normalizedSessionFile,
@@ -906,7 +1031,10 @@ export default async function remoteRuntimeExtension(
         next = new RemoteRuntimeClient({
           command: buildSshWorkerCommand(connection),
         });
-        const ready = await next.initialize(options.cwd, handshake);
+        const ready = await next.initialize(options.cwd, handshake, undefined, {
+          sessionId: launchOwnerId(ctx),
+        });
+        bindLaunchCompletionDelivery(pi, next);
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
           ownerSessionFile: normalizedSessionFile,
@@ -1011,7 +1139,7 @@ export default async function remoteRuntimeExtension(
     state.sessionFile = normalized;
     const family = findRemoteFamily(normalized);
     if (!family) return;
-    await attachFamilyMember(pi, state, family);
+    await attachFamilyMember(pi, state, family, ctx);
   });
 
   const closeBeforeSessionNavigation = async (
