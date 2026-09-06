@@ -63,7 +63,6 @@ if (target === "all" || target === "omp") {
     external: [
       "@oh-my-pi/pi-coding-agent",
       "@oh-my-pi/pi-agent-core",
-      "@oh-my-pi/omptype",
       "@oh-my-pi/pi-utils",
     ],
     define: {

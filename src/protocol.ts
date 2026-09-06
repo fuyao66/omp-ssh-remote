@@ -8,7 +8,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.4.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.5.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
@@ -75,6 +75,7 @@ export type Request =
   | InitializeRequest
   | ExecuteRequest
   | CancelRequest
+  | { type: "event-ack"; id: string }
   | ShutdownRequest;
 
 export type ToolManifest = {
@@ -216,6 +217,7 @@ export function parseRequest(raw: unknown): Request {
     };
   }
   if (type === "cancel") return { type, id: stringField(value, "id") };
+  if (type === "event-ack") return { type, id: stringField(value, "id") };
   if (type === "shutdown") return { type };
   throw new Error(`Unknown protocol request type: ${type}`);
 }

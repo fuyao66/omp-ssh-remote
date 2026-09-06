@@ -69,10 +69,13 @@ let runtime: NativeWorkerRuntime | undefined;
 let launchOwner: string | undefined;
 const active = new Map<string, { controller: AbortController; done: Promise<void> }>();
 let cleanupPromise: Promise<void> | undefined;
+const pendingEvents = new Map<string, { resolve(): void; reject(reason: Error): void }>();
 
 async function cleanupWorker(reason: Error): Promise<void> {
   if (cleanupPromise) return cleanupPromise;
   cleanupPromise = (async () => {
+    for (const event of pendingEvents.values()) event.reject(reason);
+    pendingEvents.clear();
     for (const call of active.values()) call.controller.abort(reason);
     await Promise.race([
       Promise.allSettled([...active.values()].map(call => call.done)),
@@ -86,10 +89,7 @@ async function cleanupWorker(reason: Error): Promise<void> {
       if (dapSessionManager.listSessions().length >= before) break;
     }
     if (runtime && launchOwner) {
-      await Promise.race([
-        stopOwnedRemoteDaemons(runtime.cwd, launchOwner).catch(() => undefined),
-        Bun.sleep(8_000),
-      ]);
+      await stopOwnedRemoteDaemons(runtime.cwd, launchOwner);
     }
     await Promise.race([
       Promise.allSettled([disposeAllKernelSessions(), disposeAllVmContexts(), shutdownAllLspClients()]),
@@ -124,12 +124,10 @@ async function initialize(request: InitializeRequest): Promise<void> {
   launchOwner = request.sessionId;
   runtime = await createNativeWorkerRuntime(request.cwd, hostVersion, {
     sessionId: request.sessionId,
-    onLaunchCompletion: (notification) =>
-      send({
-        type: "event",
-        event: "launch-completion",
-        payload: notification as unknown as Record<string, unknown>,
-      }),
+    onLaunchCompletion: (notification) => new Promise<void>((resolve, reject) => {
+      pendingEvents.set(notification.completionId, { resolve, reject });
+      send({ type: "event", event: "launch-completion", payload: notification as unknown as Record<string, unknown> });
+    }),
   });
   const requested = new Set(request.tools);
   const tools = Object.values(runtime.tools)
@@ -192,6 +190,10 @@ async function dispatch(request: Request): Promise<boolean> {
     case "cancel":
       active.get(request.id)?.controller.abort(new Error("Remote tool call cancelled"));
       return true;
+    case "event-ack":
+      pendingEvents.get(request.id)?.resolve();
+      pendingEvents.delete(request.id);
+      return true;
     case "shutdown":
       return false;
   }
@@ -206,7 +208,10 @@ if (process.argv[2] === JS_EVAL_PROCESS_ARG) {
   await startDaemonBrokerFromEnvironment();
 } else {
   const stopForSignal = (signal: string): void => {
-    void cleanupWorker(new Error(`Remote worker received ${signal}`)).finally(() => process.exit(0));
+    void cleanupWorker(new Error(`Remote worker received ${signal}`)).then(() => process.exit(0), (error) => {
+      console.error(error);
+      process.exit(1);
+    });
   };
   process.once("SIGHUP", () => stopForSignal("SIGHUP"));
   process.once("SIGTERM", () => stopForSignal("SIGTERM"));

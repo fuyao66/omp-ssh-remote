@@ -33,6 +33,7 @@ import {
 import { isHubLaunchOperation } from "./omp/hub-ops.ts";
 import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 
 function asyncBashAvailable(): boolean {
   return resolveLocalAsyncJobManager() !== undefined;
@@ -43,6 +44,7 @@ const REMOTE_XDEV_TOOLS = new Set<RemoteToolName>([
   "lsp",
   "ast_grep",
   "ast_edit",
+  "debug",
 ]);
 const RESOLUTION_DEVICES = new Set(["resolve", "reject"]);
 const LSP_READONLY_ACTIONS = new Set([
@@ -566,6 +568,10 @@ function registerWrapper(
   name: RemoteToolName,
   native: ToolInfo,
 ): void {
+  const hostSession = AgentRegistry.global().list().find(
+    (ref) => ref.sessionFile === state.sessionFile,
+  )?.session;
+  const original = hostSession?.getToolByName(name);
   pi.registerTool({
     name,
     label: TOOL_LABELS[name],
@@ -573,7 +579,7 @@ function registerWrapper(
     parameters: native.parameters,
     ...remoteWrapperRenderer(name),
     loadMode: "essential",
-    approval: approvalFor(name),
+    approval: original?.approval ?? approvalFor(name),
     async execute(toolCallId, rawParams, signal, rawOnUpdate, ctx) {
       const params = rawParams as Record<string, unknown>;
       const target = await executionTarget(name, params, state, ctx, signal);
@@ -626,10 +632,10 @@ async function ompHandshake(_pi: ExtensionAPI) {
 }
 
 
-function registerActiveWrappers(
+async function registerActiveWrappers(
   pi: ExtensionAPI,
   state: RemoteExtensionState,
-): void {
+): Promise<void> {
   const active = new Set(pi.getActiveTools());
   const metadata = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
   for (const name of REMOTE_TOOL_NAMES) {
@@ -639,6 +645,8 @@ function registerActiveWrappers(
       throw new Error(`OMP native tool metadata is unavailable: ${name}`);
     registerWrapper(pi, state, name, native);
   }
+  const hostSession = AgentRegistry.global().list().find((ref) => ref.sessionFile === state.sessionFile)?.session;
+  await hostSession?.runToolRegistryMutation(async () => {});
 }
 
 function detachRemoteState(
@@ -707,7 +715,7 @@ function bindLaunchCompletionDelivery(
   client.onEvent((event) => {
     if (event.event !== "launch-completion") return;
     const notification = event.payload as unknown as DaemonCompletionNotification;
-    if (!notification?.daemon || typeof notification.daemon !== "object") return;
+    if (!notification?.daemon || typeof notification.daemon !== "object") throw new Error("Invalid remote launch completion");
     const message = buildLaunchCompletionBatchMessage([notification]);
     pi.sendMessage(
       {
@@ -739,7 +747,7 @@ async function attachFamilyMember(
   state.family = family;
   state.remoteCwd = family.remoteCwd;
   family.members.add(state);
-  registerActiveWrappers(pi, state);
+  await registerActiveWrappers(pi, state);
 
   if (
     !state.localCwd ||
@@ -898,7 +906,7 @@ export default async function remoteRuntimeExtension(
         state.family = family;
         state.connectionError = undefined;
         REMOTE_FAMILIES.set(normalizedSessionFile, family);
-        registerActiveWrappers(pi, state);
+        await registerActiveWrappers(pi, state);
         ctx?.ui?.setStatus?.(
           "remote-runtime",
           `ssh ${request.displayTarget}:${ready.cwd}`,
@@ -1054,7 +1062,7 @@ export default async function remoteRuntimeExtension(
         state.family = family;
         state.connectionError = undefined;
         REMOTE_FAMILIES.set(normalizedSessionFile, family);
-        registerActiveWrappers(pi, state);
+        await registerActiveWrappers(pi, state);
         ctx.ui.setStatus(
           "remote-runtime",
           `ssh ${request.displayTarget}:${ready.cwd}`,

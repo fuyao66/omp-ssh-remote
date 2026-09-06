@@ -11,7 +11,7 @@ const TERMINAL = new Set(["exited", "failed"]);
  * has no one to observe it. `persist`/`detached` daemons are deliberately
  * left alone; that is the user's explicit survival request.
  *
- * Returns the names stopped. Never throws for individual stop failures.
+ * Rejects if any owned process could not be stopped.
  */
 export async function stopOwnedRemoteDaemons(
   projectDir: string,
@@ -24,17 +24,11 @@ export async function stopOwnedRemoteDaemons(
   const client = await daemonClientForProject(projectDir);
   const listed = await client.request({ op: "list" });
   if (listed.op !== "list") return [];
-  const stopped: string[] = [];
-  for (const daemon of listed.daemons) {
-    if (daemon.owner !== owner) continue;
-    if (daemon.persist || daemon.detached) continue;
-    if (TERMINAL.has(daemon.state)) continue;
-    try {
-      await client.request({ op: "stop", name: daemon.name, timeoutMs: 5_000 });
-      stopped.push(daemon.name);
-    } catch {
-      // Best effort; broker shutdown's own idle path is the backstop.
-    }
-  }
-  return stopped;
+  const owned = listed.daemons.filter((daemon) =>
+    daemon.owner === owner && !daemon.persist && !daemon.detached && !TERMINAL.has(daemon.state),
+  );
+  await Promise.all(owned.map(async (daemon) => {
+    await client.request({ op: "stop", name: daemon.name, timeoutMs: 1_000 });
+  }));
+  return owned.map((daemon) => daemon.name);
 }

@@ -37,6 +37,19 @@ afterAll(async () => {
 });
 
 describe("native worker round trip", () => {
+  test("truncated bash output is recoverable through remote artifact selectors", async () => {
+    const result = await client.execute("bash", "large-output", { command: "seq 1 20000" });
+    const uri = JSON.stringify(result).match(/remote-artifact:\/\/[a-f0-9-]+\/\d+/)?.[0];
+    expect(uri).toBeDefined();
+    const recovered = await client.execute("read", "recover-output", { path: `${uri}:10000-10002` });
+    expect(JSON.stringify(recovered)).toContain("10000:10000");
+    expect(JSON.stringify(recovered)).toContain("10002:10002");
+  });
+
+  test("debug device executes in the worker", async () => {
+    const result = await client.execute("write", "debug-device", { path: "xd://debug", content: JSON.stringify({ action: "sessions" }) });
+    expect(result).toMatchObject({ details: { xdev: { tool: "debug", mode: "execute", inner: { success: true } } } });
+  });
   test("native workspace tools share one filesystem and snapshot state", async () => {
     const writeResult = await client.execute("write", "write-1", {
       path: "probe.txt",
@@ -231,43 +244,30 @@ describe("native worker round trip", () => {
 });
 
 describe("hub launch ownership", () => {
-  test("worker teardown stops the owner's non-persist daemons", async () => {
+  test("worker teardown stops all stubborn services while another owner remains connected", async () => {
     const ownedCwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-hub-"));
-    const owner = "session-owner-test";
-    const first = new RemoteRuntimeClient({
-      command: ["bun", join(import.meta.dir, "../src/worker.ts")],
-    });
+    const first = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    const second = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    const names = ["owned-one", "owned-two", "owned-three"];
     try {
-      await first.initialize(ownedCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: owner });
-      const name = `owned-${process.pid}`;
-      await first.execute("hub", "hub-start-owned", {
-        op: "start",
-        name,
-        application: "sh",
-        args: ["-c", "echo up; sleep 60"],
-        ready: { log: "up", timeout: 20 },
+      await first.initialize(ownedCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: "owner" });
+      await second.initialize(ownedCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: "observer" });
+      await second.execute("hub", "observe", { op: "ps" });
+      for (const name of names) await first.execute("hub", name, {
+        op: "start", name, application: "bun",
+        args: ["-e", "process.on('SIGTERM',()=>{});console.log('ready');setInterval(()=>{},1000)"],
+        pty: false, ready: { log: "ready", timeout: 20 },
       });
       await first.close();
-
-      const second = new RemoteRuntimeClient({
-        command: ["bun", join(import.meta.dir, "../src/worker.ts")],
-      });
-      try {
-        await second.initialize(ownedCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: owner });
-        const listed = JSON.stringify(
-          await second.execute("hub", "hub-ps-after", { op: "ps" }),
-        );
-        // Either gone from the table or in a terminal state; never still running.
-        const stillRunning = new RegExp(`"name":"${name}"[^}]*"state":"(running|ready|starting)"`);
-        expect(stillRunning.test(listed)).toBe(false);
-      } finally {
-        await second.close().catch(() => {});
-      }
+      const result = await second.execute("hub", "after", { op: "ps" }) as { details: { daemons: Array<{ name: string; state: string }> } };
+      for (const name of names) expect(result.details.daemons.find((daemon) => daemon.name === name)?.state).toBe("exited");
     } finally {
+      for (const name of names) await second.execute("hub", `stop-${name}`, { op: "stop", name, timeout: 0.1 }).catch(() => {});
       await first.close().catch(() => {});
+      await second.close().catch(() => {});
       await rm(ownedCwd, { recursive: true, force: true });
     }
-  }, 90_000);
+  }, 60_000);
 
   test("owner receives a launch-completion event when its daemon exits", async () => {
     const eventCwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-hub-evt-"));

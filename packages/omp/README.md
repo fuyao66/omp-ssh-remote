@@ -18,7 +18,9 @@ Background execution is split by ownership rather than by tool name:
 - `hub start/ps/logs/stop/restart/describe`, and `send`/`wait` addressed to a process `name`, run in the native OMP broker on the remote host, so the service starts beside the project with the remote environment. Process exit notifications reach the local model exactly as native launch completions do. `hub list/inbox/jobs/cancel` and peer `send`/`wait` never leave the local host.
 - On `/remote-exit`, session shutdown, or transport loss the companion stops the supervised processes this session started unless they were launched with `persist` or `detached`; those survive by explicit request, like native OMP.
 
-Ordinary non-isolated subagents inherit the connection configuration but receive independent companion processes. The remote host does not install OMP; the companion reports the host package version it was compiled against as identity metadata. Admission compares the remote runtime contract and exact native tool schemas rather than requiring equal OMP package versions. `task isolated:true` and artifact transfer are not supported and fail closed.
+Ordinary non-isolated subagents inherit the connection configuration but receive independent companion processes. Admission compares the remote execution contract and native tool schemas; hub's local peer/job fields are excluded. `task isolated:true` remains explicitly rejected. Native host approval rules are preserved and connection waits for wrapper activation.
+
+Truncated output is stored remotely under `~/.cache/omp-ssh-remote/artifacts`. Use returned `remote-artifact://<namespace>/<id>` references with `read` selectors or `grep` while connected to that host. These files persist across disconnects; they are not copied locally or automatically expired. Local `artifact://` references remain local. The `xd://debug` entry executes remotely like direct debug.
 
 ```mermaid
 flowchart LR
@@ -111,7 +113,7 @@ First upload of the x64 worker took `32.7 s`; cached connections avoid that tran
 
 - Linux glibc x86_64 and ARM64 only;
 - OMP `>=18.0.0` with matching compiled companion schemas;
-- no async Bash / local `hub` job bridge;
+- explicit async Bash is supported; automatic backgrounding and interactive Bash PTY are not bridged;
 - no `task isolated:true` remote worktrees;
 - no remote-to-local artifact bridge;
 - no output frame above 16 MiB;

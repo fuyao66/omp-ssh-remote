@@ -48,10 +48,10 @@ export class RemoteRuntimeClient {
   #closed = false;
   #nextId = 1;
   readonly #exitPromise: Promise<number | null>;
-  readonly #eventListeners = new Set<(event: EventMessage) => void>();
+  readonly #eventListeners = new Set<(event: EventMessage) => void | Promise<void>>();
 
   /** Subscribe to unsolicited worker events; returns an unsubscribe. */
-  onEvent(listener: (event: EventMessage) => void): () => void {
+  onEvent(listener: (event: EventMessage) => void | Promise<void>): () => void {
     this.#eventListeners.add(listener);
     return () => {
       this.#eventListeners.delete(listener);
@@ -167,12 +167,13 @@ export class RemoteRuntimeClient {
     try {
       this.#send({ type: "shutdown" });
       this.#process.stdin?.end();
-      await withTimeout(
+      const code = await withTimeout(
         this.#exitPromise,
         timeoutMs,
         `Remote runtime shutdown timed out after ${timeoutMs}ms`,
       );
       this.#close(new Error("Remote runtime closed"));
+      if (code !== 0) throw new Error(`Remote runtime cleanup failed (exit ${code})`);
     } catch (error) {
       this.#terminate(error);
       throw error;
@@ -224,10 +225,11 @@ export class RemoteRuntimeClient {
       return;
     }
     if (message.type === "event") {
-      for (const listener of this.#eventListeners) {
-        try {
-          listener(message);
-        } catch {}
+      if (this.#eventListeners.size > 0) {
+        void Promise.all([...this.#eventListeners].map((listener) => listener(message))).then(() => {
+          const id = message.payload.completionId;
+          if (typeof id === "string") this.#send({ type: "event-ack", id });
+        }).catch((error) => this.#terminate(error));
       }
       return;
     }

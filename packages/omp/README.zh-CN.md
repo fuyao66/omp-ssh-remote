@@ -18,7 +18,9 @@ OMP SSH Remote 将 Oh My Pi 控制面保留在本机，同时通过 SSH 在远�
 - `hub start/ps/logs/stop/restart/describe`，以及指向进程 `name` 的 `send`/`wait`，在远端主机上的 OMP 原生 broker 中执行，服务与项目同机启动并使用远端环境。进程退出通知会像原生 launch completion 一样送达本机模型。`hub list/inbox/jobs/cancel` 与 peer `send`/`wait` 永不离开本机。
 - `/remote-exit`、session 关闭或传输丢失时，companion 会停止本 session 启动的受监管进程；以 `persist` 或 `detached` 启动的进程按显式要求存活，与原生 OMP 一致。
 
-普通非隔离子代理继承连接配置，但各自使用独立 companion。远端主机不安装 OMP；companion 报告编译时所针对的宿主包版本，仅作为身份元数据。准入比较远端 runtime 契约与精确原生工具 schema，而不是要求 OMP 包版本完全相等。`task isolated:true` 和 artifact transfer 尚不支持，并采用 fail-closed。
+普通非隔离子代理继承连接配置，但各自使用独立 companion。准入比较远端执行契约和原生工具 schema；hub 的本机 peer/job 参数不参与比较。`task isolated:true` 继续明确拒绝。保留宿主原生审批规则，连接返回前等待 wrapper 激活。
+
+截断输出保存在远端 `~/.cache/omp-ssh-remote/artifacts`。连接到同一主机后，可用 `read` selector 或 `grep` 读取返回的 `remote-artifact://<namespace>/<id>`。文件在断连后保留，不复制到本机，也不自动过期。本机 `artifact://` 仍保持本机语义。`xd://debug` 与直接 debug 一样在远端执行。
 
 ```mermaid
 flowchart LR
@@ -111,7 +113,7 @@ x64 worker 首次上传耗时 `32.7 s`；缓存连接不再传输 worker。数�
 
 - 仅支持 Linux glibc x86_64 和 ARM64；
 - OMP `>=18.0.0`，且 companion schema 匹配；
-- 不支持 async Bash / 本机 `hub` job bridge；
+- 支持显式 async Bash；不桥接自动后台化和交互 Bash PTY；
 - 不支持 `task isolated:true` 远端 worktree；
 - 不支持远端到本机 artifact bridge；
 - 单个输出 frame 不能超过 16 MiB；

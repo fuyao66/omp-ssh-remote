@@ -20,6 +20,7 @@ import {
 } from "./protocol.ts";
 import { pathShouldStayLocal } from "./path-domain.ts";
 import { createRemoteHubLaunchTool } from "./omp/hub-launch.ts";
+import { createRemoteArtifacts, resolveRemoteArtifacts } from "./omp/artifacts.ts";
 export interface RemoteNativeTool {
   readonly name: string;
   readonly description: string;
@@ -111,7 +112,7 @@ export type NativeWorkerRuntimeOptions = {
   /** Owner identity for remote supervised processes (local OMP session id). */
   sessionId?: string;
   /** Receives broker completion notifications for daemons this owner started. */
-  onLaunchCompletion?: (notification: DaemonCompletionNotification) => void;
+  onLaunchCompletion?: (notification: DaemonCompletionNotification) => void | Promise<void>;
 };
 
 export async function createNativeWorkerRuntime(
@@ -124,11 +125,12 @@ export async function createNativeWorkerRuntime(
   if (!cwdStat.isDirectory())
     throw new Error(`Remote cwd is not a directory: ${cwd}`);
   const absoluteCwd = await realpath(resolvedCwd);
+  const artifacts = await createRemoteArtifacts();
   const settings = Settings.isolated(WORKER_OVERRIDES);
   const mutationVersions = new Map<string, number>();
   const pendingInvokers = new PendingInvokerQueueAdapter();
   const xdevTools = new Map<string, RemoteNativeTool>();
-  const xdevMountedNames = new Set<string>(["lsp", "ast_grep", "ast_edit"]);
+  const xdevMountedNames = new Set<string>(["lsp", "ast_grep", "ast_edit", "debug"]);
   const callableTools = new Map<string, RemoteNativeTool>();
   const sessionId = options.sessionId ?? `omp-ssh-remote:${hostVersion}`;
   const disposeCallbacks = new Set<() => void>();
@@ -144,7 +146,9 @@ export async function createNativeWorkerRuntime(
     getSessionFile: () => null,
     getSessionSpawns: () => "",
     getSessionId: () => sessionId,
-    getArtifactsDir: () => null,
+    getArtifactsDir: () => artifacts.manager.dir,
+    getArtifactManager: () => artifacts.manager,
+    allocateOutputArtifact: (type) => artifacts.manager.allocatePath(type),
     registerDisposeCallback: (callback) => {
       disposeCallbacks.add(callback);
       return () => {
@@ -154,7 +158,7 @@ export async function createNativeWorkerRuntime(
     ...(options.onLaunchCompletion
       ? {
           queueLaunchCompletion: async (notification) => {
-            options.onLaunchCompletion?.(notification);
+            await options.onLaunchCompletion?.(notification);
           },
         }
       : {}),
@@ -197,6 +201,13 @@ export async function createNativeWorkerRuntime(
     debug: asRemoteNativeTool(new DebugTool(session)),
     hub: createRemoteHubLaunchTool(session),
   };
+  for (const tool of Object.values(tools)) {
+    const execute = tool.execute.bind(tool);
+    tool.execute = async (id, params, signal, onUpdate, context) => artifacts.publish(
+      await execute(id, await resolveRemoteArtifacts(params) as Record<string, unknown>, signal,
+        onUpdate ? (value) => onUpdate(artifacts.publish(value)) : undefined, context),
+    );
+  }
   const evalCallableNames = REMOTE_TOOL_NAMES.filter(
     (name) => name !== "eval" && name !== "ast_edit" && name !== "hub",
   );

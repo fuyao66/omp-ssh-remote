@@ -16,8 +16,8 @@ export function normalizePathArgument(value: unknown): string {
 
 function classifyPathDomains(paths: string[]): boolean {
   const concrete = paths.map((path) => path.trim()).filter(Boolean);
-  const hasLocal = concrete.some(isInternalUri);
-  const hasRemote = concrete.some((path) => !isInternalUri(path));
+  const hasLocal = concrete.some((path) => isInternalUri(path) && !path.startsWith("remote-artifact://"));
+  const hasRemote = concrete.some((path) => !isInternalUri(path) || path.startsWith("remote-artifact://"));
   if (hasLocal && hasRemote) {
     throw new Error(
       "One tool call cannot mix local internal URIs with remote filesystem paths",
