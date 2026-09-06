@@ -980,7 +980,8 @@ describe("inherited child ownership", () => {
     await piTintinExtension(mock.pi as never);
 
     await mock.commands.get("remote-exit")?.handler("", {
-      reload: async () => {},
+      waitForIdle: async () => {},
+      reload: async () => { await mock.handlers.get("session_start")?.({}); },
       ui: { notify: () => {} },
     });
 

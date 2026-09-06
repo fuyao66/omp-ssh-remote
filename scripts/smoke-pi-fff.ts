@@ -44,9 +44,11 @@ const uiContext = session.extensionRunner.createContext().ui;
 await session.bindExtensions({ mode: "print", uiContext: { ...uiContext,
   addAutocompleteProvider(factory) { provider = factory(provider); },
 }, commandContextActions: {
-  waitForIdle: async () => {}, newSession: async () => ({ cancelled: true }),
+  waitForIdle: () => session.waitForIdle(), newSession: async () => ({ cancelled: true }),
   fork: async () => ({ cancelled: true }), navigateTree: async () => ({ cancelled: true }),
-  switchSession: async () => ({ cancelled: true }), reload: async () => session.reload(),
+  switchSession: async () => ({ cancelled: true }), reload: async () => {
+    if (!session.isStreaming && !session.isCompacting) await session.reload();
+  },
 }});
 const text = (value: unknown): string => {
   if (!value || typeof value !== "object" || !("content" in value) || !Array.isArray(value.content)) {
@@ -140,6 +142,24 @@ try {
   connected = false;
   const restored = text(await execute(searchTool, { pattern: "LOCAL_ONLY_WORKSPACE_MARKER" }));
   if (!restored.includes(probeName)) throw new Error(`Local FFF not restored: ${restored}`);
+  const restoredHost = text(await execute("bash", { command: "hostname" })).trim();
+  if (restoredHost !== hostname()) throw new Error(`Local bash not restored: ${restoredHost}`);
+  if (!text(await execute("read", { path: probeName })).includes("LOCAL_ONLY_WORKSPACE_MARKER")) throw new Error("Local read not restored");
+  await execute("write", { path: probeName, content: "LOCAL_AFTER_EXIT\n" });
+  await execute("edit", { path: probeName, edits: [{ oldText: "LOCAL_AFTER_EXIT", newText: "LOCAL_AFTER_EDIT" }] });
+  if (!text(await execute("read", { path: probeName })).includes("LOCAL_AFTER_EDIT")) throw new Error("Local write/edit not restored");
+  if (withRtk) {
+    const auto = text(await execute("bash", { command: "ls -1 /" }));
+    const explicit = text(await execute("bash", { command: "rtk ls -1 /" }));
+    const raw = text(await execute("bash", { command: "rtk proxy ls -1 /" }));
+    if (auto !== explicit || auto === raw) throw new Error("Local RTK rewrite not restored");
+  }
+  await execute("remote_connect", { target, cwd: remoteCwd });
+  connected = true;
+  if (text(await execute("bash", { command: "hostname" })).trim() !== remoteHost) throw new Error("Reconnect did not restore remote execution");
+  await session.prompt("/remote-exit");
+  connected = false;
+  if (text(await execute("bash", { command: "hostname" })).trim() !== hostname()) throw new Error("Healthy exit did not restore local bash");
   console.log(JSON.stringify({ remoteHost, local, remote: result, restored, nativeRenderers: true, remoteReload: true }));
 } finally {
   if (connected) {

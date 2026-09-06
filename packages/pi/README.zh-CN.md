@@ -62,7 +62,7 @@ FFF 平台共享库内嵌到独立 worker，不在运行时下载。交叉编译
 
 其他已有插件可以保留。不要同时加载原始 FFF 与托管 FFF factory。托管入口通过公开 ExtensionAPI facade 调用真实上游插件，不修改 node_modules、不重写搜索算法。原生工具定义、补全、health/rescan 回调被保留，连接远端前关闭本地 finder。未经托管的 FFF 会被拒绝远端激活，而不是静默查询本地。
 
-修改配置后 `/reload` 或重启 Pi。连接中 reload 保留远端绑定，不启动本地 FFF finder；`/remote-exit` 关闭 companion，并重建本地插件生命周期。
+修改配置后 `/reload` 或重启 Pi。连接中 reload 保留远端绑定，不启动本地 FFF finder；`/remote-exit` 等待 Pi 空闲后关闭 companion，并重建本地插件生命周期。只有新会话生命周期确认恢复才算退出完成，不把 reload 调用返回视为成功。模型调用 `remote_exit` 返回已排队，让当前响应先结束；恢复完成前阻止工作区调用和重连。重载被跳过或失败时保留不可用状态，空闲后可再次运行 `/remote-exit` 恢复。
 
 ## 可选托管 RTK
 

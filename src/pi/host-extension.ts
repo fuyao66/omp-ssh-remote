@@ -34,11 +34,7 @@ import { managedPlugins, managedToolSnapshots } from "./managed-plugins.ts";
 import { publishSessionContext, restoreSessionContext, releaseSessionContext } from "./session-context.ts";
 const STATE_KEY = Symbol.for("pi-ssh-remote/state");
 
-type PendingReload = {
-  promise: Promise<void>;
-  resolve: () => void;
-  reject: (error: unknown) => void;
-};
+type PendingReload = { restored: boolean };
 
 export function filterStaleRemoteWrappers(
   tools: readonly ToolInfo[],
@@ -129,9 +125,7 @@ export function getPiRemoteStateForSession(
 function beginPendingReload(state: PiRemoteExtensionState): PendingReload {
   const existing = state.pendingReload;
   if (existing) return existing;
-  const { promise, resolve, reject } = Promise.withResolvers<void>();
-  void promise.catch(() => {});
-  const pending = { promise, resolve, reject };
+  const pending = { restored: false };
   state.pendingReload = pending;
   return pending;
 }
@@ -143,8 +137,7 @@ function finishPendingReload(
   const pending = state.pendingReload;
   if (!pending) return;
   state.pendingReload = undefined;
-  if (error === undefined) pending.resolve();
-  else pending.reject(error);
+  pending.restored = error === undefined;
 }
 
 export function getPiRemoteState(): PiRemoteExtensionState {
@@ -529,7 +522,7 @@ export async function installPiRemoteExtension(
         "Child sessions can only restore a parent Pi remote connection",
       );
     }
-    await state.pendingReload?.promise;
+    if (state.pendingReload) throw new Error("Remote exit is pending; reconnect after the current response finishes and local tools are restored.");
     const assembly = await resolveCurrentAssembly();
     const configuredHosts = await loadConfiguredSshHosts(localCwd);
     const parsed =
@@ -658,17 +651,17 @@ export async function installPiRemoteExtension(
         typeof params === "object" &&
         (params as Record<string, unknown>).force === true;
       const command = force ? "/remote-exit --force" : "/remote-exit";
-      const pendingReload = beginPendingReload(state);
+      beginPendingReload(state);
       setImmediate(() => {
         pi.sendUserMessage(command, {
           deliverAs: "steer",
           expandPromptTemplates: true,
         });
       });
-      await pendingReload.promise;
+      // The command waits for idle; this tool must finish before that can happen.
       return {
-        content: [{ type: "text", text: `Disconnected (${command})` }],
-        details: { queued: false, command },
+        content: [{ type: "text", text: `Queued ${command}; local tools are restored after the current response finishes.` }],
+        details: { queued: true, command },
       } as never;
     },
   });
@@ -703,10 +696,12 @@ export async function installPiRemoteExtension(
       const force = args.trim() === "--force";
       if (!state.selected && !state.scope) {
         ctx.ui?.notify?.("Not connected to a remote runtime.", "warning");
+        finishPendingReload(state);
         return;
       }
-      beginPendingReload(state);
+      const pendingReload = beginPendingReload(state);
       try {
+        await ctx.waitForIdle();
         const inheritedChild = state.isInheritedChild;
         await binding.close(force);
         state.selected = false;
@@ -726,17 +721,18 @@ export async function installPiRemoteExtension(
           "info",
         );
         await ctx.reload();
-        finishPendingReload(state);
+        if (!pendingReload.restored) {
+          throw new Error("Pi did not rebuild the local tool set. Wait until idle and run /remote-exit again.");
+        }
         return;
       } catch (error) {
         finishPendingReload(state, error);
+        state.selected = true;
+        binding.fail(error);
         state.ownershipVerified = false;
         state.connectionError =
           error instanceof Error ? error.message : String(error);
-        ctx.ui?.notify?.(
-          `Failed to disconnect: ${state.connectionError}`,
-          "error",
-        );
+        throw error;
       }
     },
   });
@@ -768,6 +764,9 @@ export async function installPiRemoteExtension(
       ...(state.assembly?.knownWorkspaceTools ?? []),
       ...(state.ready?.tools.map((tool) => tool.name) ?? []),
     ]);
+    if (state.pendingReload && guardedNames.has(event.toolName)) {
+      return { block: true, reason: "Remote exit is pending; workspace tools resume after the local tool set is rebuilt." };
+    }
     if (!state.selected || !guardedNames.has(event.toolName)) return;
     if (!state.scope || state.scope.isClosed) {
       return {
@@ -797,7 +796,7 @@ export async function installPiRemoteExtension(
       if (state.selected && state.ready && state.assembly) registerRemoteWrappers(state.ready, state.assembly);
     }
     registeredRemoteTools = new Set();
-    if (inheritedSpec && !state.selected && !state.scope) {
+    if (inheritedSpec && !state.inheritanceDisabled && !state.selected && !state.scope) {
       state.isInheritedChild = true;
       try {
         const assembly = restorePiRuntimeAssembly(
@@ -833,6 +832,13 @@ export async function installPiRemoteExtension(
     } else if (state.localActiveTools) {
       pi.setActiveTools(state.localActiveTools);
       state.localActiveTools = undefined;
+    }
+    if (!state.selected && state.pendingReload) {
+      const allTools = pi.getAllTools();
+      if (filterStaleRemoteWrappers(allTools).length !== allTools.length) {
+        throw new Error("Pi reload retained remote workspace tools; local restoration was not completed");
+      }
+      finishPendingReload(state);
     }
   });
 

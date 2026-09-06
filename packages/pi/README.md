@@ -62,7 +62,7 @@ Keep the upstream npm package installed but disable its direct extension entry. 
 
 The managed entry invokes the actual upstream factory through a public ExtensionAPI facade. It does not patch installed files or reimplement search. It preserves native tool definitions, captures native completion/health/rescan callbacks, and stops the local finder before remote activation. An unmanaged FFF installation is rejected for remote activation instead of silently searching local files.
 
-Use `/reload` or restart Pi after changing extension configuration. During an active remote connection, reload retains the remote binding without starting a local FFF finder. `/remote-exit` closes the companion and reloads the local plugin lifecycle.
+Use `/reload` or restart Pi after changing extension configuration. During an active remote connection, reload retains the remote binding without starting a local FFF finder. `/remote-exit` waits until Pi is idle, closes the companion, and reloads the local plugin lifecycle. Local restoration is acknowledged by the new session lifecycle, not merely by the reload call returning. Model-invoked `remote_exit` returns a queued result so the current response can finish; workspace calls and reconnects are blocked until restoration completes. A skipped or failed reload leaves the workspace unavailable; run `/remote-exit` again when idle.
 
 ## Optional managed RTK
 
