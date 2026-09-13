@@ -65,6 +65,8 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 链接后重启 OMP。更新时执行 `git pull`，重新构建 extension 和 workers，再重启或 reload plugin。连接状态下 reload 会关闭该 session 的 companion，之后需要重新连接。
 
+当前 companion 基于 OMP 18.1.19 构建。宿主升级导致工具参数变化时，需要同步固定的 OMP 构建依赖并重建两个架构的 worker；只 reload extension 不会更新远端原生执行语义。原生构建缓存按架构和版本隔离。
+
 ## 连接与操作
 
 可以使用标准 `~/.ssh/config` alias 或 OMP `/ssh add` 记录：

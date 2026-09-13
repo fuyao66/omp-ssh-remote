@@ -30,7 +30,7 @@ const addonFiles =
     : [{ variant: "default" as const, filename: `pi_natives.${archTag}.node` }];
 
 const root = resolve(import.meta.dir, "..");
-const cache = resolve(root, `.cache/native-${archTag}`);
+const cache = resolve(root, `.cache/native-${archTag}`, hostVersion);
 const packageDir = resolve(cache, "package");
 const archivePath = resolve(cache, `embedded-addons.${archTag}.tar.gz`);
 const embeddedModule = resolve(cache, "embedded-addon.ts");
