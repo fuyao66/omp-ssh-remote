@@ -65,7 +65,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 Restart OMP after linking. Updating requires `git pull`, rebuilding the extension and workers, then restarting or reloading the plugin. Reloading while connected closes that session's companion; reconnect afterward.
 
-The companion is currently built against OMP 18.1.19. After a host upgrade changes tool parameters, update the pinned OMP build dependencies and rebuild both workers; reloading the extension alone does not update native runtime semantics. Native build caches are isolated by architecture and version.
+The companion is currently built against OMP 18.2.3. After a host upgrade changes tool parameters, update the pinned OMP build dependencies and rebuild both workers; reloading the extension alone does not update native runtime semantics. Native build caches are isolated by architecture and version.
 
 ## Connect and Operate
 
