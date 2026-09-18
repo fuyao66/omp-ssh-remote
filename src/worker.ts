@@ -96,6 +96,9 @@ async function cleanupWorker(reason: Error): Promise<void> {
       Bun.sleep(5_000),
     ]);
     await closeDaemonClients().catch(() => undefined);
+    // Artifacts only matter while this worker can still serve remote-artifact://
+    // reads; once the transport is gone they are unreachable, so free them.
+    await runtime?.dispose().catch(() => undefined);
   })();
   return cleanupPromise;
 }
@@ -124,6 +127,7 @@ async function initialize(request: InitializeRequest): Promise<void> {
   launchOwner = request.sessionId;
   runtime = await createNativeWorkerRuntime(request.cwd, hostVersion, {
     sessionId: request.sessionId,
+    settings: request.settings,
     onLaunchCompletion: (notification) => new Promise<void>((resolve, reject) => {
       pendingEvents.set(notification.completionId, { resolve, reject });
       send({ type: "event", event: "launch-completion", payload: notification as unknown as Record<string, unknown> });
@@ -160,6 +164,10 @@ function startExecute(request: ExecuteRequest): void {
     return;
   }
   const controller = new AbortController();
+  // Native tools read `ctx?.toolNames` (bash interceptor) and `ctx?.ui` /
+  // `hasUI` (interactive PTY). The companion has no UI, so only the active
+  // tool names the local session reported are materialized here.
+  const context = request.toolNames ? { toolNames: request.toolNames, hasUI: false } : undefined;
   const done = (async () => {
     try {
       const result = await tool.execute(
@@ -167,7 +175,7 @@ function startExecute(request: ExecuteRequest): void {
         request.args,
         controller.signal,
         (partial: unknown) => send({ type: "update", id: request.id, result: partial }),
-        undefined,
+        context,
       );
       send({ type: "result", id: request.id, result });
     } catch (error) {

@@ -26,17 +26,21 @@ describe("OMP extension loading", () => {
     expect([...commands].sort()).toEqual([
       "remote-connect",
       "remote-exit",
+      "remote-reconnect",
       "remote-status",
     ]);
     expect(events.has("context")).toBe(false);
     const status = tools.get("remote_workspace_status");
     const connect = tools.get("remote_connect");
     const exit = tools.get("remote_exit");
+    const reconnect = tools.get("remote_reconnect");
 
     expect(status?.approval).toBe("read");
     expect(status?.loadMode).toBe("essential");
     expect(connect?.approval).toBe("exec");
     expect(connect?.loadMode).toBe("essential");
+    expect(reconnect?.approval).toBe("exec");
+    expect(reconnect?.loadMode).toBe("essential");
     expect(exit?.approval).toBe("exec");
     expect(exit?.loadMode).toBe("essential");
 
@@ -57,6 +61,12 @@ describe("OMP extension loading", () => {
         connectionError: null,
         remoteWorkspaceTools: [],
         pendingRemoteAstProposals: 0,
+        hostCompatibility: {
+          installedHostVersion: expect.any(String),
+          compiledHostVersion: null,
+          compatible: false,
+          advice: expect.stringContaining("not built with a pinned OMP version"),
+        },
         routing: {
           ordinaryFilesystemPaths: "local native tools",
           internalUris: "local control plane",
@@ -97,5 +107,24 @@ describe("OMP extension loading", () => {
       mergeCallAndResult: true,
       inline: true,
     });
+  });
+
+  test("remote_reconnect fails closed when nothing is selected", async () => {
+    const tools = new Map<string, ToolDefinition>();
+    const api = {
+      registerCommand() {},
+      registerTool(tool: ToolDefinition) {
+        tools.set(tool.name, tool);
+      },
+      on() {},
+    };
+    await remoteRuntimeExtension(api as unknown as ExtensionAPI);
+    const reconnect = tools.get("remote_reconnect");
+    expect(reconnect).toBeDefined();
+    await expect(
+      reconnect!.execute("call-1", {}, undefined as never, undefined, {
+        ui: { notify() {}, setStatus() {} },
+      } as never),
+    ).rejects.toThrow("No remote runtime is selected");
   });
 });

@@ -167,6 +167,7 @@ try {
     "remote_workspace_status",
     "remote_connect",
     "remote_exit",
+    "remote_reconnect",
   ]);
   if (
     tools.size !== expectedToolNames.size ||
@@ -305,6 +306,51 @@ try {
   );
   if (!JSON.stringify(afterResolve).includes("newApi"))
     throw new Error("Resolved AST proposal did not update the remote file");
+
+  // `git worktree add` must run as git on the remote host, not be rewritten
+  // into a worker self-invocation (worktree.clone is pinned off remotely).
+  const worktreeProbe = await bash.execute(
+    "adapter-worktree",
+    {
+      command:
+        "rm -rf wt-smoke && mkdir wt-smoke && cd wt-smoke && git init -q -b main . && git -c user.email=a@b -c user.name=t commit -q --allow-empty -m init && git worktree add -q ../wt-smoke-branch -b smoke && git worktree list | grep -c wt-smoke-branch; cd .. && rm -rf wt-smoke wt-smoke-branch",
+    },
+    AbortSignal.timeout(30_000),
+    undefined,
+    invokeContext,
+  );
+  if (!/"text":"1\\n/.test(JSON.stringify(worktreeProbe)))
+    throw new Error(`Remote git worktree add did not create a worktree: ${JSON.stringify(worktreeProbe).slice(0, 300)}`);
+
+  // Transport loss + /remote-reconnect: kill the local SSH child (the same
+  // failure `/remote-reconnect` exists for), then reconnect. Routing must resume
+  // on the same family without re-registering wrappers, and a file written
+  // before the loss must still be visible (same remote cwd).
+  const reconnect = commands.get("remote-reconnect");
+  if (!reconnect) throw new Error("remote-reconnect command was not registered");
+  await bash.execute("adapter-pre-loss", { command: "echo pre-loss > reconnect.txt" }, undefined, undefined, invokeContext);
+  const sshPids = Bun.spawnSync(["pgrep", "-f", "^ssh .*exec .*\\.cache/omp-ssh-remote/"]).stdout.toString().trim().split(/\s+/).filter(Boolean);
+  if (sshPids.length === 0) throw new Error("Could not find the local SSH transport child to kill");
+  for (const pid of sshPids) process.kill(Number(pid), "SIGKILL");
+  const lostStart = Date.now();
+  while (Date.now() - lostStart < 10_000) {
+    const status = await workspaceStatus.execute("status-lost", {}, undefined, undefined, invokeContext);
+    if ((status.details as { transport?: string }).transport === "unavailable") break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  await bash.execute("adapter-during-loss", { command: "true" }, undefined, undefined, invokeContext).then(
+    () => { throw new Error("bash succeeded while the transport was dead (local fallback leak)"); },
+    () => undefined,
+  );
+  await reconnect.handler("", commandContext);
+  const afterReconnect = await workspaceStatus.execute("status-after-reconnect", {}, undefined, undefined, invokeContext);
+  const afterDetails = afterReconnect.details as { mode?: string; remoteCwd?: string | null };
+  if (afterDetails.mode !== "remote" || afterDetails.remoteCwd !== cwd)
+    throw new Error(`Reconnect did not restore the remote family: ${JSON.stringify(afterReconnect.details)}`);
+  const afterLoss = await bash.execute("adapter-post-reconnect", { command: "cat reconnect.txt" }, undefined, undefined, invokeContext);
+  if (!JSON.stringify(afterLoss).includes("pre-loss"))
+    throw new Error(`Reconnected transport did not reach the same remote cwd: ${JSON.stringify(afterLoss).slice(0, 300)}`);
+  const remoteReconnect = "ok";
 
   const lspStatus = await lsp.execute(
     "adapter-lsp-status",
@@ -560,6 +606,7 @@ try {
       remoteEval: "ok",
       remoteDebug,
       remoteHub,
+      remoteReconnect,
       remoteHubCleanupAfterExit: survivors === 0 ? "ok" : `FAILED: ${survivors} still running`,
       localFallback: "ok",
       notices,

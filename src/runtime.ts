@@ -21,6 +21,7 @@ import {
 import { pathShouldStayLocal } from "./path-domain.ts";
 import { createRemoteHubLaunchTool } from "./omp/hub-launch.ts";
 import { createRemoteArtifacts, resolveRemoteArtifacts } from "./omp/artifacts.ts";
+import type { RemoteExecutionSettings } from "./omp/execution-settings.ts";
 export interface RemoteNativeTool {
   readonly name: string;
   readonly description: string;
@@ -82,6 +83,10 @@ class PendingInvokerQueueAdapter {
   }
 }
 
+/**
+ * Structural pins. These decide tool wire schemas or execution-domain
+ * ownership and therefore always win over anything the local host forwards.
+ */
 const WORKER_OVERRIDES = {
   "async.enabled": false,
   "bash.autoBackground.enabled": false,
@@ -100,12 +105,17 @@ const WORKER_OVERRIDES = {
   "eval.jl": false,
   "tools.xdev": false,
   "debug.enabled": true,
+  // `git worktree add` would otherwise be rewritten into `<worker binary>
+  // worktree add ...`, which the companion binary does not implement.
+  "worktree.clone": false,
 } as const;
 
 export type NativeWorkerRuntime = {
   cwd: string;
   tools: Readonly<Record<RemoteToolName, RemoteNativeTool>>;
   session: ToolSession;
+  /** Release runtime-owned host resources (the output artifact namespace). Idempotent. */
+  dispose: () => Promise<void>;
 };
 
 export type NativeWorkerRuntimeOptions = {
@@ -113,6 +123,8 @@ export type NativeWorkerRuntimeOptions = {
   sessionId?: string;
   /** Receives broker completion notifications for daemons this owner started. */
   onLaunchCompletion?: (notification: DaemonCompletionNotification) => void | Promise<void>;
+  /** Execution-domain settings forwarded by the local host; structural pins win. */
+  settings?: RemoteExecutionSettings;
 };
 
 export async function createNativeWorkerRuntime(
@@ -126,7 +138,10 @@ export async function createNativeWorkerRuntime(
     throw new Error(`Remote cwd is not a directory: ${cwd}`);
   const absoluteCwd = await realpath(resolvedCwd);
   const artifacts = await createRemoteArtifacts();
-  const settings = Settings.isolated(WORKER_OVERRIDES);
+  const settings = Settings.isolated({
+    ...(options.settings ?? {}),
+    ...WORKER_OVERRIDES,
+  });
   const mutationVersions = new Map<string, number>();
   const pendingInvokers = new PendingInvokerQueueAdapter();
   const xdevTools = new Map<string, RemoteNativeTool>();
@@ -229,5 +244,7 @@ export async function createNativeWorkerRuntime(
   }
   for (const name of xdevMountedNames)
     xdevTools.set(name, tools[name as RemoteToolName]);
-  return { cwd: absoluteCwd, tools, session };
+  let disposed: Promise<void> | undefined;
+  const dispose = () => (disposed ??= artifacts.dispose());
+  return { cwd: absoluteCwd, tools, session, dispose };
 }

@@ -16,7 +16,7 @@ import { RemoteRuntimeClient } from "./client.ts";
 import { prepareRemoteWorker, resolveRemoteHome } from "./deploy.ts";
 import { REMOTE_TOOL_NAMES, type RemoteToolName } from "./protocol.ts";
 import { createOmpRuntimeHandshake, toolParametersToWire } from "./omp/runtime-contract.ts";
-import { resolveOmpHostVersion } from "./omp/host-identity.ts";
+import { ompHostCompatibility, resolveOmpHostVersion, type OmpHostCompatibility } from "./omp/host-identity.ts";
 import { createNativeWorkerRuntime } from "./runtime.ts";
 import {
   isInternalUri,
@@ -34,6 +34,24 @@ import { isHubLaunchOperation } from "./omp/hub-ops.ts";
 import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { VERSION as INSTALLED_OMP_VERSION } from "@oh-my-pi/pi-utils";
+import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { captureExecutionSettings, type RemoteExecutionSettings } from "./omp/execution-settings.ts";
+
+/**
+ * Snapshot the execution-domain subset of the local session's settings.
+ * `findScopedSettings()` resolves the extension's active settings scope, so a
+ * project-level `config.yml` is honoured; when no settings are initialized
+ * (bare test harnesses) nothing is forwarded and the companion keeps defaults.
+ */
+export function captureLocalExecutionSettings(): RemoteExecutionSettings {
+  try {
+    const scoped = findScopedSettings();
+    return scoped ? captureExecutionSettings(scoped) : {};
+  } catch {
+    return {};
+  }
+}
 
 function asyncBashAvailable(): boolean {
   return resolveLocalAsyncJobManager() !== undefined;
@@ -95,6 +113,12 @@ export type RemoteWorkspaceStatus = {
   connectionError: string | null;
   remoteWorkspaceTools: RemoteToolName[];
   pendingRemoteAstProposals: number;
+  hostCompatibility: {
+    installedHostVersion: string | null;
+    compiledHostVersion: string | null;
+    compatible: boolean;
+    advice: string | null;
+  };
   routing: {
     ordinaryFilesystemPaths: string;
     internalUris: string;
@@ -115,6 +139,7 @@ type RemoteWorkspaceStatusInput = {
   owner: boolean;
   wrappedTools: Iterable<RemoteToolName>;
   proposalSources: Iterable<ExecutionTarget>;
+  hostCompatibility?: OmpHostCompatibility;
 };
 
 export function workspaceStatus(
@@ -146,6 +171,12 @@ export function workspaceStatus(
     pendingRemoteAstProposals: [...input.proposalSources].filter(
       (source) => source === "remote",
     ).length,
+    hostCompatibility: {
+      installedHostVersion: input.hostCompatibility?.installedHostVersion ?? null,
+      compiledHostVersion: input.hostCompatibility?.compiledHostVersion ?? null,
+      compatible: input.hostCompatibility?.compatible ?? false,
+      advice: input.hostCompatibility?.advice ?? null,
+    },
     routing: {
       ordinaryFilesystemPaths:
         mode === "remote"
@@ -211,6 +242,8 @@ type RemoteExtensionState = {
   owner: boolean;
   family?: RemoteFamily;
   connectionError?: string;
+  /** Active tool names of the local session; forwarded so the remote bash interceptor sees the real tool set. */
+  activeToolNames: () => string[] | undefined;
 };
 type RemoteFamily = {
   ownerSessionFile: string;
@@ -501,6 +534,7 @@ async function executeWithTarget(
       params,
       signal,
       onUpdate,
+      { toolNames: state.activeToolNames() },
     )) as AgentToolResult;
   } catch (error) {
     throw new Error(
@@ -557,6 +591,7 @@ function startRemoteAsyncBash(
         remoteParams,
         signal,
         onUpdate,
+        { toolNames: state.activeToolNames() },
       )) as AgentToolResult;
     },
   });
@@ -620,15 +655,21 @@ async function ompHandshake(_pi: ExtensionAPI) {
     process.cwd(),
     hostVersion,
   );
-  return createOmpRuntimeHandshake({
-    hostVersion,
-    localTools: REMOTE_TOOL_NAMES.map((name) => {
-      const native = nativeRuntime.tools[name];
-      if (!native)
-        throw new Error(`OMP native tool metadata is unavailable: ${name}`);
-      return { name, parameters: toolParametersToWire(native.parameters) };
-    }),
-  });
+  try {
+    return createOmpRuntimeHandshake({
+      hostVersion,
+      localTools: REMOTE_TOOL_NAMES.map((name) => {
+        const native = nativeRuntime.tools[name];
+        if (!native)
+          throw new Error(`OMP native tool metadata is unavailable: ${name}`);
+        return { name, parameters: toolParametersToWire(native.parameters) };
+      }),
+    });
+  } finally {
+    // This runtime exists only to capture schemas; it never executes tools,
+    // so its artifact namespace would otherwise be an orphan on every connect.
+    await nativeRuntime.dispose().catch(() => undefined);
+  }
 }
 
 
@@ -735,6 +776,112 @@ function launchOwnerId(ctx: ExtensionContext | undefined): string | undefined {
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
+/** Spawn the SSH worker, run the admission handshake, and bind event delivery. */
+async function openRemoteTransport(
+  pi: ExtensionAPI,
+  connection: RemoteConnectOptions & { workerPath: string },
+  cwd: string,
+  sessionId: string | undefined,
+): Promise<{ client: RemoteRuntimeClient; ready: Awaited<ReturnType<RemoteRuntimeClient["initialize"]>> }> {
+  const handshake = await ompHandshake(pi);
+  const client = new RemoteRuntimeClient({
+    command: buildSshWorkerCommand(connection),
+  });
+  try {
+    const ready = await client.initialize(cwd, handshake, undefined, {
+      sessionId,
+      settings: captureLocalExecutionSettings(),
+    });
+    bindLaunchCompletionDelivery(pi, client);
+    return { client, ready };
+  } catch (error) {
+    client.kill();
+    throw error;
+  }
+}
+
+export type RemoteReconnectOutcome = {
+  target: string;
+  remoteCwd: string;
+  droppedRemoteProposals: number;
+  replacedLiveTransport: boolean;
+};
+
+/**
+ * Re-establish the owner's transport for an already-selected remote family
+ * using its stored connection spec. Tool wrappers resolve `state.client` per
+ * call, so swapping the client in place restores routing without touching the
+ * tool registry. Two things intentionally do not survive: remote-staged AST
+ * proposals (they lived in the dead worker's memory) and non-persistent hub
+ * services (the old worker's EOF cleanup stopped them). Fails closed: on any
+ * error the session stays selected and unavailable.
+ */
+async function reconnectRemoteRuntime(
+  pi: ExtensionAPI,
+  state: RemoteExtensionState,
+  ctx: ExtensionContext | undefined,
+  options: { force: boolean },
+): Promise<RemoteReconnectOutcome> {
+  if (!state.selected) {
+    throw new Error("No remote runtime is selected; use /remote-connect <target> [cwd]");
+  }
+  if (!state.owner) {
+    throw new Error("Only the owning OMP session can reconnect the remote runtime family");
+  }
+  const family = state.family;
+  if (!family || family.closing) throw new Error("Remote runtime family state is missing");
+  const live = state.client !== undefined && !state.client.isClosed;
+  if (live && !options.force) {
+    throw new Error("Remote runtime transport is still connected; pass --force to replace it");
+  }
+  const previous = state.client;
+  state.client = undefined;
+  previous?.kill();
+  const droppedRemoteProposals = state.proposalSources.filter((source) => source === "remote").length;
+  state.proposalSources = state.proposalSources.filter((source) => source === "local");
+  state.connectionError = "Remote runtime reconnect in progress";
+  try {
+    const prepared = await prepareRemoteWorker(family.connection);
+    const connection = { ...family.connection, workerPath: prepared.workerPath };
+    const { client, ready } = await openRemoteTransport(
+      pi,
+      connection,
+      family.connection.cwd,
+      launchOwnerId(ctx),
+    );
+    if (family.closing) {
+      client.kill();
+      throw new Error("Remote session family was closed during reconnect");
+    }
+    family.connection = connection;
+    const remoteCwd: string = ready.cwd ?? family.connection.cwd;
+    family.remoteCwd = remoteCwd;
+    state.client = client;
+    state.remoteCwd = remoteCwd;
+    state.connectionError = undefined;
+    await registerActiveWrappers(pi, state);
+    return {
+      target: family.connection.displayTarget,
+      remoteCwd,
+      droppedRemoteProposals,
+      replacedLiveTransport: live,
+    };
+  } catch (error) {
+    state.connectionError = `Remote runtime reconnect failed: ${error instanceof Error ? error.message : String(error)}`;
+    throw error;
+  }
+}
+
+function describeReconnect(outcome: RemoteReconnectOutcome): string {
+  const notes: string[] = [];
+  if (outcome.replacedLiveTransport) notes.push("replaced a live transport");
+  if (outcome.droppedRemoteProposals > 0) {
+    notes.push(`${outcome.droppedRemoteProposals} remote staged proposal(s) were lost with the old worker`);
+  }
+  notes.push("non-persistent remote services stopped by the disconnect are not restarted");
+  return `Remote runtime reconnected: ${outcome.target}:${outcome.remoteCwd} (${notes.join("; ")})`;
+}
+
 async function attachFamilyMember(
   pi: ExtensionAPI,
   state: RemoteExtensionState,
@@ -759,20 +906,14 @@ async function attachFamilyMember(
 
   let next: RemoteRuntimeClient | undefined;
   try {
-    const handshake = await ompHandshake(pi);
-    next = new RemoteRuntimeClient({
-      command: buildSshWorkerCommand(family.connection),
-    });
-    const ready = await next.initialize(family.remoteCwd, handshake, undefined, {
-      sessionId: launchOwnerId(ctx),
-    });
-    bindLaunchCompletionDelivery(pi, next);
+    const opened = await openRemoteTransport(pi, family.connection, family.remoteCwd, launchOwnerId(ctx));
+    next = opened.client;
     if (family.closing)
       throw new Error(
         "Remote session family disconnected during subagent initialization",
       );
     state.client = next;
-    state.remoteCwd = ready.cwd;
+    state.remoteCwd = opened.ready.cwd;
     state.connectionError = undefined;
   } catch (error) {
     next?.kill();
@@ -789,7 +930,20 @@ export default async function remoteRuntimeExtension(
     proposalSources: [],
     selected: false,
     owner: false,
+    activeToolNames: () => {
+      try {
+        const names = pi.getActiveTools?.();
+        return Array.isArray(names) ? names : undefined;
+      } catch {
+        return undefined;
+      }
+    },
   };
+  // Compare the running host against the version this bundle (and its
+  // companion workers) were compiled for. A mismatch is the usual root cause of
+  // "schema is incompatible" handshake rejections after `omp update`.
+  const hostCompatibility = ompHostCompatibility(INSTALLED_OMP_VERSION || undefined);
+  let hostCompatibilityNotified = false;
 
   pi.registerTool({
     name: REMOTE_WORKSPACE_STATUS_TOOL,
@@ -809,6 +963,7 @@ export default async function remoteRuntimeExtension(
         owner: state.owner,
         wrappedTools: state.wrappedTools,
         proposalSources: state.proposalSources,
+        hostCompatibility,
       });
       return {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
@@ -879,14 +1034,9 @@ export default async function remoteRuntimeExtension(
           ...options,
           workerPath: prepared.workerPath,
         };
-        const handshake = await ompHandshake(pi);
-        next = new RemoteRuntimeClient({
-          command: buildSshWorkerCommand(connection),
-        });
-        const ready = await next.initialize(options.cwd, handshake, undefined, {
-          sessionId: launchOwnerId(ctx),
-        });
-        bindLaunchCompletionDelivery(pi, next);
+        const opened = await openRemoteTransport(pi, connection, options.cwd, launchOwnerId(ctx));
+        next = opened.client;
+        const ready = opened.ready;
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
           ownerSessionFile: normalizedSessionFile,
@@ -1006,6 +1156,32 @@ export default async function remoteRuntimeExtension(
     },
   });
 
+  pi.registerTool({
+    name: "remote_reconnect",
+    label: "Remote Reconnect",
+    description:
+      "Re-establish the SSH transport for the currently selected remote runtime after a connection loss, reusing the stored target, cwd, and options. Remote staged AST proposals and non-persistent remote services from before the loss do not survive. Pass force: true to replace a transport that is still connected.",
+    parameters: z.object({
+      force: z
+        .boolean()
+        .optional()
+        .describe("Replace the transport even if it is still connected"),
+    }),
+    loadMode: "essential",
+    approval: "exec",
+    async execute(_id, params: unknown, _signal, _onUpdate, ctx) {
+      const p = asRecord(params);
+      const outcome = await reconnectRemoteRuntime(pi, state, ctx, { force: p.force === true });
+      ctx?.ui?.setStatus?.("remote-runtime", `ssh ${outcome.target}:${outcome.remoteCwd}`);
+      ctx?.ui?.notify?.(describeReconnect(outcome), "info");
+      const details = { success: true, mode: "remote", ...outcome, wrappedTools: [...state.wrappedTools] };
+      return {
+        content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
+        details,
+      };
+    },
+  });
+
   pi.registerCommand("remote-connect", {
     description: "Connect native workspace tools to a remote OMP runtime",
     async handler(args, ctx) {
@@ -1035,14 +1211,9 @@ export default async function remoteRuntimeExtension(
           ...options,
           workerPath: prepared.workerPath,
         };
-        const handshake = await ompHandshake(pi);
-        next = new RemoteRuntimeClient({
-          command: buildSshWorkerCommand(connection),
-        });
-        const ready = await next.initialize(options.cwd, handshake, undefined, {
-          sessionId: launchOwnerId(ctx),
-        });
-        bindLaunchCompletionDelivery(pi, next);
+        const opened = await openRemoteTransport(pi, connection, options.cwd, launchOwnerId(ctx));
+        next = opened.client;
+        const ready = opened.ready;
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
           ownerSessionFile: normalizedSessionFile,
@@ -1090,7 +1261,25 @@ export default async function remoteRuntimeExtension(
           : state.client?.isClosed
             ? `Remote runtime: connection lost at ${state.remoteCwd} (fail-closed)`
             : `Remote runtime: ${state.remoteCwd}; role=${state.owner ? "owner" : "subagent"}; tools=${[...state.wrappedTools].join(",")}; pending=${state.proposalSources.length}`;
-      ctx.ui.notify(status, "info");
+      const build = hostCompatibility.compatible
+        ? `plugin built for OMP ${hostCompatibility.compiledHostVersion}`
+        : (hostCompatibility.advice ?? "plugin build version unknown");
+      ctx.ui.notify(`${status}. ${build}`, hostCompatibility.compatible ? "info" : "warning");
+    },
+  });
+
+  pi.registerCommand("remote-reconnect", {
+    description: "Re-establish the remote runtime transport after a connection loss",
+    async handler(args, ctx) {
+      const force = args.trim() === "--force";
+      ctx.ui.setWorkingMessage("Reconnecting remote OMP runtime");
+      try {
+        const outcome = await reconnectRemoteRuntime(pi, state, ctx, { force });
+        ctx.ui.setStatus("remote-runtime", `ssh ${outcome.target}:${outcome.remoteCwd}`);
+        ctx.ui.notify(describeReconnect(outcome), "info");
+      } finally {
+        ctx.ui.setWorkingMessage();
+      }
     },
   });
 
@@ -1141,6 +1330,10 @@ export default async function remoteRuntimeExtension(
 
   pi.on("session_start", async (_event, ctx) => {
     state.localCwd = ctx.cwd;
+    if (!hostCompatibility.compatible && !hostCompatibilityNotified && hostCompatibility.advice) {
+      hostCompatibilityNotified = true;
+      ctx.ui.notify(`omp-ssh-remote: ${hostCompatibility.advice}`, "warning");
+    }
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (!sessionFile) return;
     const normalized = resolvePath(sessionFile);

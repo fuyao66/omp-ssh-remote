@@ -1,3 +1,8 @@
+import {
+  parseExecutionSettings,
+  type RemoteExecutionSettings,
+} from "./omp/execution-settings.ts";
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -8,7 +13,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.5.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.6.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
@@ -59,6 +64,8 @@ export type InitializeRequest = {
   assembly?: RuntimeAssemblyRequest;
   /** Local OMP session id; owner identity for remote supervised processes. */
   sessionId?: string;
+  /** Forwarded execution-domain settings (see omp/execution-settings.ts). */
+  settings?: RemoteExecutionSettings;
 };
 
 export type ExecuteRequest = {
@@ -67,6 +74,8 @@ export type ExecuteRequest = {
   toolCallId: string;
   tool: string;
   args: Record<string, unknown>;
+  /** Names of the tools active in the local session (bash interceptor input). */
+  toolNames?: string[];
 };
 
 export type CancelRequest = { type: "cancel"; id: string };
@@ -205,15 +214,26 @@ export function parseRequest(raw: unknown): Request {
       ...(typeof value.sessionId === "string"
         ? { sessionId: value.sessionId }
         : {}),
+      ...(value.settings === undefined
+        ? {}
+        : { settings: parseExecutionSettings(value.settings) }),
     };
   }
   if (type === "execute") {
+    const toolNames = value.toolNames;
+    if (
+      toolNames !== undefined &&
+      !(Array.isArray(toolNames) && toolNames.every((name) => typeof name === "string"))
+    ) {
+      throw new Error("Protocol field toolNames must be a string array");
+    }
     return {
       type,
       id: stringField(value, "id"),
       toolCallId: stringField(value, "toolCallId"),
       tool: stringField(value, "tool"),
       args: asRecord(value.args, "args"),
+      ...(toolNames === undefined ? {} : { toolNames: toolNames as string[] }),
     };
   }
   if (type === "cancel") return { type, id: stringField(value, "id") };

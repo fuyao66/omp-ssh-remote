@@ -20,6 +20,35 @@ export interface OmpRuntimeHandshakeOptions {
   localTools?: readonly OmpLocalToolSnapshot[];
 }
 
+/**
+ * Names the first parameter-level difference between two object schemas so a
+ * rejected handshake says *which* field drifted instead of only "incompatible".
+ * Returns undefined when the schemas only differ below the property level.
+ */
+export function describeSchemaDrift(local: unknown, remote: unknown): string | undefined {
+  const localProps = isRecord(local) && isRecord(local.properties) ? local.properties : {};
+  const remoteProps = isRecord(remote) && isRecord(remote.properties) ? remote.properties : {};
+  const localOnly = Object.keys(localProps).filter((key) => !(key in remoteProps));
+  const remoteOnly = Object.keys(remoteProps).filter((key) => !(key in localProps));
+  if (localOnly.length > 0) return `host has parameter(s) the companion lacks: ${localOnly.join(", ")}`;
+  if (remoteOnly.length > 0) return `companion has parameter(s) the host lacks: ${remoteOnly.join(", ")}`;
+  const changed = Object.keys(localProps).filter(
+    (key) => stableJson(localProps[key]) !== stableJson(remoteProps[key]),
+  );
+  if (changed.length > 0) return `parameter definition changed: ${changed.join(", ")}`;
+  return undefined;
+}
+
+/** One-line remediation hint appended to every version-related admission failure. */
+export function versionDriftHint(localHostVersion: string | undefined, remoteHostVersion: string | undefined): string {
+  const local = localHostVersion ?? "unknown";
+  const remote = remoteHostVersion ?? "unknown";
+  const same = localHostVersion !== undefined && localHostVersion === remoteHostVersion;
+  return same
+    ? `local OMP ${local}, companion built for ${remote}; rebuild the companion workers against the installed OMP (bun run build:worker:all) and reconnect`
+    : `local OMP ${local}, companion built for ${remote}; update the plugin's pinned OMP dependencies to ${local}, rebuild the companion workers (bun run build:worker:all), and reconnect`;
+}
+
 type JsonSchemaConvertible = {
   toJsonSchema: () => unknown;
 };
@@ -88,18 +117,19 @@ function remoteHostVersion(ready: ReadyMessage): string | undefined {
 export function validateOmpReadyMessage(
   ready: ReadyMessage,
   localTools?: readonly OmpLocalToolSnapshot[],
+  localHostVersion?: string,
 ): void {
   if (ready.host !== undefined && ready.host !== "omp") {
     throw new Error(
       `Remote runtime host mismatch: expected omp, got ${ready.host}`,
     );
   }
+  const hostVersion = remoteHostVersion(ready);
   if (ready.runtimeVersion !== TOOL_RUNTIME_VERSION) {
     throw new Error(
-      `Remote runtime contract mismatch: protocol=${ready.protocolVersion}, runtime=${ready.runtimeVersion}`,
+      `Remote runtime contract mismatch: protocol=${ready.protocolVersion}, runtime=${ready.runtimeVersion} (expected ${TOOL_RUNTIME_VERSION}); ${versionDriftHint(localHostVersion, hostVersion)}`,
     );
   }
-  const hostVersion = remoteHostVersion(ready);
   if (!hostVersion) {
     throw new Error("Remote OMP runtime did not report a host version");
   }
@@ -138,8 +168,12 @@ export function validateOmpReadyMessage(
       );
     }
     if (stableJson(executionSchema(name, remote.parameters)) !== stableJson(executionSchema(name, local.parameters))) {
+      const drift = describeSchemaDrift(
+        executionSchema(name, local.parameters),
+        executionSchema(name, remote.parameters),
+      );
       throw new Error(
-        `Remote OMP tool ${name} schema is incompatible with the local tool`,
+        `Remote OMP tool ${name} schema is incompatible with the local tool${drift ? ` (${drift})` : ""}; ${versionDriftHint(localHostVersion, hostVersion)}`,
       );
     }
   }
@@ -154,7 +188,7 @@ export function createOmpRuntimeHandshake(
     runtimeVersion: TOOL_RUNTIME_VERSION,
     requestedTools: REMOTE_TOOL_NAMES,
     validateReady: (ready) =>
-      validateOmpReadyMessage(ready, options.localTools),
+      validateOmpReadyMessage(ready, options.localTools, options.hostVersion),
   };
 }
 

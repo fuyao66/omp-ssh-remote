@@ -302,3 +302,74 @@ describe("hub launch ownership", () => {
     }
   }, 60_000);
 });
+
+describe("forwarded execution settings", () => {
+  test("bash interceptor uses forwarded rules and the local active tool set", async () => {
+    const settingsCwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-settings-"));
+    const worker = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    try {
+      await worker.initialize(settingsCwd, OMP_RUNTIME_HANDSHAKE, undefined, {
+        settings: {
+          "bashInterceptor.enabled": true,
+          "bashInterceptor.patterns": [
+            { pattern: "^\\s*cat\\s+", tool: "read", message: "forwarded-rule: use read" },
+          ],
+        },
+      });
+      await Bun.write(join(settingsCwd, "note.txt"), "plain\n");
+      // Without the local tool set nothing can be intercepted (rule target unavailable).
+      const plain = JSON.stringify(await worker.execute("bash", "no-names", { command: "cat note.txt" }));
+      expect(plain).toContain("plain");
+      expect(plain).not.toContain("forwarded-rule");
+      // With the active tool names the forwarded rule blocks the command remotely
+      // (native BashTool raises a ToolError, surfaced as a rejected execute).
+      await expect(
+        worker.execute("bash", "with-names", { command: "cat note.txt" }, undefined, undefined, { toolNames: ["read", "bash"] }),
+      ).rejects.toThrow(/forwarded-rule: use read/);
+    } finally {
+      await worker.close().catch(() => {});
+      await rm(settingsCwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("tools.maxTimeout caps remote bash and structural pins beat forwarded values", async () => {
+    const settingsCwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-settings-"));
+    const worker = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    try {
+      const ready = await worker.initialize(settingsCwd, OMP_RUNTIME_HANDSHAKE, undefined, {
+        settings: { "tools.maxTimeout": 1 },
+      });
+      // A forwarded value must never change the admitted tool set or schemas.
+      expect(ready.tools.map((tool) => tool.name)).toContain("bash");
+      const started = Date.now();
+      const result = JSON.stringify(
+        await worker.execute("bash", "capped", { command: "sleep 5; echo finished", timeout: 30 }).catch((error: Error) => error.message),
+      );
+      expect(Date.now() - started).toBeLessThan(4_000);
+      expect(result).not.toContain("finished");
+    } finally {
+      await worker.close().catch(() => {});
+      await rm(settingsCwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("git worktree add is not rewritten into a worker self-invocation", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "omp-ssh-remote-wt-"));
+    const worker = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    try {
+      await worker.initialize(repo, OMP_RUNTIME_HANDSHAKE);
+      const setup = "git init -q -b main . && git -c user.email=a@b -c user.name=t commit -q --allow-empty -m init";
+      await worker.execute("bash", "wt-setup", { command: setup });
+      const output = JSON.stringify(
+        await worker.execute("bash", "wt-add", { command: "git worktree add -q ../wt-probe-branch -b probe && echo WT_OK" }),
+      );
+      expect(output).toContain("WT_OK");
+      const listed = JSON.stringify(await worker.execute("bash", "wt-list", { command: "git worktree list" }));
+      expect(listed).toContain("wt-probe-branch");
+      await worker.execute("bash", "wt-rm", { command: "git worktree remove --force ../wt-probe-branch" });
+    } finally {
+      await worker.close().catch(() => {});
+      await rm(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+});

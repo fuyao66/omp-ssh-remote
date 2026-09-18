@@ -265,6 +265,9 @@ export async function prepareRemoteWorker(
       remoteDir,
       bundle,
     );
+    await pruneStaleRemoteWorkers(options, `${cacheDir}/${bundle.cacheNamespace}`, hash).catch(
+      () => undefined,
+    );
     return { workerPath: remoteWorker, home: probe.home };
   }
   if (exists !== "missing")
@@ -282,8 +285,10 @@ export async function prepareRemoteWorker(
   const temporary = `${remoteWorker}.upload-${nonce}`;
   const temporaryMarker = `${marker}.upload-${nonce}`;
   const scp = buildScpBaseCommand(options);
-  scp.push(localWorker, `${options.target}:${quoteRemoteArgument(temporary)}`);
-  await run(scp, "Worker upload");
+  // The worker is a ~200 MB uncompressed Bun executable; ssh-level compression
+  // measured ~40% fewer bytes on the wire for the one-time upload per version.
+  scp.push("-C", localWorker, `${options.target}:${quoteRemoteArgument(temporary)}`);
+  await run(scp, "Worker upload", 600_000);
   const quotedTemporary = quoteRemoteArgument(temporary);
   const quotedTemporaryMarker = quoteRemoteArgument(temporaryMarker);
   await run(
@@ -295,7 +300,48 @@ export async function prepareRemoteWorker(
     "Worker activation",
   );
   await deployCompanionArtifacts(options, probe.home, arch, remoteDir, bundle);
+  await pruneStaleRemoteWorkers(options, `${cacheDir}/${bundle.cacheNamespace}`, hash).catch(
+    () => undefined,
+  );
   return { workerPath: remoteWorker, home: probe.home };
+}
+
+/** Versions retained under one contract namespace: the one just activated plus the previous one. */
+export const RETAINED_REMOTE_WORKER_VERSIONS = 2;
+
+/**
+ * Shell fragment that deletes every sibling version directory under `namespaceDir`
+ * except the active hash and the most recently modified `keep - 1` others.
+ * A newly activated version is always the newest, so the previous version
+ * survives and a rollback of the local plugin does not re-upload 200 MB.
+ * Deleting a directory whose worker is still running is safe on Linux: the
+ * executable's inode stays alive until that process exits.
+ */
+export function buildPruneStaleWorkersCommand(
+  namespaceDir: string,
+  activeHash: string,
+  keep = RETAINED_REMOTE_WORKER_VERSIONS,
+): string {
+  if (!/^[a-f0-9]{64}$/.test(activeHash)) throw new Error("Invalid worker hash");
+  const dir = quoteRemoteArgument(namespaceDir);
+  const others = Math.max(0, keep - 1);
+  // ls -t sorts by mtime (newest first); only 64-hex sibling names are candidates.
+  return `cd ${dir} 2>/dev/null || exit 0; ls -1t | grep -E '^[a-f0-9]{64}$' | grep -v '^${activeHash}$' | tail -n +${others + 1} | while IFS= read -r d; do rm -rf -- "$d"; done; exit 0`;
+}
+
+async function pruneStaleRemoteWorkers(
+  options: WorkerDeploymentOptions,
+  namespaceDir: string,
+  activeHash: string,
+): Promise<void> {
+  await run(
+    [
+      ...buildSshBaseCommand(options),
+      options.target,
+      buildPruneStaleWorkersCommand(namespaceDir, activeHash),
+    ],
+    "Remote worker cache prune",
+  );
 }
 
 async function deployCompanionArtifacts(

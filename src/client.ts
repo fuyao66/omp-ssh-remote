@@ -10,6 +10,7 @@ import {
   type Request,
 } from "./protocol.ts";
 import type { RemoteRuntimeHandshake } from "./runtime-contract.ts";
+import type { RemoteExecutionSettings } from "./omp/execution-settings.ts";
 
 export type SpawnSpec = {
   command: string[];
@@ -88,7 +89,7 @@ export class RemoteRuntimeClient {
     cwd: string,
     handshake: RemoteRuntimeHandshake,
     timeoutMs = 15_000,
-    options: { sessionId?: string } = {},
+    options: { sessionId?: string; settings?: RemoteExecutionSettings } = {},
   ): Promise<ReadyMessage> {
     this.#send({
       type: "initialize",
@@ -103,6 +104,9 @@ export class RemoteRuntimeClient {
       tools: [...handshake.requestedTools],
       ...(handshake.assembly ? { assembly: handshake.assembly } : {}),
       ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+      ...(options.settings && Object.keys(options.settings).length > 0
+        ? { settings: options.settings }
+        : {}),
     });
     try {
       const ready = await withTimeout(
@@ -129,6 +133,7 @@ export class RemoteRuntimeClient {
     args: Record<string, unknown>,
     signal?: AbortSignal,
     onUpdate?: (update: unknown) => void,
+    options: { toolNames?: readonly string[] } = {},
   ): Promise<unknown> {
     if (this.#closed) throw new Error("Remote runtime is disconnected");
     if (signal?.aborted) {
@@ -154,6 +159,7 @@ export class RemoteRuntimeClient {
         toolCallId,
         tool,
         args,
+        ...(options.toolNames ? { toolNames: [...options.toolNames] } : {}),
       });
       return await promise;
     } finally {

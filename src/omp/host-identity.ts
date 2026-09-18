@@ -87,6 +87,45 @@ export function ompCompiledHostVersion(): string | undefined {
   return compiled && compiled !== "undefined" ? compiled : undefined;
 }
 
+export type OmpHostCompatibility = {
+  /** Version of the OMP host currently running this extension (live import). */
+  installedHostVersion: string | undefined;
+  /** OMP version the plugin bundle and companion workers were compiled against. */
+  compiledHostVersion: string | undefined;
+  /** True only when both versions are known and equal. */
+  compatible: boolean;
+  /** Human-readable remediation when the versions differ or are unknown. */
+  advice: string | undefined;
+};
+
+/**
+ * Compare the running host's version against the version the plugin was
+ * built for. The companion worker is a native OMP runtime compiled at plugin
+ * build time, so a host upgrade without a rebuild is the single most common
+ * cause of `schema is incompatible` handshake rejections. Detecting it at
+ * session start turns a mid-connect failure into an actionable notice.
+ */
+export function ompHostCompatibility(
+  installedHostVersion: string | undefined,
+  compiledHostVersion: string | undefined = ompCompiledHostVersion(),
+): OmpHostCompatibility {
+  const compatible =
+    installedHostVersion !== undefined &&
+    compiledHostVersion !== undefined &&
+    installedHostVersion === compiledHostVersion;
+  let advice: string | undefined;
+  if (!compatible) {
+    if (installedHostVersion === undefined) {
+      advice = "Could not determine the running OMP version; the remote handshake will still verify tool schemas.";
+    } else if (compiledHostVersion === undefined) {
+      advice = `omp-ssh-remote was not built with a pinned OMP version; the running host is ${installedHostVersion}. Rebuild the plugin (bun run build && bun run build:worker:all).`;
+    } else {
+      advice = `omp-ssh-remote was built for OMP ${compiledHostVersion} but the running host is ${installedHostVersion}. Update the plugin's pinned OMP dependencies to ${installedHostVersion}, run bun run build && bun run build:worker:all, then reload the extension and reconnect.`;
+    }
+  }
+  return { installedHostVersion, compiledHostVersion, compatible, advice };
+}
+
 export async function resolveOmpHostVersion(): Promise<string> {
   const compiled = ompCompiledHostVersion();
   if (compiled) return compiled;
