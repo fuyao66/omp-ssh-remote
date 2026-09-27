@@ -6,7 +6,8 @@ import type {
   ExtensionContext,
   ToolInfo,
 } from "@oh-my-pi/pi-coding-agent";
-import { toolRenderers } from "@oh-my-pi/pi-coding-agent/tools/renderers";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { toolRenderers } from "@oh-my-pi/pi-tui/tools";
 import {
   loadConfiguredSshHosts,
   parseConnectArgs,
@@ -30,13 +31,14 @@ import {
   resolveLocalAsyncJobManager,
   startRemoteAsyncBashJob,
 } from "./omp/async-bash.ts";
-import { isHubLaunchOperation } from "./omp/hub-ops.ts";
+import { prepareService, trackService, completeService, forgetService } from "./omp/service-jobs.ts";
 import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { VERSION as INSTALLED_OMP_VERSION } from "@oh-my-pi/pi-utils";
 import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { captureExecutionSettings, type RemoteExecutionSettings } from "./omp/execution-settings.ts";
+import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 
 /**
  * Snapshot the execution-domain subset of the local session's settings.
@@ -47,7 +49,7 @@ import { captureExecutionSettings, type RemoteExecutionSettings } from "./omp/ex
 export function captureLocalExecutionSettings(): RemoteExecutionSettings {
   try {
     const scoped = findScopedSettings();
-    return scoped ? captureExecutionSettings(scoped) : {};
+    return scoped ? captureExecutionSettings({ get: (key) => lookup(key)?.get(scoped), isConfigured: (key) => { const setting = lookup(key); return !!setting && scoped.isConfigured(setting); } }) : {};
   } catch {
     return {};
   }
@@ -100,7 +102,6 @@ const TOOL_LABELS: Record<RemoteToolName, string> = {
   ast_edit: "ast replace",
   eval: "eval",
   debug: "debug",
-  hub: "hub",
 };
 
 const REMOTE_WORKSPACE_STATUS_TOOL = "remote_workspace_status";
@@ -196,7 +197,7 @@ export function workspaceStatus(
         mode === "local"
           ? "local OMP policy"
           : mode === "remote"
-            ? "hub start/ps/logs/stop/restart/describe and process send/wait run in the remote project broker; peer messaging and job ops stay local; non-persist services stop on remote exit"
+            ? "named bash services and service proc:// operations run remotely; jobs and agent coordination stay local; non-persistent services stop on exit"
             : "rejected (fail closed)",
       isolatedTasks:
         mode === "local"
@@ -401,16 +402,6 @@ function approvalFor(name: RemoteToolName): ToolApproval {
       return "write";
     };
   }
-  if (name === "hub") {
-    return (args) => {
-      const input = asRecord(args);
-      const op = input.op;
-      if (!isHubLaunchOperation(input)) return "read";
-      if (op === "ps" || op === "logs" || op === "describe" || op === "wait")
-        return "read";
-      return "exec";
-    };
-  }
   return "exec";
 }
 
@@ -473,6 +464,15 @@ async function executionTarget(
   ctx: ExtensionContext,
   signal?: AbortSignal,
 ): Promise<ExecutionTarget> {
+  const processPath = typeof params.path === "string" ? /^proc:\/\/([^/:;?#]*)(?:\/|$)/.exec(params.path) : undefined;
+  if (processPath?.[1]) {
+    const id = processPath[1];
+    const manager = resolveLocalAsyncJobManager();
+    const localJob = manager?.getAllJobs().some((job) => job.id === id);
+    const localAgent = AgentRegistry.global().list().some((agent) => agent.id === id);
+    if (localJob || localAgent) return "local";
+    return "remote";
+  }
   let target: ExecutionTarget;
   if (name !== "write") {
     target = pathShouldStayLocal(name, params) ? "local" : "remote";
@@ -480,7 +480,7 @@ async function executionTarget(
     const path = normalizePathArgument(params.path);
     const device = xdevDevice(path);
     if (!device) {
-      target = isInternalUri(path) ? "local" : "remote";
+      target = pathShouldStayLocal(name, params) ? "local" : "remote";
     } else if (RESOLUTION_DEVICES.has(device)) {
       target = state.proposalSources.at(-1) ?? "local";
     } else if (
@@ -544,7 +544,9 @@ async function executeWithTarget(
 }
 
 export function remoteWrapperRenderer(name: RemoteToolName) {
-  return toolRenderers[name] ?? {};
+  // OMP's transcript accepts undefined components for both native and custom
+  // renderers; the extension declaration still requires Component.
+  return (toolRenderers[name] ?? {}) as Omit<(typeof toolRenderers)[string], "renderCall" | "renderResult"> & Pick<ToolDefinition, "renderCall" | "renderResult">;
 }
 
 function startRemoteAsyncBash(
@@ -618,9 +620,20 @@ function registerWrapper(
     async execute(toolCallId, rawParams, signal, rawOnUpdate, ctx) {
       const params = rawParams as Record<string, unknown>;
       const target = await executionTarget(name, params, state, ctx, signal);
-      if (name === "bash" && target === "remote" && params.async === true) {
+      if (name === "bash" && target === "remote" && params.async === true && !params.name) {
         return startRemoteAsyncBash(toolCallId, params, state, ctx);
       }
+      if (name === "read" && params.path === "proc://" && target === "remote") {
+        const remote = await executeWithTarget(target, name, toolCallId, params, state, ctx, signal);
+        const local = await executeWithTarget("local", name, `${toolCallId}:local`, params, state, ctx, signal);
+        return { content: [...local.content, { type: "text", text: "Remote services:" }, ...remote.content], details: { local: local.details, remote: remote.details } };
+      }
+      const serviceName = name === "bash" && target === "remote" && typeof params.name === "string" ? params.name : undefined;
+      if (serviceName && (resolveLocalAsyncJobManager()?.getAllJobs().some((job) => job.id === serviceName) || AgentRegistry.global().list().some((agent) => agent.id === serviceName))) {
+        throw new Error(`Remote service name ${serviceName} conflicts with a local job or agent`);
+      }
+      const serviceOwner = serviceName && resolveLocalAsyncJobManager() ? resolveJobOwnerId(state.sessionFile) : undefined;
+      if (serviceName && serviceOwner && state.client) prepareService(state.client, serviceName);
       const result = await executeWithTarget(
         target,
         name,
@@ -630,7 +643,14 @@ function registerWrapper(
         ctx,
         signal,
         rawOnUpdate as (update: unknown) => void,
-      );
+      ).catch((error) => {
+        if (serviceName && state.client) forgetService(state.client, serviceName);
+        throw error;
+      });
+      if (serviceName && serviceOwner && state.client) {
+        if (result.isError) forgetService(state.client, serviceName);
+        else trackService(state.client, serviceName, serviceOwner);
+      }
       if (
         (name === "ast_edit" ||
           (name === "write" &&
@@ -757,6 +777,7 @@ function bindLaunchCompletionDelivery(
     if (event.event !== "launch-completion") return;
     const notification = event.payload as unknown as DaemonCompletionNotification;
     if (!notification?.daemon || typeof notification.daemon !== "object") throw new Error("Invalid remote launch completion");
+    if (completeService(client, notification.daemon.name, notification)) return;
     const message = buildLaunchCompletionBatchMessage([notification]);
     pi.sendMessage(
       {

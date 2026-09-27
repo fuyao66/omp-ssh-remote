@@ -10,15 +10,15 @@ Local OMP retains the TUI, conversation, model credentials, sessions, Magic Cont
 
 Remote native tools:
 
-`read`, `write`, `edit`, `bash`, `grep`, `glob`, `lsp`, `ast_grep`, `ast_edit`, constrained `eval`, `debug`, and the process-supervision half of `hub`.
+`read`, `write`, `edit`, `bash`, `grep`, `glob`, `lsp`, `ast_grep`, `ast_edit`, constrained `eval`, and `debug`.
 
 Background execution is split by ownership rather than by tool name:
 
-- `bash async:true` creates a local OMP background job that owns the id, status, logs, cancellation, and `hub jobs` visibility while the companion runs the command in the foreground; `hub cancel`, session exit, or transport loss aborts the remote command.
-- `hub start/ps/logs/stop/restart/describe`, and `send`/`wait` addressed to a process `name`, run in the native OMP broker on the remote host, so the service starts beside the project with the remote environment. Process exit notifications reach the local model exactly as native launch completions do. `hub list/inbox/jobs/cancel` and peer `send`/`wait` never leave the local host.
+- `bash async:true` creates a local OMP job; native `wait` and job `proc://` reads/cancellation remain local while the command executes remotely.
+- Named `bash` calls launch remote services. Service `proc://<name>` reads and writes (including `/kill` and `/mode`) execute remotely. Bare `read proc://` combines local and remote listings. Local jobs and agents take precedence over service names; conflicting names are rejected at launch. A local coordination job makes remote service exits visible to native `wait`; transport loss fails that job without moving execution locally.
 - On `/remote-exit`, session shutdown, or transport loss the companion stops the supervised processes this session started unless they were launched with `persist` or `detached`; those survive by explicit request, like native OMP.
 
-Ordinary non-isolated subagents inherit the connection configuration but receive independent companion processes. Admission compares the remote execution contract and native tool schemas; hub's local peer/job fields are excluded. `task isolated:true` remains explicitly rejected. Native host approval rules are preserved and connection waits for wrapper activation.
+Ordinary non-isolated subagents inherit connection configuration but receive independent companions. Admission compares the remote execution contract and native tool schemas. `task isolated:true` remains rejected. Native host approval rules are preserved and connection waits for wrapper activation.
 
 Truncated output is stored remotely under `~/.cache/omp-ssh-remote/artifacts/<namespace>`. Use returned `remote-artifact://<namespace>/<id>` references with `read` selectors or `grep` while connected to that host. The companion deletes its own namespace on normal exit and, at startup, sweeps namespaces older than one hour whose owning worker is gone; artifacts left by a transport loss therefore expire, they are never copied locally. Local `artifact://` references remain local. The `xd://debug` entry executes remotely like direct debug.
 
@@ -29,14 +29,14 @@ flowchart LR
   OMP[Local OMP] --> Adapter[OMP package adapter]
   Adapter <--> SSH[Persistent bounded SSH NDJSON]
   SSH <--> Worker[Remote OMP companion]
-  Worker --> Tools[Native ToolSession: files, AST, LSP, eval, debug, hub launch]
+  Worker --> Tools[Native ToolSession: files, AST, LSP, eval, debug, services]
   Worker --> Broker[Remote project broker: supervised services]
   Tools --> RemoteFS[Remote workspace]
 ```
 
 ## Requirements
 
-- local Linux or WSL with OMP `>=18.0.0`, Bun `1.3+`, npm, tar, OpenSSH, and SCP;
+- local Linux or WSL with OMP `>=18.3.4`, Bun `1.3+`, npm, tar, OpenSSH, and SCP;
 - remote glibc Linux `x86_64` or `aarch64`;
 - public-key SSH that succeeds in batch mode;
 - an existing remote project directory;
@@ -67,7 +67,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 Restart OMP after linking. Updating requires `git pull`, rebuilding the extension and workers, then restarting or reloading the plugin. Reloading while connected closes that session's companion; reconnect afterward.
 
-The companion is currently built against OMP 18.2.3. After a host upgrade changes tool parameters, update the pinned OMP build dependencies and rebuild both workers; reloading the extension alone does not update native runtime semantics. Native build caches are isolated by architecture and version. When the running host version differs from the version this bundle was compiled against, `/remote-status` and the first `session_start` report both versions, and a rejected handshake names the tool and the exact schema properties that diverged instead of a generic incompatibility.
+The companion is built against OMP 18.3.4 (runtime contract 0.7.0). Upgrades that change tool schemas require rebuilding both workers, not just reloading the extension. Native addon caches are partitioned by architecture and version; handshake failures report version and schema drift.
 
 ## Connect and Operate
 
@@ -117,7 +117,7 @@ First upload of the x64 worker took `32.7 s`; cached connections avoid that tran
 ## Limits
 
 - Linux glibc x86_64 and ARM64 only;
-- OMP `>=18.0.0` with matching compiled companion schemas;
+- OMP `>=18.3.4` with matching compiled companion schemas;
 - explicit async Bash is supported; automatic backgrounding and interactive Bash PTY are not bridged;
 - no `task isolated:true` remote worktrees;
 - no remote-to-local artifact bridge;

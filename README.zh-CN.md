@@ -6,7 +6,7 @@
 
 | Package        | 宿主                | 远端 runtime                                    | 文档                                           |
 | -------------- | ------------------- | ----------------------------------------------- | ---------------------------------------------- |
-| `packages/omp` | Oh My Pi `>=18.0.0` | OMP 原生 `ToolSession`，11 个工作区工具         | [OMP SSH Remote](packages/omp/README.zh-CN.md) |
+| `packages/omp` | Oh My Pi `>=18.3.4` | OMP 原生 `ToolSession`，11 个工作区工具         | [OMP SSH Remote](packages/omp/README.zh-CN.md) |
 | `packages/pi`  | 兼容的当前 Pi Agent | 可组合 Pi core 与检测到的受支持 plugin adapters | [Pi SSH Remote](packages/pi/README.zh-CN.md)   |
 
 不要安装仓库根目录。先在根目录构建，再只链接所用宿主对应的 package：

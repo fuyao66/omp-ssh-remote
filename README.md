@@ -6,7 +6,7 @@ This repository contains two independently installable SSH remote-workspace plug
 
 | Package        | Host                        | Remote runtime                                             | Documentation                            |
 | -------------- | --------------------------- | ---------------------------------------------------------- | ---------------------------------------- |
-| `packages/omp` | Oh My Pi `>=18.0.0`         | OMP native `ToolSession`, 11 workspace tools               | [OMP SSH Remote](packages/omp/README.md) |
+| `packages/omp` | Oh My Pi `>=18.3.4`         | OMP native `ToolSession`, 11 workspace tools               | [OMP SSH Remote](packages/omp/README.md) |
 | `packages/pi`  | Compatible current Pi Agent | Composable Pi core plus detected supported plugin adapters | [Pi SSH Remote](packages/pi/README.md)   |
 
 Do not install the repository root. Build from the root, then link only the package for the host you use:

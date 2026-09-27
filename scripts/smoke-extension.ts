@@ -34,7 +34,6 @@ const activeTools = [
   "ast_edit",
   "eval",
   "debug",
-  "hub",
 ];
 const hubOwner = `smoke-owner-${process.pid}`;
 const launchCompletions: unknown[] = [];
@@ -211,8 +210,7 @@ try {
   const lsp = tools.get("lsp");
   const evalTool = tools.get("eval");
   const debug = tools.get("debug");
-  const hub = tools.get("hub");
-  if (!write || !read || !bash || !astEdit || !lsp || !evalTool || !debug || !hub) {
+  if (!write || !read || !bash || !astEdit || !lsp || !evalTool || !debug) {
     throw new Error("Active remote wrappers were not registered");
   }
 
@@ -498,25 +496,13 @@ try {
     }
   }
 
-  // hub: process supervision runs in the remote project broker; messaging/jobs
-  // are local control-plane ops and must never leave the host.
-  const localHub = await hub.execute(
-    "adapter-hub-list",
-    { op: "list" },
-    AbortSignal.timeout(10_000),
-    undefined,
-    invokeContext,
-  );
-  if (!JSON.stringify(localHub).includes("local fallback"))
-    throw new Error("hub list did not stay on the local control plane");
   const serviceName = `smoke-svc-${process.pid}`;
-  const started = await hub.execute(
+  const started = await bash.execute(
     "adapter-hub-start",
     {
-      op: "start",
       name: serviceName,
-      application: "sh",
-      args: ["-c", `marker=${serviceName} ; echo smoke-ready; hostname; sleep 120`],
+      command: `marker=${serviceName} ; echo smoke-ready; hostname; sleep 120`,
+      pty: false,
       ready: { log: "smoke-ready", timeout: 20 },
     },
     AbortSignal.timeout(30_000),
@@ -534,9 +520,9 @@ try {
       invokeContext,
     ),
   );
-  const serviceLogs = await hub.execute(
+  const serviceLogs = await read.execute(
     "adapter-hub-logs",
-    { op: "logs", name: serviceName },
+    { path: `proc://${serviceName}` },
     AbortSignal.timeout(15_000),
     undefined,
     invokeContext,
@@ -554,9 +540,9 @@ try {
     };
     poll();
   });
-  await hub.execute(
+  await bash.execute(
     "adapter-hub-start-short",
-    { op: "start", name: shortName, application: "sh", args: ["-c", "exit 7"] },
+    { name: shortName, command: "exit 7", pty: false },
     AbortSignal.timeout(30_000),
     undefined,
     invokeContext,

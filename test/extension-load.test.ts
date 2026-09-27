@@ -83,7 +83,7 @@ describe("OMP extension loading", () => {
 
   test("preserves native renderer metadata for workspace wrappers", async () => {
     const { toolRenderers } = await import(
-      "@oh-my-pi/pi-coding-agent/tools/renderers"
+      "@oh-my-pi/pi-tui/tools"
     );
     for (const name of [
       "read",
@@ -97,7 +97,6 @@ describe("OMP extension loading", () => {
       "ast_edit",
       "eval",
       "debug",
-      "hub",
     ]) {
       expect(toolRenderers[name]).toBeDefined();
       expect(toolRenderers[name]?.renderCall).toBeFunction();

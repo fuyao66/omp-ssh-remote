@@ -24,7 +24,6 @@ beforeAll(async () => {
     "eval",
     "glob",
     "grep",
-    "hub",
     "lsp",
     "read",
     "write",
@@ -207,38 +206,26 @@ describe("native worker round trip", () => {
       }),
     ).rejects.toThrow("Async bash execution is disabled");
   });
-  test("remote hub rejects messaging and job ops (local control plane)", async () => {
-    await expect(
-      client.execute("hub", "hub-list", { op: "list" }),
-    ).rejects.toThrow("Remote hub only supervises processes");
-    await expect(
-      client.execute("hub", "hub-jobs", { op: "jobs" }),
-    ).rejects.toThrow("Remote hub only supervises processes");
-    await expect(
-      client.execute("hub", "hub-send-peer", { op: "send", to: "Main", message: "x" }),
-    ).rejects.toThrow("Remote hub only supervises processes");
-  });
 
   test("remote hub supervises a process through the worker-hosted broker", async () => {
     const name = `probe-${process.pid}`;
-    const started = await client.execute("hub", "hub-start", {
-      op: "start",
+    const started = await client.execute("bash", "service-start", {
       name,
-      application: "sh",
-      args: ["-c", "echo booted; sleep 30"],
+      command: "echo booted; sleep 30",
+      pty: false,
       ready: { log: "booted", timeout: 20 },
     });
     const startedText = JSON.stringify(started);
     expect(startedText).toContain(name);
     expect(startedText).not.toContain("disabled");
 
-    const listed = await client.execute("hub", "hub-ps", { op: "ps" });
+    const listed = await client.execute("read", "service-list", { path: "proc://" });
     expect(JSON.stringify(listed)).toContain(name);
 
-    const logs = await client.execute("hub", "hub-logs", { op: "logs", name });
+    const logs = await client.execute("read", "service-logs", { path: `proc://${name}` });
     expect(JSON.stringify(logs)).toContain("booted");
 
-    const stopped = await client.execute("hub", "hub-stop", { op: "stop", name });
+    const stopped = await client.execute("write", "service-stop", { path: `proc://${name}/kill`, content: "" });
     expect(JSON.stringify(stopped)).toContain(name);
   }, 60_000);
 });
@@ -252,17 +239,18 @@ describe("hub launch ownership", () => {
     try {
       await first.initialize(ownedCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: "owner" });
       await second.initialize(ownedCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: "observer" });
-      await second.execute("hub", "observe", { op: "ps" });
-      for (const name of names) await first.execute("hub", name, {
-        op: "start", name, application: "bun",
-        args: ["-e", "process.on('SIGTERM',()=>{});console.log('ready');setInterval(()=>{},1000)"],
+      await second.execute("read", "observe", { path: "proc://" });
+      for (const name of names) await first.execute("bash", name, {
+        name, command: `bun -e "process.on('SIGTERM',()=>{});console.log('ready');setInterval(()=>{},1000)"`,
         pty: false, ready: { log: "ready", timeout: 20 },
       });
       await first.close();
-      const result = await second.execute("hub", "after", { op: "ps" }) as { details: { daemons: Array<{ name: string; state: string }> } };
-      for (const name of names) expect(result.details.daemons.find((daemon) => daemon.name === name)?.state).toBe("exited");
+      for (const name of names) {
+        const result = await second.execute("read", `after-${name}`, { path: `proc://${name}` });
+        expect(JSON.stringify(result)).toContain(`${name} [service] — exited`);
+      }
     } finally {
-      for (const name of names) await second.execute("hub", `stop-${name}`, { op: "stop", name, timeout: 0.1 }).catch(() => {});
+      for (const name of names) await second.execute("write", `stop-${name}`, { path: `proc://${name}/kill`, content: "" }).catch(() => {});
       await first.close().catch(() => {});
       await second.close().catch(() => {});
       await rm(ownedCwd, { recursive: true, force: true });
@@ -283,11 +271,10 @@ describe("hub launch ownership", () => {
           if (event.event === "launch-completion") resolve(event.payload);
         });
       });
-      await worker.execute("hub", "hub-start-short", {
-        op: "start",
+      await worker.execute("bash", "service-start-short", {
         name,
-        application: "sh",
-        args: ["-c", "echo done; exit 3"],
+        command: "echo done; exit 3",
+        pty: false,
       });
       // The test-level timeout bounds this; the awaited signal is the real event.
       const payload = await completion;

@@ -50,6 +50,13 @@ export class RemoteRuntimeClient {
   #nextId = 1;
   readonly #exitPromise: Promise<number | null>;
   readonly #eventListeners = new Set<(event: EventMessage) => void | Promise<void>>();
+  readonly #closeListeners = new Set<(error: Error) => void>();
+
+  onClose(listener: (error: Error) => void): () => void {
+    if (this.#closed) listener(new Error("Remote transport is closed"));
+    else this.#closeListeners.add(listener);
+    return () => { this.#closeListeners.delete(listener); };
+  }
 
   /** Subscribe to unsolicited worker events; returns an unsubscribe. */
   onEvent(listener: (event: EventMessage) => void | Promise<void>): () => void {
@@ -275,5 +282,7 @@ export class RemoteRuntimeClient {
     for (const pending of this.#pending.values()) pending.reject(error);
     this.#pending.clear();
     this.#eventListeners.clear();
+    for (const listener of this.#closeListeners) listener(error);
+    this.#closeListeners.clear();
   }
 }

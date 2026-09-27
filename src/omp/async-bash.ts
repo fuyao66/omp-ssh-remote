@@ -1,5 +1,5 @@
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
-import { formatBackgroundNotice } from "@oh-my-pi/pi-coding-agent/async/auto-background";
+import { formatBackgroundNotice } from "@oh-my-pi/pi-tui/tools/bash";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 

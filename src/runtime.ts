@@ -19,7 +19,6 @@ import {
   type RemoteToolName,
 } from "./protocol.ts";
 import { pathShouldStayLocal } from "./path-domain.ts";
-import { createRemoteHubLaunchTool } from "./omp/hub-launch.ts";
 import { createRemoteArtifacts, resolveRemoteArtifacts } from "./omp/artifacts.ts";
 import type { RemoteExecutionSettings } from "./omp/execution-settings.ts";
 export interface RemoteNativeTool {
@@ -101,8 +100,6 @@ const WORKER_OVERRIDES = {
   "memory.backend": "off",
   "eval.py": true,
   "eval.js": true,
-  "eval.rb": false,
-  "eval.jl": false,
   "tools.xdev": false,
   "debug.enabled": true,
   // `git worktree add` would otherwise be rewritten into `<worker binary>
@@ -214,7 +211,6 @@ export async function createNativeWorkerRuntime(
     ast_edit: asRemoteNativeTool(new AstEditTool(session)),
     eval: asRemoteNativeTool(new EvalTool(session)),
     debug: asRemoteNativeTool(new DebugTool(session)),
-    hub: createRemoteHubLaunchTool(session),
   };
   for (const tool of Object.values(tools)) {
     const execute = tool.execute.bind(tool);
@@ -224,7 +220,7 @@ export async function createNativeWorkerRuntime(
     );
   }
   const evalCallableNames = REMOTE_TOOL_NAMES.filter(
-    (name) => name !== "eval" && name !== "ast_edit" && name !== "hub",
+    (name) => name !== "eval" && name !== "ast_edit",
   );
   for (const name of evalCallableNames) {
     const tool = tools[name];

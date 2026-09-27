@@ -92,20 +92,6 @@ function isObjectSchema(value: unknown): boolean {
   return isRecord(value) && value.type === "object";
 }
 
-const HUB_LOCAL_FIELDS = new Set([
-  "to", "message", "replyTo", "await", "from", "ids", "timeoutMs", "peek", "status", "limit",
-]);
-
-function executionSchema(name: string, schema: unknown): unknown {
-  if (name !== "hub" || !isRecord(schema) || !isRecord(schema.properties)) return schema;
-  return {
-    ...schema,
-    properties: Object.fromEntries(Object.entries(schema.properties).filter(([key]) => !HUB_LOCAL_FIELDS.has(key))),
-    ...(Array.isArray(schema.required)
-      ? { required: schema.required.filter((key) => !HUB_LOCAL_FIELDS.has(String(key))) }
-      : {}),
-  };
-}
 function remoteHostVersion(ready: ReadyMessage): string | undefined {
   if (typeof ready.hostVersion === "string" && ready.hostVersion)
     return ready.hostVersion;
@@ -167,10 +153,10 @@ export function validateOmpReadyMessage(
         `Remote OMP tool ${name} has an invalid parameter schema`,
       );
     }
-    if (stableJson(executionSchema(name, remote.parameters)) !== stableJson(executionSchema(name, local.parameters))) {
+    if (stableJson(remote.parameters) !== stableJson(local.parameters)) {
       const drift = describeSchemaDrift(
-        executionSchema(name, local.parameters),
-        executionSchema(name, remote.parameters),
+        local.parameters,
+        remote.parameters,
       );
       throw new Error(
         `Remote OMP tool ${name} schema is incompatible with the local tool${drift ? ` (${drift})` : ""}; ${versionDriftHint(localHostVersion, hostVersion)}`,

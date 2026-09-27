@@ -10,15 +10,15 @@ OMP SSH Remote 将 Oh My Pi 控制面保留在本机，同时通过 SSH 在远�
 
 远端原生工具：
 
-`read`、`write`、`edit`、`bash`、`grep`、`glob`、`lsp`、`ast_grep`、`ast_edit`、受限 `eval`、`debug`，以及 `hub` 的进程监管部分。
+`read`、`write`、`edit`、`bash`、`grep`、`glob`、`lsp`、`ast_grep`、`ast_edit`、受限 `eval` 和 `debug`。
 
 后台执行按归属划分，而不是按工具名划分：
 
-- `bash async:true` 创建本机 OMP 后台 job，由本机拥有 id、状态、日志、取消和 `hub jobs` 可见性；companion 在远端前台执行命令。`hub cancel`、session 退出或传输丢失都会中止远端命令。
-- `hub start/ps/logs/stop/restart/describe`，以及指向进程 `name` 的 `send`/`wait`，在远端主机上的 OMP 原生 broker 中执行，服务与项目同机启动并使用远端环境。进程退出通知会像原生 launch completion 一样送达本机模型。`hub list/inbox/jobs/cancel` 与 peer `send`/`wait` 永不离开本机。
+- `bash async:true` 创建本机 job；原生 `wait` 和 job 的 `proc://` 查询、取消留在本机，命令在远端执行。
+- 带 `name` 的 `bash` 启动远端服务。服务 `proc://<name>` 的读写（包括 `/kill`、`/mode`）路由远端；裸 `read proc://` 合并两端列表。本机 job/agent 名称优先，启动时拒绝冲突名称。远端服务通过本机协调 job 接入原生 `wait`；断连令 job 失败，不回落到本机执行。
 - `/remote-exit`、session 关闭或传输丢失时，companion 会停止本 session 启动的受监管进程；以 `persist` 或 `detached` 启动的进程按显式要求存活，与原生 OMP 一致。
 
-普通非隔离子代理继承连接配置，但各自使用独立 companion。准入比较远端执行契约和原生工具 schema；hub 的本机 peer/job 参数不参与比较。`task isolated:true` 继续明确拒绝。保留宿主原生审批规则，连接返回前等待 wrapper 激活。
+普通非隔离子代理继承连接配置，但各自使用独立 companion。准入比较远端执行契约和原生工具 schema。`task isolated:true` 继续明确拒绝。保留宿主原生审批规则，连接返回前等待 wrapper 激活。
 
 截断输出保存在远端 `~/.cache/omp-ssh-remote/artifacts/<namespace>`。连接到同一主机后，可用 `read` selector 或 `grep` 读取返回的 `remote-artifact://<namespace>/<id>`。companion 正常退出时删除自己的 namespace，启动时清扫超过一小时且所属 worker 已不存在的 namespace；因此 transport 丢失遗留的 artifact 会过期，但永远不会复制到本机。本机 `artifact://` 仍保持本机语义。`xd://debug` 与直接 debug 一样在远端执行。
 
@@ -29,14 +29,14 @@ flowchart LR
   OMP[本机 OMP] --> Adapter[OMP package adapter]
   Adapter <--> SSH[持久有界 SSH NDJSON]
   SSH <--> Worker[远端 OMP companion]
-  Worker --> Tools[原生 ToolSession: 文件、AST、LSP、eval、debug、hub launch]
+  Worker --> Tools[原生 ToolSession: 文件、AST、LSP、eval、debug、services]
   Worker --> Broker[远端项目 broker: 受监管服务]
   Tools --> RemoteFS[远端工作区]
 ```
 
 ## 环境要求
 
-- 本机 Linux 或 WSL，OMP `>=18.0.0`，并安装 Bun `1.3+`、npm、tar、OpenSSH 和 SCP；
+- 本机 Linux 或 WSL，OMP `>=18.3.4`，并安装 Bun `1.3+`、npm、tar、OpenSSH 和 SCP；
 - 远端为 glibc Linux `x86_64` 或 `aarch64`；
 - 公钥 SSH 可在 batch mode 下登录；
 - 远端项目目录已存在；
@@ -67,7 +67,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 链接后重启 OMP。更新时执行 `git pull`，重新构建 extension 和 workers，再重启或 reload plugin。连接状态下 reload 会关闭该 session 的 companion，之后需要重新连接。
 
-当前 companion 基于 OMP 18.2.3 构建。宿主升级导致工具参数变化时，需要同步固定的 OMP 构建依赖并重建两个架构的 worker；只 reload extension 不会更新远端原生执行语义。原生构建缓存按架构和版本隔离。当运行中的宿主版本与本 bundle 编译所针对的版本不同时，`/remote-status` 和首次 `session_start` 会同时报告两个版本；握手被拒绝时会指出具体工具和发生差异的 schema 属性，而不是笼统的“不兼容”。
+当前 companion 基于 OMP 18.3.4 构建，runtime contract 为 0.7.0。宿主升级改变工具 schema 时，需要同步依赖并重建双架构 worker，不能只 reload extension。原生缓存按架构、版本隔离；握手失败报告具体版本和 schema 差异。
 
 ## 连接与操作
 
@@ -117,7 +117,7 @@ x64 worker 首次上传耗时 `32.7 s`；缓存连接不再传输 worker。数�
 ## 限制
 
 - 仅支持 Linux glibc x86_64 和 ARM64；
-- OMP `>=18.0.0`，且 companion schema 匹配；
+- OMP `>=18.3.4`，且 companion schema 匹配；
 - 支持显式 async Bash；不桥接自动后台化和交互 Bash PTY；
 - 不支持 `task isolated:true` 远端 worktree；
 - 不支持远端到本机 artifact bridge；

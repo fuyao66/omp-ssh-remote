@@ -104,21 +104,10 @@ describe("workspace path routing", () => {
     ).toThrow("cannot mix local internal URIs with remote filesystem paths");
   });
 
-  test("routes hub process supervision remotely and control-plane ops locally", () => {
-    for (const op of ["start", "ps", "logs", "stop", "restart", "describe"]) {
-      expect(pathShouldStayLocal("hub", { op, name: "web" })).toBe(false);
-    }
-    // send/wait address a process only when `name` is given without a peer.
-    expect(pathShouldStayLocal("hub", { op: "send", name: "web", text: "q" })).toBe(false);
-    expect(pathShouldStayLocal("hub", { op: "wait", name: "web", for: "ready" })).toBe(false);
-    expect(pathShouldStayLocal("hub", { op: "send", to: "Main", message: "hi" })).toBe(true);
-    expect(pathShouldStayLocal("hub", { op: "send", name: "web", to: "Main", message: "hi" })).toBe(true);
-    expect(pathShouldStayLocal("hub", { op: "wait" })).toBe(true);
-    expect(pathShouldStayLocal("hub", { op: "wait", from: "Scout" })).toBe(true);
-    for (const op of ["list", "inbox", "jobs", "cancel"]) {
-      expect(pathShouldStayLocal("hub", { op })).toBe(true);
-    }
-    expect(pathShouldStayLocal("hub", {})).toBe(true);
+  test("routes service process URLs remotely", () => {
+    expect(pathShouldStayLocal("read", { path: "proc://web" })).toBe(false);
+    expect(pathShouldStayLocal("write", { path: "proc://web/kill" })).toBe(false);
+    expect(pathShouldStayLocal("write", { path: "agent://Main", content: "hi" })).toBe(true);
   });
 });
 

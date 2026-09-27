@@ -59,11 +59,11 @@ if (target === "all" || target === "omp") {
     outdir: ompOutdir,
     target: "bun",
     format: "esm",
-    minify: false,
+    minify: true,
     external: [
       "@oh-my-pi/pi-coding-agent",
       "@oh-my-pi/pi-agent-core",
-      "@oh-my-pi/pi-utils",
+      "@oh-my-pi/pi-natives",
     ],
     define: {
       "process.env.OMP_COMPILED_HOST_VERSION": JSON.stringify(hostVersion),
