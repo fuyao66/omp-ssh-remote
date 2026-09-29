@@ -1,90 +1,31 @@
-# Remote Workspace Plugins
+# OMP SSH Remote
 
-[简体中文](README.zh-CN.md) | English
+SSH remote workspace execution for Oh My Pi. This repository contains only the OMP integration.
 
-This repository contains two independently installable SSH remote-workspace plugins. They share bounded SSH transport, strict host verification, content-addressed deployment, cancellation, and fail-closed routing. Their host runtimes, package manifests, companion binaries, and lifecycle rules are separate.
+Pi SSH Remote has been split into the independent sibling repository `pi-ssh-remote`; neither repository depends on the other. Shared transport code is independently maintained.
 
-| Package        | Host                        | Remote runtime                                             | Documentation                            |
-| -------------- | --------------------------- | ---------------------------------------------------------- | ---------------------------------------- |
-| `packages/omp` | Oh My Pi `>=18.3.4`         | OMP native `ToolSession`, 11 workspace tools               | [OMP SSH Remote](packages/omp/README.md) |
-| `packages/pi`  | Compatible current Pi Agent | Composable Pi core plus detected supported plugin adapters | [Pi SSH Remote](packages/pi/README.md)   |
+## Build and install
 
-Do not install the repository root. Build from the root, then link only the package for the host you use:
-
-```bash
+```sh
 bun install --frozen-lockfile
-bun run build
+bun run check
 bun run build:worker:all
-bun run build:pi-worker:all
-```
-
-OMP:
-
-```bash
 omp plugin link "$PWD/packages/omp"
 ```
 
-Pi Agent:
+The installed package path remains `packages/omp`; existing local links remain valid. Compiled workers are generated artifacts, not tracked in Git.
 
-```bash
-pi install "$PWD/packages/pi"
-```
+## Documentation
 
-Both packages provide `/remote-connect`, `/remote-status`, `/remote-exit`, plus model-callable `remote_connect`, `remote_workspace_status`, and `remote_exit` tools. See the package README before installation; the Pi package has an explicit extension-order requirement because Pi resolves duplicate tools first-wins.
+- [English](packages/omp/README.md)
+- [简体中文](packages/omp/README.zh-CN.md)
 
-## Repository Layout
+## Verification
 
-```text
-packages/omp/                  OMP-only manifest, docs, extension, and workers
-packages/pi/                   Pi-only manifest, docs, extension, and workers
-src/runtime-contract.ts        host-neutral runtime handshake and artifact contract
-src/omp/                       OMP capability/schema admission contract
-src/pi/assembly.ts             Pi host/plugin capability resolver and RuntimeAssembly
-src/pi/plugins/                independently pluggable Pi workspace adapters
-src/pi/host-extension.ts       Pi host lifecycle adapter for the resolved assembly
-src/pi/worker-runtime.ts       model-free worker assembled from requested components
-src/pi/scope.ts                one companion lifecycle per Pi workspace scope
-src/pi/integrations/           local orchestrator integration contracts
-scripts/                       host-specific builds, smokes, and benchmarks
-test/                          shared-core and host-specific contracts
-```
-
-## Architecture
-
-OMP and Pi deliberately use different extension models over the same transport and deployment core. OMP has one native workspace runtime: local OMP and the companion admit each other by runtime contract and exact native tool schemas. Host package versions are retained as identity metadata, not equality gates. The remote host does not install OMP.
-
-Pi composes source-verified component surfaces and effective plugin configuration into a RuntimeAssembly; model active-tool permissions are separate. Workspace bindings own transitions and reject stale results. The companion verifies actual owners, schemas and configuration. Versions remain reproducible build identity, not equality gates.
-
-Pi core and independently selected FFF/AFT adapters use the same companion. Managed FFF preserves native tools, presentation, remote completion and index commands. Default Pi sessions do not publish inheritance state; Tintin is explicit opt-in via its dedicated entry. Arbitrary plugin-internal filesystem calls remain local unless an integration covers them. See the Pi package README for the managed FFF installation and exact boundaries.
-
-```mermaid
-flowchart LR
-  Core[Remote Workspace Core] --> OMP[OMP schema admission]
-  Core --> PiHost[Base Pi host adapter]
-  PiHost --> Resolver[Runtime assembly resolver]
-  PluginAdapters[Supported plugin adapters] --> Resolver
-  Integration[Local orchestrator integration] --> Scope[Independent workspace scope]
-  Resolver --> Scope
-  Scope --> Companion[Matching model-free companion]
-```
-
-## Development Verification
-
-```bash
-bun run check
-bun run build:pi-worker:all
+```sh
 REMOTE_ALIAS=<ssh-alias> REMOTE_CWD=<remote-path> bun run benchmark:omp
-REMOTE_ALIAS=<ssh-alias> REMOTE_CWD=<remote-path> bun run benchmark:pi
-REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_SMOKE_PLUGINS=none bun scripts/smoke-pi-assembly.ts
-REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_SMOKE_PLUGINS=aft bun scripts/smoke-pi-assembly.ts
-REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> bun scripts/smoke-pi-fff.ts
-REMOTE_TARGET=<ssh-alias> REMOTE_CWD=<remote-path> PI_TINTIN_SUBAGENTS_ENTRY=<tintin-entry> bun scripts/smoke-pi-tintin-subagent.ts
 ```
 
-The Pi assembly smokes exercise Pi core alone and assemblies extended by the active adapter set through the same extension, SSH deployment, worker, tool-routing, and restoration lifecycle. The tintin smoke additionally verifies a normal in-process child opens its own companion and executes `hostname` and `pwd` on the remote workspace; it does not cover local worktree isolation.
-
-Workers are large generated artifacts and are ignored by Git. Source installation requires running `bun run build:pi-worker:all` locally before linking the package.
-
-## License
+Each session and non-isolated subagent owns its own companion. Conversation and orchestration stay local. Remote worktrees remain explicitly unsupported.
 
 [MIT](LICENSE)

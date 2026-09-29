@@ -73,7 +73,7 @@ describe("OMP capability admission", () => {
 
   test("rejects a non-omp ready host", () => {
     expect(() =>
-      validateOmpReadyMessage(ready({ host: "pi" }), toolsWith()),
+      validateOmpReadyMessage(ready({ host: "other" as "omp" }), toolsWith()),
     ).toThrow(/host mismatch/);
   });
 

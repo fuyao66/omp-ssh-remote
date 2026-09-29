@@ -1,13 +1,12 @@
-import type { ReadyMessage, RuntimeAssemblyRequest } from "./protocol.ts";
+import type { ReadyMessage } from "./protocol.ts";
 
-export type RemoteWorkerHost = "omp" | "pi";
+export type RemoteWorkerHost = "omp";
 
 export interface RemoteRuntimeHandshake {
   host: RemoteWorkerHost;
   hostVersion: string;
   runtimeVersion: string;
   requestedTools: readonly string[];
-  assembly?: RuntimeAssemblyRequest;
   validateReady(ready: ReadyMessage): void;
 }
 

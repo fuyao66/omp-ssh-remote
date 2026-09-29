@@ -32,35 +32,16 @@ export const REMOTE_TOOL_NAMES = [
 export type RemoteToolName = (typeof REMOTE_TOOL_NAMES)[number];
 export type AnyRemoteToolName = string;
 
-export type RuntimeComponentKind = "host" | "plugin";
-export type RuntimeAssemblyComponent = {
-  id: string;
-  kind: RuntimeComponentKind;
-  contractVersion: string;
-  version: string;
-  /** Effective serializable plugin/host config; identity metadata, not a compatibility lock. */
-  config?: Record<string, unknown>;
-};
-export type RuntimeAssemblyTool = {
-  name: string;
-  owner: string;
-};
-export type RuntimeAssemblyRequest = {
-  id: string;
-  components: RuntimeAssemblyComponent[];
-  tools: RuntimeAssemblyTool[];
-};
 
 export type InitializeRequest = {
   type: "initialize";
   protocolVersion: number;
-  host?: "omp" | "pi";
+  host?: "omp";
   ompVersion?: string;
   hostVersion?: string;
   runtimeVersion: string;
   cwd: string;
   tools: string[];
-  assembly?: RuntimeAssemblyRequest;
   /** Local OMP session id; owner identity for remote supervised processes. */
   sessionId?: string;
   /** Forwarded execution-domain settings (see omp/execution-settings.ts). */
@@ -95,7 +76,7 @@ export type ToolManifest = {
 export type ReadyMessage = {
   type: "ready";
   protocolVersion: number;
-  host?: "omp" | "pi";
+  host?: "omp";
   ompVersion?: string;
   hostVersion?: string;
   toolRuntimeVersion?: string;
@@ -139,46 +120,6 @@ function numberField(value: Record<string, unknown>, key: string): number {
   return field;
 }
 
-function parseAssembly(value: unknown): RuntimeAssemblyRequest {
-  const assembly = asRecord(value, "assembly");
-  const components = assembly.components;
-  const tools = assembly.tools;
-  if (!Array.isArray(components) || !Array.isArray(tools)) {
-    throw new Error("Protocol assembly must contain component and tool arrays");
-  }
-  return {
-    id: stringField(assembly, "id"),
-    components: components.map((component) => {
-      const item = asRecord(component, "assembly component");
-      const kind = stringField(item, "kind");
-      if (kind !== "host" && kind !== "plugin") {
-        throw new Error(`Unknown runtime assembly component kind: ${kind}`);
-      }
-      const parsed: RuntimeAssemblyComponent = {
-        id: stringField(item, "id"),
-        kind,
-        contractVersion: stringField(item, "contractVersion"),
-        version: stringField(item, "version"),
-      };
-      if ("config" in item && item.config !== undefined) {
-        if (!isRecord(item.config) || Array.isArray(item.config)) {
-          throw new Error(
-            `Assembly component ${parsed.id} config must be a plain object`,
-          );
-        }
-        parsed.config = item.config;
-      }
-      return parsed;
-    }),
-    tools: tools.map((tool) => {
-      const item = asRecord(tool, "assembly tool");
-      return {
-        name: stringField(item, "name"),
-        owner: stringField(item, "owner"),
-      };
-    }),
-  };
-}
 
 export function parseRequest(raw: unknown): Request {
   const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
@@ -196,7 +137,7 @@ export function parseRequest(raw: unknown): Request {
       type,
       protocolVersion: numberField(value, "protocolVersion"),
       ...(typeof value.host === "string"
-        ? { host: value.host as "omp" | "pi" }
+        ? { host: value.host as "omp" }
         : {}),
       ...(typeof value.ompVersion === "string"
         ? { ompVersion: value.ompVersion }
@@ -207,9 +148,6 @@ export function parseRequest(raw: unknown): Request {
       runtimeVersion: stringField(value, "runtimeVersion"),
       cwd: stringField(value, "cwd"),
       tools,
-      ...(value.assembly === undefined
-        ? {}
-        : { assembly: parseAssembly(value.assembly) }),
       ...(typeof value.sessionId === "string"
         ? { sessionId: value.sessionId }
         : {}),
@@ -259,7 +197,7 @@ export function parseMessage(line: string): Message {
       type,
       protocolVersion: numberField(value, "protocolVersion"),
       ...(typeof value.host === "string"
-        ? { host: value.host as "omp" | "pi" }
+        ? { host: value.host as "omp" }
         : {}),
       ...(typeof value.ompVersion === "string"
         ? { ompVersion: value.ompVersion }

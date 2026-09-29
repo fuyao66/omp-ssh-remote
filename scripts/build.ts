@@ -1,24 +1,10 @@
 import { mkdir, readdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { resolveOmpHostVersion } from "../src/omp/host-identity.ts";
-import { rtkBundlePlugin } from "./pi-worker-build/rtk.ts";
-type BuildTarget = "all" | "omp" | "pi";
-const target = (process.argv[2] ?? "all") as BuildTarget;
-if (target !== "all" && target !== "omp" && target !== "pi") {
-  throw new Error(
-    `Usage: bun scripts/build.ts <all|omp|pi>; got ${JSON.stringify(target)}`,
-  );
-}
-
 const root = resolve(import.meta.dir, "..");
 const ompOutdir = resolve(root, "packages/omp/dist");
-const piOutdir = resolve(root, "packages/pi/dist");
-await Promise.all([
-  mkdir(ompOutdir, { recursive: true }),
-  mkdir(piOutdir, { recursive: true }),
-]);
-if (target === "all" || target === "omp") {
-  await rm(resolve(ompOutdir, "pi-extension.js"), { force: true });
+await mkdir(ompOutdir, { recursive: true });
+{
   for (const entry of await readdir(ompOutdir)) {
     if (
       entry === "worker.js" ||
@@ -30,29 +16,7 @@ if (target === "all" || target === "omp") {
     }
   }
 }
-if (target === "all" || target === "pi") {
-  await rm(resolve(piOutdir, "extension.js"), { force: true });
-  await rm(resolve(piOutdir, "pi-extension.js"), { force: true });
-  await rm(resolve(piOutdir, "pi-tintin-extension.js"), { force: true });
-  await rm(resolve(piOutdir, "pi-rtk-extension.js"), { force: true });
-}
-
-const legacyModulePlugin: Bun.BunPlugin = {
-  name: "omp-ssh-remote:legacy-pi-disabled",
-  setup(build) {
-    build.onResolve({ filter: /^omp-legacy-pi-modules$/ }, () => ({
-      path: "omp-legacy-pi-modules",
-      namespace: "omp-ssh-remote",
-    }));
-    build.onLoad({ filter: /.*/, namespace: "omp-ssh-remote" }, () => ({
-      contents: "export const BUNDLED_PI_MODULE_LOADERS = {};",
-      loader: "js",
-    }));
-  },
-};
-
-
-if (target === "all" || target === "omp") {
+{
   const hostVersion = await resolveOmpHostVersion();
   const extension = await Bun.build({
     entrypoints: [resolve(root, "src/extension.ts")],
@@ -73,27 +37,3 @@ if (target === "all" || target === "omp") {
     throw new AggregateError(extension.logs, "OMP extension build failed");
 }
 
-if (target === "all" || target === "pi") {
-  const extension = await Bun.build({
-    entrypoints: [
-      resolve(root, "src/pi/pi-extension.ts"),
-      resolve(root, "src/pi/pi-tintin-extension.ts"),
-      resolve(root, "src/pi/pi-fff-extension.ts"),
-      resolve(root, "src/pi/pi-rtk-extension.ts"),
-    ],
-    outdir: piOutdir,
-    naming: "[name].js",
-    plugins: [rtkBundlePlugin],
-    define: { "process.env.PI_RTK_BUNDLED": JSON.stringify("true") },
-    target: "node",
-    format: "esm",
-    minify: false,
-    external: [
-      "@earendil-works/pi-coding-agent",
-      "@earendil-works/pi-agent-core",
-      "@ff-labs/pi-fff",
-    ],
-  });
-  if (!extension.success)
-    throw new AggregateError(extension.logs, "Pi extension build failed");
-}

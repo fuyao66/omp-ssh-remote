@@ -109,7 +109,6 @@ export class RemoteRuntimeClient {
       runtimeVersion: handshake.runtimeVersion,
       cwd,
       tools: [...handshake.requestedTools],
-      ...(handshake.assembly ? { assembly: handshake.assembly } : {}),
       ...(options.sessionId ? { sessionId: options.sessionId } : {}),
       ...(options.settings && Object.keys(options.settings).length > 0
         ? { settings: options.settings }

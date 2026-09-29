@@ -1,21 +1,5 @@
-import {
-  createBashTool,
-  createEditTool,
-  createFindTool,
-  createGrepTool,
-  createLsTool,
-  createReadTool,
-  createSyntheticSourceInfo,
-  createWriteTool,
-} from "@earendil-works/pi-coding-agent";
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
-import {
-  PI_CORE_TOOL_NAMES,
-  resolvePiRuntimeAssembly,
-  type PiRuntimeAssembly,
-  type PiToolSnapshot,
-} from "../src/pi/assembly.ts";
 import {
   loadConfiguredSshHosts,
   parseConnectArgs,
@@ -23,11 +7,11 @@ import {
 import { prepareRemoteWorker } from "../src/deploy.ts";
 import { buildSshWorkerCommand } from "../src/ssh.ts";
 
-type Host = "omp" | "pi";
+type Host = "omp";
 
 const host = process.argv[2] as Host | undefined;
-if (host !== "omp" && host !== "pi") {
-  throw new Error(`Usage: bun scripts/benchmark-remote.ts <omp|pi>`);
+if (host !== "omp") {
+  throw new Error(`Usage: bun scripts/benchmark-remote.ts <omp>`);
 }
 const target = process.env.REMOTE_ALIAS ?? process.env.REMOTE_TARGET;
 const requestedCwd = process.env.REMOTE_CWD;
@@ -35,31 +19,6 @@ if (!target) throw new Error("REMOTE_ALIAS or REMOTE_TARGET is required");
 
 function quote(value: string): string {
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
-}
-
-async function basePiAssembly(cwd: string): Promise<PiRuntimeAssembly> {
-  const definitions = [
-    createReadTool(cwd),
-    createWriteTool(cwd),
-    createEditTool(cwd),
-    createBashTool(cwd),
-    createGrepTool(cwd),
-    createFindTool(cwd),
-    createLsTool(cwd),
-  ];
-  const tools = definitions.map(
-    (tool): PiToolSnapshot => ({
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
-      sourceInfo: createSyntheticSourceInfo(`<builtin:${tool.name}>`, {
-        source: "builtin",
-      }),
-    }),
-  );
-  return resolvePiRuntimeAssembly({
-    tools,
-  });
 }
 
 const configuredHosts = await loadConfiguredSshHosts(process.cwd());
@@ -100,11 +59,9 @@ const summary = (samples: number[]) => ({
 
 const localArtifactDir = new URL(`../packages/${host}/dist/`, import.meta.url)
   .pathname;
-const runtime = host === "pi" ? await basePiAssembly(process.cwd()) : undefined;
 let started = performance.now();
 const prepared = await prepareRemoteWorker(
   { ...connection, localArtifactDir },
-  runtime?.workerBundle,
 );
 const deployCacheMs = milliseconds(started);
 const cwd = requestedCwd ?? prepared.home;
@@ -120,7 +77,7 @@ try {
   started = performance.now();
   const ready = await client.initialize(
     cwd,
-    runtime?.handshake ?? OMP_RUNTIME_HANDSHAKE,
+    OMP_RUNTIME_HANDSHAKE,
     30_000,
   );
   const initializeMs = milliseconds(started);

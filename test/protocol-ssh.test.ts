@@ -5,16 +5,7 @@ import {
   decodeFrames,
   parseMessage,
   parseRequest,
-  type ReadyMessage,
-  type RuntimeAssemblyRequest,
 } from "../src/protocol.ts";
-import {
-  PI_CORE_COMPONENT_ID,
-  PI_REMOTE_RUNTIME_VERSION,
-  validatePiReadyMessage,
-} from "../src/pi/assembly.ts";
-import { AFT_PLUGIN_ID } from "../src/pi/plugins/aft.ts";
-import { WORKSPACE_HOOKS } from "../src/pi/workspace-plugin.ts";
 import {
   buildScpBaseCommand,
   buildSshWorkerCommand,
@@ -23,81 +14,6 @@ import {
 
 async function* chunks(...values: string[]): AsyncGenerator<Uint8Array> {
   for (const value of values) yield new TextEncoder().encode(value);
-}
-
-const assemblyRequest: RuntimeAssemblyRequest = {
-  id: "schema-compatible-assembly",
-  components: [
-    {
-      id: PI_CORE_COMPONENT_ID,
-      kind: "host",
-      contractVersion: "1",
-      version: "0.90.0",
-    },
-    {
-      id: AFT_PLUGIN_ID,
-      kind: "plugin",
-      contractVersion: "1",
-      version: "0.60.0",
-    },
-  ],
-  tools: [
-    { name: "find", owner: PI_CORE_COMPONENT_ID },
-    { name: "read", owner: AFT_PLUGIN_ID },
-  ],
-};
-const expectedTools = [
-  {
-    name: "find",
-    owner: PI_CORE_COMPONENT_ID,
-    description: "find",
-    parameters: {
-      type: "object",
-      properties: { path: { type: "string" } },
-      required: ["path"],
-    },
-  },
-  {
-    name: "read",
-    owner: AFT_PLUGIN_ID,
-    description: "read",
-    parameters: {
-      type: "object",
-      properties: { path: { type: "string" } },
-      required: ["path"],
-    },
-  },
-];
-const validationAssembly = {
-  id: assemblyRequest.id,
-  request: assemblyRequest,
-  tools: expectedTools,
-};
-
-function validReady(): ReadyMessage {
-  return {
-    type: "ready",
-    protocolVersion: PROTOCOL_VERSION,
-    host: "pi",
-    hostVersion: "0.91.0",
-    toolRuntimeVersion: PI_REMOTE_RUNTIME_VERSION,
-    tools: expectedTools.map(({ name, description, parameters }) => ({
-      name,
-      description,
-      parameters,
-    })),
-    capabilities: {
-      workspaceHooks: [...WORKSPACE_HOOKS],
-      assembly: {
-        id: assemblyRequest.id,
-        components: [
-          { ...assemblyRequest.components[0], version: "0.91.0" },
-          { ...assemblyRequest.components[1], version: "0.61.0" },
-        ],
-        tools: assemblyRequest.tools.map((tool) => ({ ...tool })),
-      },
-    },
-  };
 }
 
 describe("protocol boundaries", () => {
@@ -112,22 +28,6 @@ describe("protocol boundaries", () => {
       { type: "shutdown" },
       { type: "cancel", id: "1" },
     ]);
-  });
-
-  test("parses a structured runtime assembly on initialization", () => {
-    const request = parseRequest({
-      type: "initialize",
-      protocolVersion: PROTOCOL_VERSION,
-      host: "pi",
-      hostVersion: "0.90.0",
-      runtimeVersion: PI_REMOTE_RUNTIME_VERSION,
-      cwd: "/workspace",
-      tools: ["find", "read"],
-      assembly: assemblyRequest,
-    });
-    expect(
-      request.type === "initialize" ? request.assembly : undefined,
-    ).toEqual(assemblyRequest);
   });
 
   test("rejects oversized unterminated frames", async () => {
@@ -146,85 +46,7 @@ describe("protocol boundaries", () => {
     expect(() => parseMessage('{"type":"result","id":"1"}')).toThrow(
       "missing result",
     );
-    expect(() =>
-      parseRequest({
-        type: "initialize",
-        protocolVersion: 1,
-        runtimeVersion: "1",
-        cwd: "/tmp",
-        tools: [],
-        assembly: { id: "bad", components: [{}], tools: [] },
-      }),
-    ).toThrow("must be a string");
-  });
-});
 
-describe("Pi runtime assembly boundary", () => {
-  test("accepts different Pi and plugin versions when contracts and schemas match", () => {
-    expect(() =>
-      validatePiReadyMessage(validationAssembly, validReady()),
-    ).not.toThrow();
-  });
-
-  test("rejects companions that bypass workspace plugin hooks", () => {
-    const ready = validReady();
-    delete ready.capabilities!.workspaceHooks;
-    expect(() => validatePiReadyMessage(validationAssembly, ready)).toThrow("workspace hook lifecycle");
-  });
-
-  test("rejects missing, unknown, duplicate, and incompatible tools", () => {
-    const missing = validReady();
-    missing.tools = missing.tools.filter((tool) => tool.name !== "read");
-    expect(() => validatePiReadyMessage(validationAssembly, missing)).toThrow(
-      "missing tools",
-    );
-
-    const unknown = validReady();
-    unknown.tools.push({
-      name: "remote_shell_root",
-      description: "unexpected",
-      parameters: { type: "object" },
-    });
-    expect(() => validatePiReadyMessage(validationAssembly, unknown)).toThrow(
-      "unsupported tool",
-    );
-
-    const duplicate = validReady();
-    duplicate.tools.push(duplicate.tools[0]!);
-    expect(() => validatePiReadyMessage(validationAssembly, duplicate)).toThrow(
-      "duplicate tool",
-    );
-
-    const invalidSchema = validReady();
-    invalidSchema.tools[0] = { ...invalidSchema.tools[0]!, parameters: {} };
-    expect(() =>
-      validatePiReadyMessage(validationAssembly, invalidSchema),
-    ).toThrow("invalid parameter schema");
-
-    const incompatibleSchema = validReady();
-    incompatibleSchema.tools[0] = {
-      ...incompatibleSchema.tools[0]!,
-      parameters: { type: "object", properties: {} },
-    };
-    expect(() =>
-      validatePiReadyMessage(validationAssembly, incompatibleSchema),
-    ).toThrow("schema is incompatible");
-  });
-
-  test("rejects component contract and ownership drift", () => {
-    const contractDrift = validReady();
-    const capability = contractDrift.capabilities?.assembly as any;
-    capability.components[1].contractVersion = "2";
-    expect(() =>
-      validatePiReadyMessage(validationAssembly, contractDrift),
-    ).toThrow("component contract mismatch");
-
-    const ownershipDrift = validReady();
-    const ownershipCapability = ownershipDrift.capabilities?.assembly as any;
-    ownershipCapability.tools[1].owner = PI_CORE_COMPONENT_ID;
-    expect(() =>
-      validatePiReadyMessage(validationAssembly, ownershipDrift),
-    ).toThrow("tool ownership");
   });
 });
 
