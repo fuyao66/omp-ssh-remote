@@ -205,7 +205,7 @@ try {
     "checking session branch guard",
     Promise.resolve(
       branchGuard(
-        { type: "session_before_branch", entryId: "probe" },
+        { type: "session_before_branch", reason: "branch", entryId: "probe" },
         owner.context,
       ),
     ),

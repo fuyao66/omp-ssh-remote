@@ -24,6 +24,16 @@ await mkdir(ompOutdir, { recursive: true });
     target: "bun",
     format: "esm",
     minify: true,
+    plugins: [{
+      name: "omp-ssh-remote:renderer-imports",
+      setup(build) {
+        // The compiled host exposes the agent-core root, but not this new
+        // renderer dependency's subpath. Bundle its stateless definitions.
+        build.onResolve({ filter: /^@oh-my-pi\/pi-agent-core\/thinking$/ }, () => ({
+          path: Bun.resolveSync("@oh-my-pi/pi-agent-core/thinking", root),
+        }));
+      },
+    }],
     external: [
       "@oh-my-pi/pi-coding-agent",
       "@oh-my-pi/pi-agent-core",

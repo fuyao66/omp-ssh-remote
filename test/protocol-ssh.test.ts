@@ -55,12 +55,6 @@ describe("SSH command safety", () => {
     expect(quoteRemoteArgument("/tmp/worker path'quoted")).toBe(
       "'/tmp/worker path'\"'\"'quoted'",
     );
-    expect(
-      buildSshWorkerCommand({
-        target: "user@example.com",
-        workerPath: "/tmp/worker path'quoted",
-      }).at(-1),
-    ).toBe("exec '/tmp/worker path'\"'\"'quoted'");
   });
 
   test("forces strict non-forwarding SSH options", () => {

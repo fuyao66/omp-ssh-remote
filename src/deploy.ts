@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { OMP_WORKER_BUNDLE } from "./omp/runtime-contract.ts";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type {
   RemoteCompanionArtifact,
   RemoteWorkerBundle,
@@ -22,6 +23,8 @@ export interface WorkerDeploymentOptions extends Omit<
   workerPath?: string;
   localWorkerPath?: string;
   localArtifactDir?: string;
+  signal?: AbortSignal;
+  onProgress?: (stage: string) => void;
 }
 
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
@@ -43,73 +46,41 @@ async function collectBounded(
   );
 }
 
-async function run(
-  command: string[],
-  description: string,
-  timeoutMs = 120_000,
-): Promise<string> {
+const deploymentContext = new AsyncLocalStorage<Pick<WorkerDeploymentOptions, "signal" | "onProgress">>();
+const deployments = new Map<string, Promise<unknown>>();
+
+async function run(command: string[], description: string, timeoutMs = 120_000): Promise<string> {
+  const { signal, onProgress } = deploymentContext.getStore() ?? {};
+  signal?.throwIfAborted();
+  onProgress?.(description);
   return new Promise<string>((resolvePromise, rejectPromise) => {
     const [file, ...args] = command;
-    const proc = spawn(file, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
-
-    proc.stdout?.on("data", (chunk: Buffer) => {
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_COMMAND_OUTPUT_BYTES) {
-        proc.kill();
-        rejectPromise(
-          new Error(
-            `${description} stdout exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes`,
-          ),
-        );
-        return;
-      }
-      stdoutChunks.push(chunk);
-    });
-
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      stderrBytes += chunk.length;
-      if (stderrBytes > MAX_COMMAND_OUTPUT_BYTES) {
-        proc.kill();
-        rejectPromise(
-          new Error(
-            `${description} stderr exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes`,
-          ),
-        );
-        return;
-      }
-      stderrChunks.push(chunk);
-    });
-
-    const timer = setTimeout(() => {
-      proc.kill();
-      rejectPromise(new Error(`${description} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    proc.on("error", (err: Error) => {
+    const proc = spawn(file, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const chunks: Buffer[] = [];
+    const errors: Buffer[] = [];
+    let bytes = 0;
+    let failure: Error | undefined;
+    const stop = (error: Error) => { failure ??= error; proc.kill("SIGKILL"); };
+    const abort = () => stop(new Error(`${description} cancelled`, { cause: signal?.reason }));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    const collect = (target: Buffer[]) => (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > MAX_COMMAND_OUTPUT_BYTES) stop(new Error(`${description} output exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes`));
+      else target.push(chunk);
+    };
+    proc.stdout?.on("data", collect(chunks));
+    proc.stderr?.on("data", collect(errors));
+    const timer = setTimeout(() => stop(new Error(`${description} timed out after ${timeoutMs}ms`)), timeoutMs);
+    proc.on("error", (error) => { failure ??= error; });
+    proc.on("close", (code) => {
       clearTimeout(timer);
-      rejectPromise(err);
-    });
-
-    proc.on("close", (code: number | null) => {
-      clearTimeout(timer);
-      const stdoutText = Buffer.concat(stdoutChunks).toString("utf-8").trim();
-      const stderrText = Buffer.concat(stderrChunks).toString("utf-8").trim();
-      if (code !== 0) {
-        rejectPromise(
-          new Error(
-            `${description} failed (${code}): ${stderrText || stdoutText}`,
-          ),
-        );
-      } else {
-        resolvePromise(stdoutText);
-      }
+      signal?.removeEventListener("abort", abort);
+      const stdout = Buffer.concat(chunks).toString("utf8").trim();
+      const stderr = Buffer.concat(errors).toString("utf8").trim();
+      if (failure) rejectPromise(failure);
+      else if (code !== 0) rejectPromise(new Error(`${description} failed (${code}): ${stderr || stdout}`));
+      else resolvePromise(stdout);
     });
   });
 }
@@ -220,12 +191,34 @@ export async function prepareRemoteWorker(
   options: WorkerDeploymentOptions,
   bundle: RemoteWorkerBundle = OMP_WORKER_BUNDLE,
 ): Promise<PreparedRemoteWorker> {
+  const key = JSON.stringify([options.target, options.port, options.identityFile, options.knownHostsFile, bundle.cacheNamespace]);
+  const previous = deployments.get(key);
+  const result = (async () => {
+    if (previous) {
+      options.onProgress?.("Waiting for existing deployment to finish");
+      await previous.catch(() => {});
+    }
+    options.signal?.throwIfAborted();
+    return deploymentContext.run(options, () => deployRemoteWorker(options, bundle));
+  })();
+  deployments.set(key, result);
+  void result.finally(() => { if (deployments.get(key) === result) deployments.delete(key); }).catch(() => {});
+  if (!options.signal) return result;
+  const cancelled = Promise.withResolvers<never>();
+  const abort = () => cancelled.reject(new Error("Remote deployment cancelled", { cause: options.signal?.reason }));
+  options.signal.addEventListener("abort", abort, { once: true });
+  if (options.signal.aborted) abort();
+  try { return await Promise.race([result, cancelled.promise]); }
+  finally { options.signal.removeEventListener("abort", abort); }
+}
+
+async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: RemoteWorkerBundle): Promise<PreparedRemoteWorker> {
   const probe = parseProbe(
     await run(
       [
         ...buildSshBaseCommand(options),
         options.target,
-        "uname -s && uname -m && printf '%s' \"$HOME\"",
+        "command -v flock >/dev/null && uname -s && uname -m && printf '%s' \"$HOME\"",
       ],
       "Probe remote host platform and home",
     ),
@@ -288,9 +281,10 @@ export async function prepareRemoteWorker(
   // The worker is a ~200 MB uncompressed Bun executable; ssh-level compression
   // measured ~40% fewer bytes on the wire for the one-time upload per version.
   scp.push("-C", localWorker, `${options.target}:${quoteRemoteArgument(temporary)}`);
-  await run(scp, "Worker upload", 600_000);
   const quotedTemporary = quoteRemoteArgument(temporary);
   const quotedTemporaryMarker = quoteRemoteArgument(temporaryMarker);
+  try {
+    await run(scp, "Worker upload (compressed SCP; first deployment may take several minutes)", 600_000);
   await run(
     [
       ...buildSshBaseCommand(options),
@@ -299,6 +293,13 @@ export async function prepareRemoteWorker(
     ],
     "Worker activation",
   );
+  } catch (error) {
+    await deploymentContext.run({}, () => run([
+      ...buildSshBaseCommand(options), options.target,
+      `rm -f -- ${quotedTemporary} ${quotedTemporaryMarker}`,
+    ], "Remove incomplete worker upload", 20000)).catch(() => {});
+    throw error;
+  }
   await deployCompanionArtifacts(options, probe.home, arch, remoteDir, bundle);
   await pruneStaleRemoteWorkers(options, `${cacheDir}/${bundle.cacheNamespace}`, hash).catch(
     () => undefined,
@@ -314,8 +315,8 @@ export const RETAINED_REMOTE_WORKER_VERSIONS = 2;
  * except the active hash and the most recently modified `keep - 1` others.
  * A newly activated version is always the newest, so the previous version
  * survives and a rollback of the local plugin does not re-upload 200 MB.
- * Deleting a directory whose worker is still running is safe on Linux: the
- * executable's inode stays alive until that process exits.
+ * A version lease protects worker self-reentry (eval and broker subprocesses).
+ * Legacy processes without a lease are also checked via /proc before deletion.
  */
 export function buildPruneStaleWorkersCommand(
   namespaceDir: string,
@@ -326,7 +327,7 @@ export function buildPruneStaleWorkersCommand(
   const dir = quoteRemoteArgument(namespaceDir);
   const others = Math.max(0, keep - 1);
   // ls -t sorts by mtime (newest first); only 64-hex sibling names are candidates.
-  return `cd ${dir} 2>/dev/null || exit 0; ls -1t | grep -E '^[a-f0-9]{64}$' | grep -v '^${activeHash}$' | tail -n +${others + 1} | while IFS= read -r d; do rm -rf -- "$d"; done; exit 0`;
+  return `cd ${dir} 2>/dev/null || exit 0; ls -1t | grep -E '^[a-f0-9]{64}$' | grep -v '^${activeHash}$' | tail -n +${others + 1} | while IFS= read -r d; do ( exec 9>"$d/.worker.lock" || exit 0; flock -n -x 9 || exit 0; for exe in /proc/[0-9]*/exe; do target=$(readlink "$exe" 2>/dev/null) || continue; case "$target" in "$PWD/$d/"*) exit 0;; esac; done; rm -rf -- "$d" ); done; exit 0`;
 }
 
 async function pruneStaleRemoteWorkers(

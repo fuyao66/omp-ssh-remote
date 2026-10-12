@@ -4,6 +4,7 @@ import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import {
   resolveJobOwnerId,
+  resolveLocalAsyncJobManager,
   startRemoteAsyncBashJob,
 } from "../src/omp/async-bash.ts";
 
@@ -114,6 +115,31 @@ describe("remote async bash job bridge", () => {
 });
 
 describe("job owner resolution", () => {
+  test("a second root and its child register jobs with their own manager", async () => {
+    const first = new AsyncJobManager({ maxRunningJobs: 4 });
+    const second = new AsyncJobManager({ maxRunningJobs: 4 });
+    const previous = AsyncJobManager.instance();
+    AsyncJobManager.setInstance(first);
+    const registry = new AgentRegistry();
+    type Session = Parameters<AgentRegistry["register"]>[0]["session"];
+    registry.register({ id: "First", displayName: "first", kind: "main", sessionFile: "/s/first.jsonl", session: { asyncJobManager: first } as Session });
+    registry.register({ id: "Second", displayName: "second", kind: "main", sessionFile: "/s/second.jsonl", session: { asyncJobManager: second } as Session });
+    registry.register({ id: "Child", displayName: "child", kind: "sub", parentId: "Second", sessionFile: "/s/second/Child.jsonl", session: { asyncJobManager: second } as Session });
+    try {
+      for (const sessionFile of ["/s/second.jsonl", "/s/second/Child.jsonl"]) {
+        const manager = resolveLocalAsyncJobManager(sessionFile, registry);
+        if (!manager) throw new Error("Missing session job manager");
+        const result = startRemoteAsyncBashJob({ manager, ownerId: resolveJobOwnerId(sessionFile, registry), command: "echo scoped", params: { command: "echo scoped", async: true }, remoteCwd: "/srv", execute: async () => textResult("scoped") });
+        await settle(second, (result.details as { async: { jobId: string } }).async.jobId);
+      }
+      expect(first.getAllJobs()).toEqual([]);
+      expect(second.getAllJobs().map(job => [job.ownerId, job.resultText])).toEqual([["Second", "scoped"], ["Child", "scoped"]]);
+      expect(resolveLocalAsyncJobManager("/s/missing.jsonl", registry)).toBeUndefined();
+    } finally {
+      AsyncJobManager.setInstance(previous);
+      await Promise.all([first.dispose({ timeoutMs: 1000 }), second.dispose({ timeoutMs: 1000 })]);
+    }
+  });
   test("matches the agent registered with the session file", () => {
     const registry = new AgentRegistry();
     registry.register({

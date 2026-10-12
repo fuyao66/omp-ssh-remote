@@ -13,7 +13,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.7.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.8.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [

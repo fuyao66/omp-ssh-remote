@@ -2,7 +2,7 @@
  * Declarative forwarding of execution-domain OMP settings to the companion.
  *
  * The companion builds its ToolSession from `Settings.isolated()`, which knows
- * nothing about the user's `config.yml`. Keys listed here are the ones the 12
+ * nothing about the user's `config.yml`. Keys listed here are the ones the 11
  * remote-executed native tools actually read at execution time and whose value
  * changes behaviour without changing a tool's wire schema. Everything else is
  * deliberately not forwarded:
@@ -24,6 +24,8 @@ export type ForwardedSettingSpec =
 
 export const FORWARDED_EXECUTION_SETTINGS = {
   "tools.maxTimeout": { type: "number", min: 0 },
+  "tools.artifactMaxBytes": { type: "number", min: 0 },
+  "bash.gitGuard": { type: "boolean" },
   "bash.direnv": { type: "enum", values: ["auto", "off"] },
   "bash.direnvLoadTimeoutMs": { type: "number", min: 0 },
   "bashInterceptor.enabled": { type: "boolean" },

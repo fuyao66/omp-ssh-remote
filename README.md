@@ -2,8 +2,6 @@
 
 SSH remote workspace execution for Oh My Pi. This repository contains only the OMP integration.
 
-Pi SSH Remote has been split into the independent sibling repository `pi-ssh-remote`; neither repository depends on the other. Shared transport code is independently maintained.
-
 ## Build and install
 
 ```sh

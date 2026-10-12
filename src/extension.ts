@@ -31,7 +31,7 @@ import {
   resolveLocalAsyncJobManager,
   startRemoteAsyncBashJob,
 } from "./omp/async-bash.ts";
-import { prepareService, trackService, completeService, forgetService } from "./omp/service-jobs.ts";
+import { startRemoteService, completeService } from "./omp/service-jobs.ts";
 import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -53,10 +53,6 @@ export function captureLocalExecutionSettings(): RemoteExecutionSettings {
   } catch {
     return {};
   }
-}
-
-function asyncBashAvailable(): boolean {
-  return resolveLocalAsyncJobManager() !== undefined;
 }
 
 const REMOTE_TOOL_SET = new Set<string>(REMOTE_TOOL_NAMES);
@@ -234,6 +230,7 @@ type RemoteConnectOptions = Omit<RemoteConnectRequest, "cwd"> & {
 };
 type RemoteExtensionState = {
   client?: RemoteRuntimeClient;
+  deployment?: AbortController;
   remoteCwd?: string;
   localCwd?: string;
   sessionFile?: string;
@@ -310,12 +307,22 @@ export function taskRequestsIsolation(input: Record<string, unknown>): boolean {
 export function remoteControlPlaneBlockReason(
   toolName: string,
   input: unknown,
+  sessionFile?: string,
 ): string | undefined {
+  if (["find", "security_scan", "checkpoint", "rewind", "ida"].includes(toolName)) {
+    return `${toolName} is not remote-adapted. Disconnect before using it on the local workspace; use remote grep/glob/bash for remote files.`;
+  }
+  if ((toolName === "read" || toolName === "write") && typeof asRecord(input).path === "string") {
+    const device = xdevDevice(asRecord(input).path as string);
+    if (device && ["find", "security_scan", "checkpoint", "rewind", "ida"].includes(device)) {
+      return `${device} is not remote-adapted; local workspace execution is blocked while connected.`;
+    }
+  }
   const params = asRecord(input);
   if (toolName === "task" && taskRequestsIsolation(params)) {
     return "Remote runtime does not support OMP local isolated worktrees. Use isolated:false or disconnect first.";
   }
-  if (toolName === "bash" && params.async === true && !asyncBashAvailable()) {
+  if (toolName === "bash" && params.async === true && !resolveLocalAsyncJobManager(sessionFile)) {
     return "Remote async bash requires the local OMP background job manager, which is unavailable in this session.";
   }
   return undefined;
@@ -467,7 +474,7 @@ async function executionTarget(
   const processPath = typeof params.path === "string" ? /^proc:\/\/([^/:;?#]*)(?:\/|$)/.exec(params.path) : undefined;
   if (processPath?.[1]) {
     const id = processPath[1];
-    const manager = resolveLocalAsyncJobManager();
+    const manager = resolveLocalAsyncJobManager(state.sessionFile);
     const localJob = manager?.getAllJobs().some((job) => job.id === id);
     const localAgent = AgentRegistry.global().list().some((agent) => agent.id === id);
     if (localJob || localAgent) return "local";
@@ -557,7 +564,8 @@ function startRemoteAsyncBash(
 ): AgentToolResult {
   const client = state.client;
   if (!client) throw new Error("Remote runtime is disconnected");
-  const manager = resolveLocalAsyncJobManager();
+  const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? state.sessionFile;
+  const manager = resolveLocalAsyncJobManager(sessionFile);
   if (!manager) {
     throw new Error(
       "Remote async bash requires the local OMP background job manager, which is unavailable in this session.",
@@ -565,7 +573,6 @@ function startRemoteAsyncBash(
   }
   const command = typeof params.command === "string" ? params.command : "";
   if (!command) throw new Error("bash requires a command");
-  const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? state.sessionFile;
   const ownerId = resolveJobOwnerId(
     sessionFile ? resolvePath(sessionFile) : undefined,
   );
@@ -581,6 +588,7 @@ function startRemoteAsyncBash(
     command,
     params,
     remoteCwd,
+    maxTimeout: captureLocalExecutionSettings()["tools.maxTimeout"] as number | undefined,
     execute: async (remoteParams, signal, onUpdate) => {
       if (state.client !== client || client.isClosed) {
         throw new Error(
@@ -612,7 +620,11 @@ function registerWrapper(
   pi.registerTool({
     name,
     label: TOOL_LABELS[name],
-    description: native.description,
+    get description() {
+      return name === "eval" && state.selected
+        ? "Execute Python or JavaScript in the remote workspace. Persistent compute kernels and remote file/command tools only. Local agent/workpool, judge/completion, archive, browser, todo and other control-plane helpers are unavailable here. Use the corresponding top-level local tools instead; never assume local eval documentation applies to this remote kernel."
+        : native.description;
+    },
     parameters: native.parameters,
     ...remoteWrapperRenderer(name),
     loadMode: "essential",
@@ -629,27 +641,22 @@ function registerWrapper(
         return { content: [...local.content, { type: "text", text: "Remote services:" }, ...remote.content], details: { local: local.details, remote: remote.details } };
       }
       const serviceName = name === "bash" && target === "remote" && typeof params.name === "string" ? params.name : undefined;
-      if (serviceName && (resolveLocalAsyncJobManager()?.getAllJobs().some((job) => job.id === serviceName) || AgentRegistry.global().list().some((agent) => agent.id === serviceName))) {
+      const manager = resolveLocalAsyncJobManager(state.sessionFile);
+      if (serviceName && (manager?.getAllJobs().some((job) => job.id === serviceName) || AgentRegistry.global().list().some((agent) => agent.id === serviceName))) {
         throw new Error(`Remote service name ${serviceName} conflicts with a local job or agent`);
       }
-      const serviceOwner = serviceName && resolveLocalAsyncJobManager() ? resolveJobOwnerId(state.sessionFile) : undefined;
-      if (serviceName && serviceOwner && state.client) prepareService(state.client, serviceName);
-      const result = await executeWithTarget(
-        target,
-        name,
-        toolCallId,
-        params,
-        state,
-        ctx,
-        signal,
+      const execute = (executionSignal = signal) => executeWithTarget(
+        target, name, toolCallId, params, state, ctx, executionSignal,
         rawOnUpdate as (update: unknown) => void,
-      ).catch((error) => {
-        if (serviceName && state.client) forgetService(state.client, serviceName);
-        throw error;
-      });
-      if (serviceName && serviceOwner && state.client) {
-        if (result.isError) forgetService(state.client, serviceName);
-        else trackService(state.client, serviceName, serviceOwner);
+      );
+      let result: AgentToolResult;
+      if (serviceName) {
+        if (!manager || !state.client) throw new Error("Remote service requires the current session job manager and transport");
+        const owner = resolveJobOwnerId(state.sessionFile);
+        if (!owner) throw new Error("Remote service requires a registered session owner");
+        result = await startRemoteService(state.client, serviceName, owner, manager, execute, signal);
+      } else {
+        result = await execute();
       }
       if (
         (name === "ast_edit" ||
@@ -666,7 +673,14 @@ function registerWrapper(
   });
   state.wrappedTools.add(name);
 }
-async function ompHandshake(_pi: ExtensionAPI) {
+let handshakeSnapshot: ReturnType<typeof captureOmpHandshake> | undefined;
+function ompHandshake(pi: ExtensionAPI) {
+  return handshakeSnapshot ??= captureOmpHandshake(pi).catch((error) => {
+    handshakeSnapshot = undefined;
+    throw error;
+  });
+}
+async function captureOmpHandshake(_pi: ExtensionAPI) {
   // Top-level getAllTools() omits setting-gated/xdev tools such as ast_grep.
   // Admission must still compare the companion's full remote surface, so take
   // wire schemas from the same native ToolSession the worker instantiates.
@@ -843,6 +857,7 @@ async function reconnectRemoteRuntime(
   ctx: ExtensionContext | undefined,
   options: { force: boolean },
 ): Promise<RemoteReconnectOutcome> {
+  if (state.deployment) throw new Error("Remote connection is already in progress");
   if (!state.selected) {
     throw new Error("No remote runtime is selected; use /remote-connect <target> [cwd]");
   }
@@ -861,8 +876,10 @@ async function reconnectRemoteRuntime(
   const droppedRemoteProposals = state.proposalSources.filter((source) => source === "remote").length;
   state.proposalSources = state.proposalSources.filter((source) => source === "local");
   state.connectionError = "Remote runtime reconnect in progress";
+  const deployment = new AbortController();
+  state.deployment = deployment;
   try {
-    const prepared = await prepareRemoteWorker(family.connection);
+    const prepared = await prepareRemoteWorker({ ...family.connection, signal: deployment.signal, onProgress: (stage) => ctx?.ui?.setWorkingMessage(stage) });
     const connection = { ...family.connection, workerPath: prepared.workerPath };
     const { client, ready } = await openRemoteTransport(
       pi,
@@ -870,7 +887,7 @@ async function reconnectRemoteRuntime(
       family.connection.cwd,
       launchOwnerId(ctx),
     );
-    if (family.closing) {
+    if (family.closing || deployment.signal.aborted) {
       client.kill();
       throw new Error("Remote session family was closed during reconnect");
     }
@@ -890,6 +907,8 @@ async function reconnectRemoteRuntime(
   } catch (error) {
     state.connectionError = `Remote runtime reconnect failed: ${error instanceof Error ? error.message : String(error)}`;
     throw error;
+  } finally {
+    if (state.deployment === deployment) state.deployment = undefined;
   }
 }
 
@@ -1013,6 +1032,7 @@ export default async function remoteRuntimeExtension(
     loadMode: "essential",
     approval: "exec",
     async execute(_id, params: unknown, _signal, _onUpdate, ctx) {
+      if (state.deployment) throw new Error("Remote connection is already in progress");
       if (state.selected) {
         throw new Error(
           "A remote runtime is already selected; call remote_exit first",
@@ -1046,8 +1066,9 @@ export default async function remoteRuntimeExtension(
 
       const request = parseConnectArgs(rawArgs.join(" "), configuredHosts);
       let next: RemoteRuntimeClient | undefined;
+      state.deployment = new AbortController();
       try {
-        const prepared = await prepareRemoteWorker(request);
+        const prepared = await prepareRemoteWorker({ ...request, signal: _signal ? AbortSignal.any([_signal, state.deployment.signal]) : state.deployment.signal, onProgress: (stage) => _onUpdate?.({ content: [{ type: "text", text: stage }] }) });
         const remoteCwd: string =
           request.cwd ?? prepared.home ?? (await resolveRemoteHome(request));
         const options: RemoteConnectOptions = { ...request, cwd: remoteCwd };
@@ -1057,6 +1078,8 @@ export default async function remoteRuntimeExtension(
         };
         const opened = await openRemoteTransport(pi, connection, options.cwd, launchOwnerId(ctx));
         next = opened.client;
+        state.deployment.signal.throwIfAborted();
+        _signal?.throwIfAborted();
         const ready = opened.ready;
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
@@ -1100,6 +1123,8 @@ export default async function remoteRuntimeExtension(
       } catch (error) {
         next?.kill();
         throw error;
+      } finally {
+        state.deployment = undefined;
       }
     },
   });
@@ -1120,6 +1145,7 @@ export default async function remoteRuntimeExtension(
     loadMode: "essential",
     approval: "exec",
     async execute(_id, params: unknown, _signal, _onUpdate, ctx) {
+      state.deployment?.abort(new Error("Remote connection cancelled by remote_exit"));
       const p = asRecord(params);
       const force = p.force === true;
       if (!state.selected) {
@@ -1206,6 +1232,7 @@ export default async function remoteRuntimeExtension(
   pi.registerCommand("remote-connect", {
     description: "Connect native workspace tools to a remote OMP runtime",
     async handler(args, ctx) {
+      if (state.deployment) throw new Error("Remote connection is already in progress; /remote-exit cancels deployment");
       if (state.selected)
         throw new Error(
           "A remote runtime is already selected; run /remote-exit first",
@@ -1223,8 +1250,9 @@ export default async function remoteRuntimeExtension(
       const request = parseConnectArgs(args, configuredHosts);
       ctx.ui.setWorkingMessage("Deploying remote OMP runtime");
       let next: RemoteRuntimeClient | undefined;
+      state.deployment = new AbortController();
       try {
-        const prepared = await prepareRemoteWorker(request);
+        const prepared = await prepareRemoteWorker({ ...request, signal: state.deployment.signal, onProgress: (stage) => ctx.ui.setWorkingMessage(stage) });
         const remoteCwd: string =
           request.cwd ?? prepared.home ?? (await resolveRemoteHome(request));
         const options: RemoteConnectOptions = { ...request, cwd: remoteCwd };
@@ -1234,6 +1262,7 @@ export default async function remoteRuntimeExtension(
         };
         const opened = await openRemoteTransport(pi, connection, options.cwd, launchOwnerId(ctx));
         next = opened.client;
+        state.deployment.signal.throwIfAborted();
         const ready = opened.ready;
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
@@ -1267,6 +1296,7 @@ export default async function remoteRuntimeExtension(
         next?.kill();
         throw error;
       } finally {
+        state.deployment = undefined;
         ctx.ui.setWorkingMessage();
       }
     },
@@ -1307,6 +1337,7 @@ export default async function remoteRuntimeExtension(
   pi.registerCommand("remote-exit", {
     description: "Disconnect the remote runtime and restore local native tools",
     async handler(args, ctx) {
+      state.deployment?.abort(new Error("Remote connection cancelled by /remote-exit"));
       const force = args.trim() === "--force";
       if (!state.selected) {
         ctx.ui.notify(
@@ -1414,12 +1445,25 @@ export default async function remoteRuntimeExtension(
   pi.on("session_before_branch", async (_event, ctx) => {
     return closeBeforeSessionNavigation(ctx);
   });
+  // Returning an explicit result is required: OMP may swallow hook exceptions
+  // and otherwise continue with its local shell/Python runner.
+  const blockedUserExecution = () => {
+    const output = "Remote workspace selected: direct !/!! shell and $/$$ Python shortcuts are disabled. Use the remote bash/eval tool, or /remote-exit before executing locally.";
+    const bytes = Buffer.byteLength(output);
+    return { output, exitCode: 1, cancelled: false, truncated: false, totalLines: 1, outputLines: 1, totalBytes: bytes, outputBytes: bytes };
+  };
+  pi.on("user_bash", () => state.selected ? { result: blockedUserExecution() } : undefined);
+  pi.on("user_python", () => state.selected ? { result: { ...blockedUserExecution(), displayOutputs: [], stdinRequested: false } } : undefined);
+  pi.on("before_agent_start", () => state.selected ? {
+    message: { customType: "remote-workspace-boundary", content: "Remote workspace active. bash/eval operate remotely. Eval is a remote compute kernel, not a local orchestration kernel: agent/workpool, judge/completion, archive/browser and local tool callbacks are unavailable. Use top-level local task/todo/wait tools for orchestration. find/security_scan/checkpoint/rewind/ida and direct user shell/Python shortcuts are blocked until remote-exit.", display: false },
+  } : undefined);
 
   pi.on("tool_call", (event) => {
     if (!state.selected) return;
     const controlPlaneBlock = remoteControlPlaneBlockReason(
       event.toolName,
       event.input,
+      state.sessionFile,
     );
     if (controlPlaneBlock) return { block: true, reason: controlPlaneBlock };
     if (
@@ -1434,6 +1478,7 @@ export default async function remoteRuntimeExtension(
   });
 
   pi.on("session_shutdown", async () => {
+    state.deployment?.abort(new Error("Session shutdown"));
     state.sessionFile = undefined;
     if (state.owner && state.family) {
       await closeRemoteFamily(

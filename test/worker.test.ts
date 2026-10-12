@@ -340,6 +340,31 @@ describe("forwarded execution settings", () => {
     }
   }, 30_000);
 
+  test("forwarded artifact cap bounds shell storage while retaining the output tail", async () => {
+    const settingsCwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-cap-"));
+    const worker = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    try {
+      await worker.initialize(settingsCwd, OMP_RUNTIME_HANDSHAKE, undefined, {
+        settings: { "tools.artifactMaxBytes": 1 },
+      });
+      const result = await worker.execute("bash", "cap-output", {
+        command: "printf 'CAP_HEAD\\n'; seq 1 400000; printf 'CAP_TAIL\\n'",
+      });
+      const uri = JSON.stringify(result).match(/remote-artifact:\/\/([a-f0-9-]+)\/(\d+)/);
+      expect(uri).not.toBeNull();
+      const { readdir, stat } = await import("node:fs/promises");
+      const { homedir } = await import("node:os");
+      const artifactDir = join(homedir(), ".cache/omp-ssh-remote/artifacts", uri![1]!);
+      const file = (await readdir(artifactDir)).find(name => name.startsWith(`${uri![2]}.`))!;
+      expect((await stat(join(artifactDir, file))).size).toBeLessThan(1.1 * 1024 * 1024);
+      const tail = await worker.execute("read", "cap-tail", { path: `${uri![0]}:-3:raw` });
+      expect(JSON.stringify(tail)).toContain("CAP_TAIL");
+    } finally {
+      await worker.close().catch(() => {});
+      await rm(settingsCwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("git worktree add is not rewritten into a worker self-invocation", async () => {
     const repo = await mkdtemp(join(tmpdir(), "omp-ssh-remote-wt-"));
     const worker = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });

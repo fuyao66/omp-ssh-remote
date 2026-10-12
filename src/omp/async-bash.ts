@@ -1,4 +1,6 @@
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { resolve } from "node:path";
+import { clampTimeout } from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import { formatBackgroundNotice } from "@oh-my-pi/pi-tui/tools/bash";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
@@ -7,10 +9,10 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
  * Bridge OMP `bash async:true` onto the remote companion.
  *
  * Ownership model: the LOCAL AsyncJobManager owns the job (id, status, delivery,
- * cancel, `hub jobs/wait/cancel`). The remote companion runs the command as an
- * ordinary foreground request; its `update` frames become job progress and its
- * final result becomes the job result. Cancel (local `hub cancel`, session
- * teardown) aborts the job signal, which sends the existing `cancel` frame.
+ * cancel, `proc://` inspection and native `wait`). The remote companion runs
+ * the command as an ordinary foreground request; its updates become job
+ * progress and its final result becomes the job result. Local cancellation or
+ * session teardown aborts the signal and sends the existing `cancel` frame.
  * Transport loss rejects the pending request, so the job fails closed — there
  * is no detached remote process and nothing to reconnect to.
  */
@@ -29,6 +31,7 @@ export interface RemoteAsyncBashJobOptions {
   command: string;
   params: Record<string, unknown>;
   remoteCwd: string;
+  maxTimeout?: number;
   execute: RemoteAsyncBashExecutor;
 }
 
@@ -68,8 +71,15 @@ export function resolveJobOwnerId(
   return undefined;
 }
 
-export function resolveLocalAsyncJobManager(): AsyncJobManager | undefined {
-  return AsyncJobManager.instance();
+export function resolveLocalAsyncJobManager(
+  sessionFile: string | undefined,
+  registry: AgentRegistry = AgentRegistry.global(),
+): AsyncJobManager | undefined {
+  if (!sessionFile) return undefined;
+  const normalized = resolve(sessionFile);
+  return registry.list().find(
+    (ref) => ref.sessionFile && resolve(ref.sessionFile) === normalized,
+  )?.session?.asyncJobManager;
 }
 
 /**
@@ -85,6 +95,10 @@ export function startRemoteAsyncBashJob(
     command.length > 120 ? `${command.slice(0, 117)}...` : command;
   const remoteParams: Record<string, unknown> = { ...params };
   delete remoteParams.async;
+  const timeoutSeconds = params.timeout === 0 ? undefined : clampTimeout(
+    "bash", typeof params.timeout === "number" ? params.timeout : undefined, options.maxTimeout,
+  );
+  remoteParams.timeout = timeoutSeconds ?? 0;
 
   const jobId = manager.register(
     "bash",
@@ -115,20 +129,18 @@ export function startRemoteAsyncBashJob(
     { ownerId },
   );
 
-  const timeout = params.timeout;
   const details: Record<string, unknown> = {
     async: { state: "running", jobId, type: "bash" },
     remoteCwd,
   };
-  if (timeout === 0) details.timeoutDisabled = true;
-  else if (typeof timeout === "number") details.timeoutSeconds = timeout;
-  else details.timeoutSeconds = 300;
+  if (timeoutSeconds === undefined) details.timeoutDisabled = true;
+  else details.timeoutSeconds = timeoutSeconds;
 
   return {
     content: [
       {
         type: "text",
-        text: `Remote (${remoteCwd}): ${formatBackgroundNotice(jobId)}`,
+        text: `Remote (${remoteCwd}): ${formatBackgroundNotice(jobId, timeoutSeconds)}`,
       },
     ],
     details,

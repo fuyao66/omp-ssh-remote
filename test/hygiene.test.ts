@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, stat, utimes, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
   sweepOrphanedArtifactNamespaces,
 } from "../src/omp/artifacts.ts";
 import { buildPruneStaleWorkersCommand } from "../src/deploy.ts";
+import { buildSshWorkerCommand } from "../src/ssh.ts";
 
 const HOUR = 60 * 60 * 1000;
 
@@ -77,6 +78,25 @@ describe("remote artifact namespace hygiene", () => {
 });
 
 describe("remote worker cache prune command", () => {
+  test("an active version survives pruning and becomes reclaimable after exit", async () => {
+    const ns = await mkdtemp(join(tmpdir(), "worker lease '"));
+    const old = "a".repeat(64), current = "b".repeat(64);
+    await mkdir(join(ns, old)); await mkdir(join(ns, current));
+    const worker = join(ns, old, "worker path'quoted");
+    await writeFile(worker, '#!/bin/sh\necho READY\nread input\nprintf "%s" "$input"\n', { mode: 0o700 });
+    const proc = Bun.spawn(["sh", "-c", buildSshWorkerCommand({ target: "example", workerPath: worker }).at(-1)!], { stdin: "pipe", stdout: "pipe" });
+    try {
+      const reader = proc.stdout.getReader();
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain("READY");
+      expect(Bun.spawnSync(["sh", "-c", buildPruneStaleWorkersCommand(ns, current, 1)]).exitCode).toBe(0);
+      expect(await readFile(worker, "utf8")).toContain("READY");
+      proc.stdin.write("still-live\n"); proc.stdin.end();
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain("still-live");
+      await proc.exited;
+      expect(Bun.spawnSync(["sh", "-c", buildPruneStaleWorkersCommand(ns, current, 1)]).exitCode).toBe(0);
+      expect(await readdir(ns)).toEqual([current]);
+    } finally { proc.kill(); await proc.exited; await rm(ns, { recursive: true, force: true }); }
+  });
   test("keeps the active hash plus the newest other version and ignores foreign entries", async () => {
     const base = await mkdtemp(join(tmpdir(), "worker-prune-"));
     const ns = join(base, "omp-1");

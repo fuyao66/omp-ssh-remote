@@ -1,5 +1,5 @@
 import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { resolve } from "node:path";
 import { resolveOmpHostVersion } from "../src/omp/host-identity.ts";
 
 type Target = "arm64" | "x64";
@@ -32,7 +32,6 @@ const addonFiles =
 const root = resolve(import.meta.dir, "..");
 const cache = resolve(root, `.cache/native-${archTag}`, hostVersion);
 const packageDir = resolve(cache, "package");
-const archivePath = resolve(cache, `embedded-addons.${archTag}.tar.gz`);
 const embeddedModule = resolve(cache, "embedded-addon.ts");
 const dist = resolve(root, "packages/omp/dist");
 const outfile = resolve(dist, `worker-linux-${target}`);
@@ -70,26 +69,23 @@ for (const file of addonFiles) {
   }
 }
 
-const archiveEntries: Record<string, Uint8Array> = {};
+const imports: string[] = [];
 const fileSpecs: string[] = [];
-for (const file of addonFiles) {
+for (const [index, file] of addonFiles.entries()) {
   const addon = await readFile(resolve(packageDir, file.filename));
-  archiveEntries[file.filename] = addon;
+  const zstdPath = resolve(cache, `${file.filename}.zst`);
+  await Bun.write(zstdPath, Bun.zstdCompressSync(addon));
+  imports.push(`import zstdPath${index} from ${JSON.stringify(zstdPath)} with { type: "file" };`);
   fileSpecs.push(
-    `{ variant: ${JSON.stringify(file.variant)}, filename: ${JSON.stringify(file.filename)}, size: ${addon.byteLength} }`,
+    `{ variant: ${JSON.stringify(file.variant)}, filename: ${JSON.stringify(file.filename)}, size: ${addon.byteLength}, zstdPath: zstdPath${index} }`,
   );
 }
-await Bun.write(
-  archivePath,
-  await new Bun.Archive(archiveEntries, { compress: "gzip", level: 9 }).bytes(),
-);
 await writeFile(
   embeddedModule,
-  `import archivePath from ${JSON.stringify(archivePath)} with { type: "file" };\n` +
+  `${imports.join("\n")}\n` +
     `export const embeddedAddon = {\n` +
     `  platformTag: ${JSON.stringify(archTag)},\n` +
     `  version: ${JSON.stringify(hostVersion)},\n` +
-    `  archive: { format: "tar.gz", filename: ${JSON.stringify(basename(archivePath))}, filePath: archivePath },\n` +
     `  files: [${fileSpecs.join(", ")}],\n` +
     `};\n`,
 );

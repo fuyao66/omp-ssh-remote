@@ -24,6 +24,9 @@ import {
 } from "./protocol.ts";
 import { resolveOmpHostVersion } from "./omp/host-identity.ts";
 import { toolParametersToWire } from "./omp/runtime-contract.ts";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
+import { captureExecutionSettings } from "./omp/execution-settings.ts";
 
 const JS_EVAL_PROCESS_ARG = "__omp_worker_js_eval_process";
 
@@ -131,6 +134,18 @@ async function initialize(request: InitializeRequest): Promise<void> {
     onLaunchCompletion: (notification) => new Promise<void>((resolve, reject) => {
       pendingEvents.set(notification.completionId, { resolve, reject });
       send({ type: "event", event: "launch-completion", payload: notification as unknown as Record<string, unknown> });
+    }),
+  });
+  // The native shell executor reads Settings.init(), not ToolSession.settings.
+  // This process owns one session; initialize its in-memory shell settings
+  // from the same allowlist, outside the remote project's config scope.
+  const settingsCwd = runtime.session.getArtifactsDir!()!;
+  await Settings.init({
+    inMemory: true,
+    cwd: settingsCwd,
+    agentDir: settingsCwd,
+    overrides: captureExecutionSettings({
+      get: (key) => lookup(key)?.get(runtime!.session.settings),
     }),
   });
   const requested = new Set(request.tools);

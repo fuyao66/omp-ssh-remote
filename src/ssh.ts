@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { posix } from "node:path";
 
 export type SshConnectionOptions = {
   target: string;
@@ -94,6 +95,6 @@ export function buildSshWorkerCommand(options: SshWorkerOptions): string[] {
   return [
     ...buildSshBaseCommand(options),
     options.target,
-    `exec ${quoteRemoteArgument(options.workerPath)}`,
+    `exec flock --shared ${quoteRemoteArgument(posix.join(posix.dirname(options.workerPath), ".worker.lock"))} ${quoteRemoteArgument(options.workerPath)}`,
   ];
 }
