@@ -18,11 +18,11 @@ OMP SSH Remote 将 Oh My Pi 控制面保留在本机，同时通过 SSH 在远�
 - 带 `name` 的 `bash` 启动远端服务。服务 `proc://<name>` 的读写（包括 `/kill`、`/mode`）路由远端；裸 `read proc://` 合并两端列表。本机 job/agent 名称优先，启动时拒绝冲突名称。远端服务通过本机协调 job 接入原生 `wait`；断连令 job 失败，不回落到本机执行。
 - `/remote-exit`、session 关闭或传输丢失时，companion 会停止本 session 启动的受监管进程；以 `persist` 或 `detached` 启动的进程按显式要求存活，与原生 OMP 一致。
 
-普通非隔离子代理继承连接配置，但各自使用独立 companion。准入比较远端执行契约和原生工具 schema。`task isolated:true` 继续明确拒绝。保留宿主原生审批规则，连接返回前等待 wrapper 激活。
+普通非隔离子代理继承连接配置，但各自使用独立 companion。准入比较远端执行契约和原生工具 schema。`task isolated:true` 继续明确拒绝。保留宿主原生审批规则；wrapper 在 session 初始化、首个模型请求前安装，不在连接时临时注册。
 
 服务在远端启动前先预留本机 job；本机容量满时不会先启动一个无人追踪的服务。启动期间的提前完成通知会保留，成功启动后取消会停止远端服务。
 
-连接期间明确拒绝用户直接 shell（`!`/`!!`）和 Python 快捷入口，避免静默执行本机命令；请使用远端 `bash`/`eval`，或退出连接后使用本机快捷入口。未适配的 `find`、`security_scan`、`checkpoint`、`rewind`、`ida`（包括 xdev 入口）明确拒绝。远端 eval 只支持计算和远端工作区工具回调，不桥接本机 agent/workpool、judge/completion、archive、browser、todo；工具描述和每轮提示明确此边界，本机编排请用顶层工具。
+连接期间明确拒绝用户直接 shell（`!`/`!!`）和 Python 快捷入口，避免静默执行本机命令；请使用远端 `bash`/`eval`，或退出连接后使用本机快捷入口。未适配的 `find`、`security_scan`、`checkpoint`、`rewind`、`ida`（包括 xdev 入口）明确拒绝。远端 eval 只支持计算和远端工作区工具回调，不桥接本机 agent/workpool、judge/completion、archive、browser、todo；固定的工作区说明解释此边界，本机编排请用顶层工具。
 
 截断输出保存在远端 `~/.cache/omp-ssh-remote/artifacts/<namespace>`。连接到同一主机后，可用 `read` selector 或 `grep` 读取返回的 `remote-artifact://<namespace>/<id>`。companion 正常退出时删除自己的 namespace，启动时清扫超过一小时且所属 worker 已不存在的 namespace；因此 transport 丢失遗留的 artifact 会过期，但永远不会复制到本机。本机 `artifact://` 仍保持本机语义。`xd://debug` 与直接 debug 一样在远端执行。
 
@@ -117,6 +117,16 @@ adapter 探测远端平台和 home，选择 package 自带的对应 worker，校
 | 前台 Bash | `17.01 ms` |
 
 worker 初始化 `2439 ms`。另一次首次上传／部署耗时 `88.36 s`，该轮 read/bash 中位数约 `0.8 s`，后续交错对照测量恢复到上表水平。这不是受控的前后加速对比。宿主 schema 缓存减少重复构造元数据 runtime，但不减少每个 worker 的基础内存，本次不宣称内存降低。ARM64 仅完成构建验证，未进行实机性能验收。
+
+## 提示缓存稳定性
+
+连接、断开、重连只切换执行绑定，不改变工具列表或描述。`remote_workspace_status` 的固定说明讲清路由规则、远端限制和何时查状态。保留原生审批和渲染，不替换其他插件拥有的工具。启动时没有绑定的工具在远端明确拒绝，不通过重连临时注册。
+
+绑定变化后，在下一次模型请求的上下文末尾追加简短通知，不额外启动模型回合。状态不变不重复提醒。通知及其消息锚点作为扩展数据保存，不改写原始 transcript；后续请求在原位置重放通知。压缩移除锚点时重新追加当前状态。恢复历史不会因为旧通知写着远端就恢复 SSH 连接。切换期间的调用不会在新环境重试，过期结果和更新会被拒绝或抑制。
+
+`scripts/smoke-cache.ts` 在真实 OMP 中使用本地 HTTP 接收端和合成回复，对比本机、连接、重连、断开前后的实际序列化工具、系统消息和完整历史前缀，同时通过 SSH 执行真实工作区命令。它验证前缀相等，**不伪造供应商 cached tokens 或费用节省数字**。可复现命令见 [English README](README.md#prompt-cache-stability)。
+
+升级或 reload 插件本身可能引起一次初始前缀变化。模型／配置切换、其他插件、上下文压缩以及供应商缓存过期不属于连接切换保证。本次只需重新构建本机扩展，无需重新部署 companion 二进制。
 
 ## 限制
 

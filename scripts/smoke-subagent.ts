@@ -172,6 +172,9 @@ if (!connect || !exit)
 let ownerConnected = false;
 let childConnected = false;
 try {
+  for (const handler of owner.handlers.session_start ?? []) {
+    await handler({ type: "session_start" }, owner.context);
+  }
   await within(
     "connecting owner",
     connect.handler(

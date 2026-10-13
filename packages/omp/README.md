@@ -18,11 +18,11 @@ Background execution is split by ownership rather than by tool name:
 - Named `bash` calls launch remote services. Service `proc://<name>` reads and writes (including `/kill` and `/mode`) execute remotely. Bare `read proc://` combines local and remote listings. Local jobs and agents take precedence over service names; conflicting names are rejected at launch. A local coordination job makes remote service exits visible to native `wait`; transport loss fails that job without moving execution locally.
 - On `/remote-exit`, session shutdown, or transport loss the companion stops the supervised processes this session started unless they were launched with `persist` or `detached`; those survive by explicit request, like native OMP.
 
-Ordinary non-isolated subagents inherit connection configuration but receive independent companions. Admission compares the remote execution contract and native tool schemas. `task isolated:true` remains rejected. Native host approval rules are preserved and connection waits for wrapper activation.
+Ordinary non-isolated subagents inherit connection configuration but receive independent companions. Admission compares the remote execution contract and native tool schemas. `task isolated:true` remains rejected. Native host approval rules are preserved; wrappers are installed at session initialization, before the first model request, not when connecting.
 
 Service coordination reserves a local job before remote startup; a full job manager cannot leave an untracked service running. Completion during startup is retained, and cancellation after successful startup stops the remote service.
 
-While connected, direct user shell (`!`/`!!`) and Python shortcuts are explicitly refused rather than silently executed locally. Use remote `bash`/`eval`, or disconnect before using local shortcuts. `find`, `security_scan`, `checkpoint`, `rewind`, and `ida` are not remote-adapted and are blocked (including their xdev entrypoints). Remote eval supports computation and remote workspace callbacks only: local agent/workpool, judge/completion, archive, browser, and todo helpers are not bridged. Its tool description and per-turn notice disclose this boundary; use top-level local orchestration tools instead.
+While connected, direct user shell (`!`/`!!`) and Python shortcuts are explicitly refused rather than silently executed locally. Use remote `bash`/`eval`, or disconnect before using local shortcuts. `find`, `security_scan`, `checkpoint`, `rewind`, and `ida` are not remote-adapted and are blocked (including their xdev entrypoints). Remote eval supports computation and remote workspace callbacks only: local agent/workpool, judge/completion, archive, browser, and todo helpers are not bridged. The fixed workspace contract explains this distinction; use top-level local orchestration tools instead.
 
 Truncated output is stored remotely under `~/.cache/omp-ssh-remote/artifacts/<namespace>`. Use returned `remote-artifact://<namespace>/<id>` references with `read` selectors or `grep` while connected to that host. The companion deletes its own namespace on normal exit and, at startup, sweeps namespaces older than one hour whose owning worker is gone; artifacts left by a transport loss therefore expire, they are never copied locally. Local `artifact://` references remain local. The `xd://debug` entry executes remotely like direct debug.
 
@@ -117,6 +117,23 @@ October 2026, OMP 18.9.1 on trialsfinder Linux x86_64, cached worker and persist
 | foreground Bash | `17.01 ms` |
 
 Worker initialization was `2439 ms`. A separate initial upload/deployment took `88.36 s`; that run's read/bash medians were roughly `0.8 s`. The later interleaved control returned to the values above. Do not treat these runs as a controlled speedup comparison. Host schema caching avoids repeated metadata-runtime construction but does not reduce each worker's baseline memory; no memory reduction is claimed. ARM64 received build validation, not live performance acceptance.
+
+## Prompt Cache Stability
+
+Connect, disconnect and reconnect change the execution binding, not the tool roster or descriptions. The fixed `remote_workspace_status` description explains routing, remote limitations and when to query status. Native approvals and renderers remain attached; other plugins' tools are not replaced. Tools not bound at startup fail closed remotely rather than being dynamically registered on reconnect.
+
+On a binding change, a short notice is appended to the next provider context without starting another model turn. Unchanged bindings emit no repeated notices. Notice anchors are saved as extension data (not transcript messages) and replayed in their original positions; if compaction removes the anchor, the current state is appended again. Resuming a transcript never restores an SSH connection just because an old notice says it was remote. Calls that overlap a binding change are not retried in the new workspace; stale results and updates are rejected or suppressed.
+
+`scripts/smoke-cache.ts` runs native OMP against a local HTTP endpoint returning synthetic replies. It compares the actual serialized tools, system messages and complete previous request prefix across local/remote/reconnect/local transitions, and executes real workspace commands over SSH. It measures prefix equality, **not provider cache-hit tokens or savings**. Run from the repository root (the bundle is placed beside the workers):
+
+```sh
+bun run build
+bun build scripts/smoke-cache.ts --target=bun --minify --external '@oh-my-pi/pi-coding-agent' --external '@oh-my-pi/pi-agent-core' --external '@oh-my-pi/pi-natives' --outfile=packages/omp/dist/cache-smoke.js
+REMOTE_CONNECT_ARGS='gpu-box /tmp' omp --no-extensions --no-skills --no-rules --no-title --session-dir /tmp/omp-cache-smoke-sessions -e "$PWD/packages/omp/dist/cache-smoke.js" --approval-mode yolo -p /remote-cache-smoke
+rm packages/omp/dist/cache-smoke.js
+```
+
+One plugin upgrade/reload can change the initial prefix. Model/configuration changes, other extensions, compaction and provider cache expiration are outside the connection-switch guarantee. This change requires only rebuilding the local extension, not redeploying companion binaries.
 
 ## Limits
 

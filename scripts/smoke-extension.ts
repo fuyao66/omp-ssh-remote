@@ -43,6 +43,7 @@ type CapturedCommand = {
 const commands = new Map<string, CapturedCommand>();
 const tools = new Map<string, ToolDefinition>();
 const events = new Set<string>();
+const eventHandlers = new Map<string, (...args: any[]) => unknown>();
 
 const schemaRuntime = await createNativeWorkerRuntime(process.cwd(), "smoke");
 const nativeTools = REMOTE_TOOL_NAMES.map((name) => ({
@@ -69,7 +70,8 @@ const apiHarness = {
   getAllTools() {
     return nativeTools;
   },
-  on(event: string) {
+  on(event: string, handler: (...args: any[]) => unknown) {
+    eventHandlers.set(event, handler);
     events.add(event);
   },
   sendMessage(message: { customType?: string; details?: unknown }) {
@@ -116,16 +118,13 @@ const commandContext = {
     },
   },
 } as unknown as ExtensionCommandContext;
+await eventHandlers.get("session_start")?.({}, commandContext);
 const connect = commands.get("remote-connect");
 if (!connect) throw new Error("remote-connect was not registered");
 const connectArgs = alias
   ? `${alias} ${cwd}`
   : `${target} ${cwd} --port ${port} --identity ${identityFile} --known-hosts ${knownHostsFile}`;
 await connect.handler(connectArgs, commandContext);
-if (events.has("context"))
-  throw new Error(
-    "Extension registered a model-visible workspace-state handler",
-  );
 const exit = commands.get("remote-exit");
 if (!exit) throw new Error("remote-exit was not registered");
 

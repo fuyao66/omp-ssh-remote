@@ -29,7 +29,6 @@ describe("OMP extension loading", () => {
       "remote-reconnect",
       "remote-status",
     ]);
-    expect(events.has("context")).toBe(false);
     const status = tools.get("remote_workspace_status");
     const connect = tools.get("remote_connect");
     const exit = tools.get("remote_exit");

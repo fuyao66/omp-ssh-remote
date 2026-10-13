@@ -38,6 +38,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { VERSION as INSTALLED_OMP_VERSION } from "@oh-my-pi/pi-utils";
 import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { captureExecutionSettings, type RemoteExecutionSettings } from "./omp/execution-settings.ts";
+import { WORKSPACE_RULES, WORKSPACE_CONTEXT_ENTRY, projectWorkspaceContext, type WorkspaceNoticeAnchor } from "./omp/workspace-context.ts";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 
 /**
@@ -229,6 +230,7 @@ type RemoteConnectOptions = Omit<RemoteConnectRequest, "cwd"> & {
   cwd: string;
 };
 type RemoteExtensionState = {
+  binding: string;
   client?: RemoteRuntimeClient;
   deployment?: AbortController;
   remoteCwd?: string;
@@ -471,6 +473,7 @@ async function executionTarget(
   ctx: ExtensionContext,
   signal?: AbortSignal,
 ): Promise<ExecutionTarget> {
+  if (!state.selected) return "local";
   const processPath = typeof params.path === "string" ? /^proc:\/\/([^/:;?#]*)(?:\/|$)/.exec(params.path) : undefined;
   if (processPath?.[1]) {
     const id = processPath[1];
@@ -619,25 +622,32 @@ function registerWrapper(
   const original = hostSession?.getToolByName(name);
   pi.registerTool({
     name,
-    label: TOOL_LABELS[name],
-    get description() {
-      return name === "eval" && state.selected
-        ? "Execute Python or JavaScript in the remote workspace. Persistent compute kernels and remote file/command tools only. Local agent/workpool, judge/completion, archive, browser, todo and other control-plane helpers are unavailable here. Use the corresponding top-level local tools instead; never assume local eval documentation applies to this remote kernel."
-        : native.description;
-    },
+    label: original?.label ?? TOOL_LABELS[name],
+    description: native.description,
     parameters: native.parameters,
     ...remoteWrapperRenderer(name),
-    loadMode: "essential",
+    loadMode: original?.loadMode ?? "essential",
+    readsSkillUris: original?.readsSkillUris,
+    deferrable: original?.deferrable,
+    strict: original?.strict,
+    ...{ customWireName: original?.customWireName },
     approval: original?.approval ?? approvalFor(name),
     async execute(toolCallId, rawParams, signal, rawOnUpdate, ctx) {
       const params = rawParams as Record<string, unknown>;
+      const binding = state.binding;
+      const ensureCurrent = () => {
+        if (state.binding !== binding) throw new Error("Workspace binding changed during this call; execution was not retried in the new workspace. Recheck the current workspace before continuing.");
+      };
       const target = await executionTarget(name, params, state, ctx, signal);
+      ensureCurrent();
       if (name === "bash" && target === "remote" && params.async === true && !params.name) {
         return startRemoteAsyncBash(toolCallId, params, state, ctx);
       }
       if (name === "read" && params.path === "proc://" && target === "remote") {
         const remote = await executeWithTarget(target, name, toolCallId, params, state, ctx, signal);
+        ensureCurrent();
         const local = await executeWithTarget("local", name, `${toolCallId}:local`, params, state, ctx, signal);
+        ensureCurrent();
         return { content: [...local.content, { type: "text", text: "Remote services:" }, ...remote.content], details: { local: local.details, remote: remote.details } };
       }
       const serviceName = name === "bash" && target === "remote" && typeof params.name === "string" ? params.name : undefined;
@@ -645,10 +655,13 @@ function registerWrapper(
       if (serviceName && (manager?.getAllJobs().some((job) => job.id === serviceName) || AgentRegistry.global().list().some((agent) => agent.id === serviceName))) {
         throw new Error(`Remote service name ${serviceName} conflicts with a local job or agent`);
       }
-      const execute = (executionSignal = signal) => executeWithTarget(
-        target, name, toolCallId, params, state, ctx, executionSignal,
-        rawOnUpdate as (update: unknown) => void,
-      );
+      const execute = (executionSignal = signal) => {
+        ensureCurrent();
+        return executeWithTarget(
+          target, name, toolCallId, params, state, ctx, executionSignal,
+          (update) => { if (state.binding === binding) rawOnUpdate?.(update as AgentToolResult); },
+        );
+      };
       let result: AgentToolResult;
       if (serviceName) {
         if (!manager || !state.client) throw new Error("Remote service requires the current session job manager and transport");
@@ -658,6 +671,7 @@ function registerWrapper(
       } else {
         result = await execute();
       }
+      ensureCurrent();
       if (
         (name === "ast_edit" ||
           (name === "write" &&
@@ -718,6 +732,8 @@ async function registerActiveWrappers(
     const native = metadata.get(name);
     if (!native)
       throw new Error(`OMP native tool metadata is unavailable: ${name}`);
+    // Preserve other plugins' ownership; remote calls to unbound names fail closed.
+    if (native.sourceInfo.source !== "builtin") continue;
     registerWrapper(pi, state, name, native);
   }
   const hostSession = AgentRegistry.global().list().find((ref) => ref.sessionFile === state.sessionFile)?.session;
@@ -730,6 +746,7 @@ function detachRemoteState(
 ): RemoteRuntimeClient | undefined {
   const current = state.client;
   state.client = undefined;
+  state.binding = crypto.randomUUID();
   state.remoteCwd = restoreLocal ? undefined : state.remoteCwd;
   state.selected = !restoreLocal;
   state.owner = false;
@@ -872,6 +889,7 @@ async function reconnectRemoteRuntime(
   }
   const previous = state.client;
   state.client = undefined;
+  state.binding = crypto.randomUUID();
   previous?.kill();
   const droppedRemoteProposals = state.proposalSources.filter((source) => source === "remote").length;
   state.proposalSources = state.proposalSources.filter((source) => source === "local");
@@ -897,7 +915,6 @@ async function reconnectRemoteRuntime(
     state.client = client;
     state.remoteCwd = remoteCwd;
     state.connectionError = undefined;
-    await registerActiveWrappers(pi, state);
     return {
       target: family.connection.displayTarget,
       remoteCwd,
@@ -930,11 +947,11 @@ async function attachFamilyMember(
 ): Promise<void> {
   if (state.selected) return;
   state.selected = true;
+  state.binding = crypto.randomUUID();
   state.owner = false;
   state.family = family;
   state.remoteCwd = family.remoteCwd;
   family.members.add(state);
-  await registerActiveWrappers(pi, state);
 
   if (
     !state.localCwd ||
@@ -966,6 +983,7 @@ export default async function remoteRuntimeExtension(
   pi: ExtensionAPI,
 ): Promise<void> {
   const state: RemoteExtensionState = {
+    binding: crypto.randomUUID(),
     wrappedTools: new Set(),
     proposalSources: [],
     selected: false,
@@ -979,6 +997,7 @@ export default async function remoteRuntimeExtension(
       }
     },
   };
+  let workspaceNotices: WorkspaceNoticeAnchor[] = [];
   // Compare the running host against the version this bundle (and its
   // companion workers) were compiled for. A mismatch is the usual root cause of
   // "schema is incompatible" handshake rejections after `omp update`.
@@ -989,7 +1008,7 @@ export default async function remoteRuntimeExtension(
     name: REMOTE_WORKSPACE_STATUS_TOOL,
     label: "Remote Workspace Status",
     description:
-      "Report the current known remote workspace mode and routing boundary. Use before workspace work when the execution location is unclear, after a remote tool error, or when asked whether paths run locally or remotely. This reads extension state only; it does not send an SSH health probe.",
+      `Report the current workspace binding and execution boundaries. ${WORKSPACE_RULES}`,
     parameters: z.object({}),
     loadMode: "essential",
     approval: "read",
@@ -1092,6 +1111,7 @@ export default async function remoteRuntimeExtension(
           closing: false,
         };
         state.client = next;
+        state.binding = crypto.randomUUID();
         state.remoteCwd = resolvedRemoteCwd;
         state.localCwd = localCwd;
         state.sessionFile = normalizedSessionFile;
@@ -1100,7 +1120,6 @@ export default async function remoteRuntimeExtension(
         state.family = family;
         state.connectionError = undefined;
         REMOTE_FAMILIES.set(normalizedSessionFile, family);
-        await registerActiveWrappers(pi, state);
         ctx?.ui?.setStatus?.(
           "remote-runtime",
           `ssh ${request.displayTarget}:${ready.cwd}`,
@@ -1275,6 +1294,7 @@ export default async function remoteRuntimeExtension(
           closing: false,
         };
         state.client = next;
+        state.binding = crypto.randomUUID();
         state.remoteCwd = resolvedRemoteCwd;
         state.localCwd = ctx.cwd;
         state.sessionFile = normalizedSessionFile;
@@ -1283,7 +1303,6 @@ export default async function remoteRuntimeExtension(
         state.family = family;
         state.connectionError = undefined;
         REMOTE_FAMILIES.set(normalizedSessionFile, family);
-        await registerActiveWrappers(pi, state);
         ctx.ui.setStatus(
           "remote-runtime",
           `ssh ${request.displayTarget}:${ready.cwd}`,
@@ -1390,6 +1409,16 @@ export default async function remoteRuntimeExtension(
     if (!sessionFile) return;
     const normalized = resolvePath(sessionFile);
     state.sessionFile = normalized;
+    workspaceNotices = [];
+    const branch = ctx.sessionManager.getBranch?.() ?? [];
+    for (let index = branch.length - 1; index >= 0; index--) {
+      const entry = branch[index];
+      if (entry.type === "custom" && entry.customType === WORKSPACE_CONTEXT_ENTRY && Array.isArray(entry.data)) {
+        workspaceNotices = entry.data;
+        break;
+      }
+    }
+    await registerActiveWrappers(pi, state);
     const family = findRemoteFamily(normalized);
     if (!family) return;
     await attachFamilyMember(pi, state, family, ctx);
@@ -1454,9 +1483,17 @@ export default async function remoteRuntimeExtension(
   };
   pi.on("user_bash", () => state.selected ? { result: blockedUserExecution() } : undefined);
   pi.on("user_python", () => state.selected ? { result: { ...blockedUserExecution(), displayOutputs: [], stdinRequested: false } } : undefined);
-  pi.on("before_agent_start", () => state.selected ? {
-    message: { customType: "remote-workspace-boundary", content: "Remote workspace active. bash/eval operate remotely. Eval is a remote compute kernel, not a local orchestration kernel: agent/workpool, judge/completion, archive/browser and local tool callbacks are unavailable. Use top-level local task/todo/wait tools for orchestration. find/security_scan/checkpoint/rewind/ida and direct user shell/Python shortcuts are blocked until remote-exit.", display: false },
-  } : undefined);
+  pi.on("context", (event) => {
+    const projected = projectWorkspaceContext(event.messages, workspaceNotices, {
+      binding: state.binding,
+      mode: !state.selected ? "local" : (!state.client || state.client.isClosed || state.connectionError) ? "unavailable" : "remote",
+      target: state.selected ? state.family?.connection.displayTarget ?? null : null,
+      cwd: (state.selected ? state.remoteCwd : state.localCwd) ?? null,
+    });
+    workspaceNotices = projected.records;
+    if (projected.changed) pi.appendEntry(WORKSPACE_CONTEXT_ENTRY, workspaceNotices);
+    return { messages: projected.messages };
+  });
 
   pi.on("tool_call", (event) => {
     if (!state.selected) return;
@@ -1473,7 +1510,7 @@ export default async function remoteRuntimeExtension(
       return;
     return {
       block: true,
-      reason: `Remote runtime is selected, but ${event.toolName} is not remotely bound. Reconnect to refresh the active tool surface.`,
+      reason: `Remote runtime is selected, but ${event.toolName} was not bound at session initialization. Restart with the required tool enabled; execution is blocked rather than falling back locally.`,
     };
   });
 
