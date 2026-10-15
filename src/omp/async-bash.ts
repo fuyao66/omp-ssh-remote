@@ -33,6 +33,7 @@ export interface RemoteAsyncBashJobOptions {
   remoteCwd: string;
   maxTimeout?: number;
   execute: RemoteAsyncBashExecutor;
+  onUpdate?: (update: AgentToolResult) => void;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -104,27 +105,45 @@ export function startRemoteAsyncBashJob(
     "bash",
     label,
     async ({ jobId, signal, reportProgress }) => {
-      const result = await execute(remoteParams, signal, (update) => {
-        const text = textOf(update);
-        if (text)
-          void reportProgress(text, {
-            async: { state: "running", jobId, type: "bash" },
-            remoteCwd,
-          });
-      });
-      const text = textOf(result);
-      if (asRecord(result).isError === true) {
-        await reportProgress(text, {
-          async: { state: "failed", jobId, type: "bash" },
+      let ended = false;
+      let latestDetails: Record<string, unknown> = {};
+      const report = (
+        text: string,
+        state: "running" | "completed" | "failed" | "cancelled",
+      ): Promise<void> => {
+        if (ended || (state === "running" && signal.aborted))
+          return Promise.resolve();
+        if (state !== "running") ended = true;
+        const details: Record<string, unknown> = {
+          ...latestDetails,
+          async: { state, jobId, type: "bash" },
           remoteCwd,
+        };
+        const reported = reportProgress(text, details);
+        // Job listings retain output; the live card already renders the text.
+        const { output: _output, ...frame } = details;
+        options.onUpdate?.({ content: [{ type: "text", text }], details: frame });
+        return reported;
+      };
+      try {
+        const result = await execute(remoteParams, signal, (update) => {
+          if (ended || signal.aborted) return;
+          latestDetails = asRecord(asRecord(update).details);
+          void report(textOf(update), "running");
         });
-        throw new Error(text || `Remote bash job ${jobId} failed`);
+        latestDetails = asRecord(result.details);
+        const text = textOf(result);
+        if (signal.aborted)
+          throw new Error(text || `Remote bash job ${jobId} cancelled`);
+        if (result.isError === true)
+          throw new Error(text || `Remote bash job ${jobId} failed`);
+        await report(text, "completed");
+        return text;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await report(message, signal.aborted ? "cancelled" : "failed");
+        throw error;
       }
-      await reportProgress(text, {
-        async: { state: "completed", jobId, type: "bash" },
-        remoteCwd,
-      });
-      return text;
     },
     { ownerId },
   );

@@ -22,6 +22,10 @@ Ordinary non-isolated subagents inherit connection configuration but receive ind
 
 Service coordination reserves a local job before remote startup; a full job manager cannot leave an untracked service running. Completion during startup is retained, and cancellation after successful startup stops the remote service.
 
+OMP 18.11 compatibility: remote async Bash forwards live and terminal card updates while the local job manager still owns logs and `wait`. Named service readiness observes the owning session's steering and peer-message queues; an incoming steer ends only the readiness wait, not the service. Follow-ups and `interruptMode: wait` do not trigger it. This uses public session events rather than the native tool's private steering signal; hidden internal steering without a session queue event is not bridged. Remote `read`/`grep` and hashline `edit` share the native truncated-line protection: reread complete lines with `:raw` before editing them.
+
+Successful explicit service stops also settle their local coordination jobs from the native stop receipt. They are not treated as natural exits: the broker deliberately sends no `daemon-completed` event for an explicit stop. Failed stops leave tracking intact.
+
 While connected, direct user shell (`!`/`!!`) and Python shortcuts are explicitly refused rather than silently executed locally. Use remote `bash`/`eval`, or disconnect before using local shortcuts. `find`, `security_scan`, `checkpoint`, `rewind`, and `ida` are not remote-adapted and are blocked (including their xdev entrypoints). Remote eval supports computation and remote workspace callbacks only: local agent/workpool, judge/completion, archive, browser, and todo helpers are not bridged. The fixed workspace contract explains this distinction; use top-level local orchestration tools instead.
 
 Truncated output is stored remotely under `~/.cache/omp-ssh-remote/artifacts/<namespace>`. Use returned `remote-artifact://<namespace>/<id>` references with `read` selectors or `grep` while connected to that host. The companion deletes its own namespace on normal exit and, at startup, sweeps namespaces older than one hour whose owning worker is gone; artifacts left by a transport loss therefore expire, they are never copied locally. Local `artifact://` references remain local. The `xd://debug` entry executes remotely like direct debug.
@@ -40,7 +44,7 @@ flowchart LR
 
 ## Requirements
 
-- local Linux or WSL with OMP `>=18.9.1`, Bun `1.3.14+`, npm, tar, OpenSSH, and SCP;
+- local Linux or WSL with OMP `>=18.11.0`, Bun `1.3.14+`, npm, tar, OpenSSH, and SCP;
 - remote glibc Linux `x86_64` or `aarch64`;
 - public-key SSH that succeeds in batch mode;
 - an existing remote project directory;
@@ -71,7 +75,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 Restart OMP after linking. Updating requires `git pull`, rebuilding the extension and workers, then restarting or reloading the plugin. Reloading while connected closes that session's companion; reconnect afterward.
 
-The companion is built against OMP 18.9.1 (runtime contract 0.8.0). Upgrades that change tool schemas require rebuilding both workers, not just reloading the extension. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Handshake failures report version and schema drift.
+The companion is built against OMP 18.11.0 (runtime contract 0.9.0), including the native broker IPC migration. Rebuild both workers when updating runtime dependencies, even if wire schemas have not changed. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Handshake failures report version and schema drift.
 
 Connection UI reports probe/check/upload/activation stages. The `remote_connect` tool honors cancellation; `/remote-exit` cancels a pending command deployment. Same-host deployments in one extension instance are serialized and recheck the cache, avoiding duplicate uploads. Failed uploads are removed on a best-effort basis if SSH is still reachable. Host schema metadata is cached per loaded extension instance for reconnects and child sessions.
 
@@ -133,12 +137,14 @@ REMOTE_CONNECT_ARGS='gpu-box /tmp' omp --no-extensions --no-skills --no-rules --
 rm packages/omp/dist/cache-smoke.js
 ```
 
-One plugin upgrade/reload can change the initial prefix. Model/configuration changes, other extensions, compaction and provider cache expiration are outside the connection-switch guarantee. This change requires only rebuilding the local extension, not redeploying companion binaries.
+`scripts/smoke-lifecycle.ts` additionally checks real file/edit/compute/artifact behavior, async live frames and native `wait`, service steering, explicit-stop tracking, natural exit status, and local restoration. It defers agent-initiated model turns during the model-free test. Bundle it beside the workers with the same flags above, then run `/remote-lifecycle-smoke` instead of `/remote-cache-smoke`; remove the generated bundle afterward.
+
+One plugin upgrade/reload can change the initial prefix. Model/configuration changes, other extensions, compaction and provider cache expiration are outside the connection-switch guarantee. The prefix-stability mechanism itself requires only a local extension rebuild; runtime dependency or protocol changes still require rebuilding and deploying companion binaries.
 
 ## Limits
 
 - Linux glibc x86_64 and ARM64 only;
-- OMP `>=18.9.1` with matching compiled companion schemas;
+- OMP `>=18.11.0` with matching compiled companion schemas;
 - remote `flock` (util-linux) is required: workers hold shared per-version leases so cache pruning cannot delete a live worker's self-reentry executable;
 - explicit async Bash is supported; automatic backgrounding and interactive Bash PTY are not bridged;
 - no `task isolated:true` remote worktrees;

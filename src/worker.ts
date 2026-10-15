@@ -70,7 +70,7 @@ async function runJsEvalProcessHost(): Promise<void> {
 
 let runtime: NativeWorkerRuntime | undefined;
 let launchOwner: string | undefined;
-const active = new Map<string, { controller: AbortController; done: Promise<void> }>();
+const active = new Map<string, { controller: AbortController; steering: AbortController; done: Promise<void> }>();
 let cleanupPromise: Promise<void> | undefined;
 const pendingEvents = new Map<string, { resolve(): void; reject(reason: Error): void }>();
 
@@ -179,10 +179,14 @@ function startExecute(request: ExecuteRequest): void {
     return;
   }
   const controller = new AbortController();
-  // Native tools read `ctx?.toolNames` (bash interceptor) and `ctx?.ui` /
-  // `hasUI` (interactive PTY). The companion has no UI, so only the active
-  // tool names the local session reported are materialized here.
-  const context = request.toolNames ? { toolNames: request.toolNames, hasUI: false } : undefined;
+  const steering = new AbortController();
+  // Steering ends only the native readiness wait; cancellation still aborts
+  // the operation. No host UI, credentials or model state enters this context.
+  const context = {
+    ...(request.toolNames ? { toolNames: request.toolNames } : {}),
+    hasUI: false,
+    ...(request.steering ? { toolCall: { steeringSignal: steering.signal } } : {}),
+  };
   const done = (async () => {
     try {
       const result = await tool.execute(
@@ -199,7 +203,7 @@ function startExecute(request: ExecuteRequest): void {
       active.delete(request.id);
     }
   })();
-  active.set(request.id, { controller, done });
+  active.set(request.id, { controller, steering, done });
 }
 
 async function dispatch(request: Request): Promise<boolean> {
@@ -212,6 +216,9 @@ async function dispatch(request: Request): Promise<boolean> {
       return true;
     case "cancel":
       active.get(request.id)?.controller.abort(new Error("Remote tool call cancelled"));
+      return true;
+    case "steer":
+      active.get(request.id)?.steering.abort(new Error("Host message queued"));
       return true;
     case "event-ack":
       pendingEvents.get(request.id)?.resolve();

@@ -12,6 +12,16 @@ export function completeService(client: RemoteRuntimeClient, name: string, resul
   return true;
 }
 
+/** Native explicit stops intentionally do not emit daemon-completed. */
+export function completeStoppedService(
+  client: RemoteRuntimeClient,
+  result: AgentToolResult,
+): boolean {
+  const proc = (result.details as { proc?: { action?: string; daemon?: { name?: string } } })?.proc;
+  if (result.isError || proc?.action !== "stop" || !proc.daemon?.name) return false;
+  return completeService(client, proc.daemon.name, { operation: "stop", result });
+}
+
 export async function startRemoteService(
   client: RemoteRuntimeClient,
   name: string,

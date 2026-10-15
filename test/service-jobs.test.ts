@@ -1,7 +1,7 @@
 import { test, expect } from 'bun:test';
 import { AsyncJobManager } from '@oh-my-pi/pi-coding-agent/async/job-manager';
 import { RemoteRuntimeClient } from '../src/client.ts';
-import { completeService, startRemoteService } from '../src/omp/service-jobs.ts';
+import { completeService, completeStoppedService, startRemoteService } from '../src/omp/service-jobs.ts';
 const ok = { content: [{ type: 'text' as const, text: 'ready' }] };
 
 test('service reserves capacity before launch, retains early completion, and fails on disconnect', async () => {
@@ -48,5 +48,30 @@ test('launch signal expires without stopping service; job cancellation owns its 
     const job = manager.getAllJobs()[0]!;
     await job.promise;
     expect(job.status).toBe('completed');
+  } finally { client.kill(); await manager.dispose({ timeoutMs: 1000 }); }
+});
+
+test('successful explicit stop releases coordination without a completion event', async () => {
+  const manager = new AsyncJobManager({ maxRunningJobs: 1 });
+  const client = new RemoteRuntimeClient({ command: ['bun', '-e', 'setInterval(()=>{},1000)'] });
+  try {
+    await startRemoteService(client, 'manual', 'Main', manager, async () => ok);
+    const job = manager.getAllJobs()[0]!;
+    const receipt = { content: [{ type: 'text' as const, text: 'manual stopped' }], details: { proc: { action: 'stop', daemon: { name: 'manual', state: 'exited' } } } };
+    expect(completeStoppedService(client, { ...receipt, isError: true })).toBe(false);
+    expect(completeStoppedService(client, ok)).toBe(false);
+    expect(completeStoppedService(client, { ...receipt, details: { proc: { action: 'mode', daemon: { name: 'manual' } } } })).toBe(false);
+    expect(completeStoppedService(client, { ...receipt, details: { proc: { action: 'stop', daemon: { name: 'other' } } } })).toBe(false);
+    expect(job.status).toBe('running');
+    expect(completeStoppedService(client, receipt)).toBe(true);
+    await job.promise;
+    expect(job.status).toBe('completed');
+    expect(job.resultText).toContain('"operation":"stop"');
+    expect(job.resultText).not.toContain('exitCode');
+    expect(completeService(client, 'manual', {})).toBe(false);
+    await startRemoteService(client, 'manual', 'Main', manager, async () => {
+      completeService(client, 'manual', { exitCode: 0 }); return ok;
+    });
+    await Promise.all(manager.getAllJobs().map(j => j.promise));
   } finally { client.kill(); await manager.dispose({ timeoutMs: 1000 }); }
 });

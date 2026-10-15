@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { watch } from "node:fs";
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
 
@@ -45,6 +46,24 @@ describe("native worker round trip", () => {
     expect(JSON.stringify(recovered)).toContain("10002:10002");
   });
 
+  for (const via of ["read", "grep"] as const) {
+    test(`${via} cannot authorize editing a column-truncated line`, async () => {
+      const path = `long-${via}.txt`;
+      const original = `LONG_SENTINEL${"x".repeat(20_000)}TAIL_SENTINEL\n`;
+      await client.execute("write", `long-write-${via}`, { path, content: original });
+      const preview = await client.execute(via, `long-preview-${via}`, via === "read" ? { path } : { path, pattern: "LONG_SENTINEL" });
+      const header = JSON.stringify(preview).match(/\[long-(?:read|grep)\.txt#[A-F0-9]+\]/)?.[0];
+      expect(header).toBeDefined();
+      const rejected = await client.execute("edit", `long-unsafe-${via}`, {
+        input: `${header}\nPUT 1.=1:\n+replacement`,
+      }).catch((error: Error) => ({ isError: true, error: error.message }));
+      expect(rejected).toMatchObject({ isError: true });
+      expect(await readFile(join(cwd, path), "utf8")).toBe(original);
+      await client.execute("read", `long-full-${via}`, { path: `${path}:raw` });
+      await client.execute("edit", `long-safe-${via}`, { input: `${header}\nPUT 1.=1:\n+replacement` });
+      expect(await readFile(join(cwd, path), "utf8")).toBe("replacement\n");
+    });
+  }
   test("debug device executes in the worker", async () => {
     const result = await client.execute("write", "debug-device", { path: "xd://debug", content: JSON.stringify({ action: "sessions" }) });
     expect(result).toMatchObject({ details: { xdev: { tool: "debug", mode: "execute", inner: { success: true } } } });
@@ -228,6 +247,28 @@ describe("native worker round trip", () => {
     const stopped = await client.execute("write", "service-stop", { path: `proc://${name}/kill`, content: "" });
     expect(JSON.stringify(stopped)).toContain(name);
   }, 60_000);
+  test("a queued host message interrupts readiness but leaves the service running", async () => {
+    const name = `steer-${process.pid}`;
+    const marker = `${name}.started`;
+    const steering = new AbortController();
+    const watcher = watch(cwd, { persistent: false }, (_event, file) => {
+      if (file === marker) steering.abort();
+    });
+    try {
+      const started = Date.now();
+      const result = await client.execute("bash", "steer-ready", {
+        name, command: `touch '${marker}'; sleep 30`, pty: false,
+        ready: { log: "NEVER_READY", timeout: 20 },
+      }, AbortSignal.timeout(15_000), undefined, { steeringSignal: steering.signal });
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(JSON.stringify(result)).toContain("Readiness wait interrupted");
+      const status = await client.execute("read", "steer-still-running", { path: `proc://${name}` });
+      expect(JSON.stringify(status)).toContain("starting");
+    } finally {
+      watcher.close();
+      await client.execute("write", "steer-stop", { path: `proc://${name}/kill`, content: "" }).catch(() => {});
+    }
+  }, 30_000);
 });
 
 describe("hub launch ownership", () => {

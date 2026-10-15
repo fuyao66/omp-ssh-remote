@@ -29,16 +29,20 @@ describe("remote async bash job bridge", () => {
 
   test("returns a backgrounded result and completes the local job from the remote result", async () => {
     let seenParams: Record<string, unknown> | undefined;
+    const updates: AgentToolResult[] = [];
+    let emitRemoteUpdate: ((update: unknown) => void) | undefined;
     const started = startRemoteAsyncBashJob({
       manager,
       ownerId: "Main",
       command: "sleep 1; echo done",
       params: { command: "sleep 1; echo done", async: true, timeout: 60 },
       remoteCwd: "/srv/project",
+      onUpdate: (update) => updates.push(update),
       execute: async (params, _signal, onUpdate) => {
         seenParams = params;
-        onUpdate(textResult("partial"));
-        return textResult("done\n");
+        emitRemoteUpdate = onUpdate;
+        onUpdate({ ...textResult("partial"), details: { output: "partial", timeoutSeconds: 60 } });
+        return { ...textResult("done\n"), details: { output: "done\n", exitCode: 0 } };
       },
     });
     const jobId = (started.details as { async: { jobId: string } }).async.jobId;
@@ -47,6 +51,11 @@ describe("remote async bash job bridge", () => {
     expect(JSON.stringify(started)).toContain("/srv/project");
     expect(seenParams?.async).toBeUndefined();
     expect(seenParams?.command).toBe("sleep 1; echo done");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).toEqual({
+      content: [{ type: "text", text: "partial" }],
+      details: { async: { state: "running", jobId, type: "bash" }, remoteCwd: "/srv/project", timeoutSeconds: 60 },
+    });
 
     await settle(manager, jobId);
     const job = manager.getJob(jobId);
@@ -56,54 +65,92 @@ describe("remote async bash job bridge", () => {
     expect(job?.latestDetails).toMatchObject({
       async: { state: "completed", jobId, type: "bash" },
     });
+    expect(job?.latestDetails?.output).toBe("done\n");
+    expect(updates).toHaveLength(2);
+    expect(updates[1]).toEqual({
+      content: [{ type: "text", text: "done\n" }],
+      details: { async: { state: "completed", jobId, type: "bash" }, remoteCwd: "/srv/project", exitCode: 0 },
+    });
+    emitRemoteUpdate?.(textResult("late output"));
+    expect(updates).toHaveLength(2);
+    expect(job?.progressText).toBe("done\n");
   });
 
   test("marks the job failed when the remote result is an error", async () => {
+    const updates: AgentToolResult[] = [];
     const started = startRemoteAsyncBashJob({
       manager,
       ownerId: "Main",
       command: "false",
       params: { command: "false", async: true },
       remoteCwd: "/srv",
+      onUpdate: (update) => updates.push(update),
       execute: async () => textResult("exit 1", true),
     });
     const jobId = (started.details as { async: { jobId: string } }).async.jobId;
     await settle(manager, jobId);
     expect(manager.getJob(jobId)?.status).toBe("failed");
     expect(manager.getJob(jobId)?.errorText).toBe("exit 1");
+    expect(updates).toEqual([{
+      content: [{ type: "text", text: "exit 1" }],
+      details: { async: { state: "failed", jobId, type: "bash" }, remoteCwd: "/srv" },
+    }]);
+    expect(manager.getJob(jobId)?.latestDetails).toMatchObject({
+      async: { state: "failed", jobId, type: "bash" },
+    });
   });
 
   test("local cancel aborts the remote execution signal", async () => {
     let aborted = false;
+    const updates: AgentToolResult[] = [];
+    let emitRemoteUpdate: ((update: unknown) => void) | undefined;
     const started = startRemoteAsyncBashJob({
       manager,
       ownerId: "Main",
       command: "sleep 30",
       params: { command: "sleep 30", async: true },
       remoteCwd: "/srv",
-      execute: (_params, signal) =>
-        new Promise((_resolve, reject) => {
+      onUpdate: (update) => updates.push(update),
+      execute: (_params, signal, onUpdate) => {
+        emitRemoteUpdate = onUpdate;
+        onUpdate(textResult("started"));
+        return new Promise((_resolve, reject) => {
           signal.addEventListener("abort", () => {
             aborted = true;
             reject(new Error("Remote tool call cancelled"));
           });
-        }),
+        });
+      },
     });
     const jobId = (started.details as { async: { jobId: string } }).async.jobId;
     expect(manager.cancel(jobId)).toBe(true);
+    emitRemoteUpdate?.(textResult("output after abort"));
     await settle(manager, jobId);
     expect(aborted).toBe(true);
     expect(manager.getJob(jobId)?.status).toBe("cancelled");
+    expect(updates).toHaveLength(2);
+    expect(updates[0]?.details).toMatchObject({ async: { state: "running", jobId } });
+    expect(updates[1]).toEqual({
+      content: [{ type: "text", text: "Remote tool call cancelled" }],
+      details: { async: { state: "cancelled", jobId, type: "bash" }, remoteCwd: "/srv" },
+    });
+    expect(manager.getJob(jobId)?.latestDetails).toMatchObject({ async: { state: "cancelled", jobId } });
+    emitRemoteUpdate?.(textResult("late output"));
+    expect(updates).toHaveLength(2);
   });
 
   test("transport loss fails the job closed", async () => {
+    const updates: AgentToolResult[] = [];
+    let emitRemoteUpdate: ((update: unknown) => void) | undefined;
     const started = startRemoteAsyncBashJob({
       manager,
       ownerId: "Main",
       command: "sleep 30",
       params: { command: "sleep 30", async: true },
       remoteCwd: "/srv",
-      execute: async () => {
+      onUpdate: (update) => updates.push(update),
+      execute: async (_params, _signal, onUpdate) => {
+        emitRemoteUpdate = onUpdate;
         throw new Error("Remote runtime exited with code 255");
       },
     });
@@ -111,6 +158,64 @@ describe("remote async bash job bridge", () => {
     await settle(manager, jobId);
     expect(manager.getJob(jobId)?.status).toBe("failed");
     expect(manager.getJob(jobId)?.errorText).toContain("exited with code 255");
+    expect(updates).toEqual([{
+      content: [{ type: "text", text: "Remote runtime exited with code 255" }],
+      details: { async: { state: "failed", jobId, type: "bash" }, remoteCwd: "/srv" },
+    }]);
+    expect(manager.getJob(jobId)?.latestDetails).toMatchObject({ async: { state: "failed", jobId } });
+    emitRemoteUpdate?.(textResult("late output"));
+    expect(updates).toHaveLength(1);
+    expect(manager.getJob(jobId)?.progressText).toBe("Remote runtime exited with code 255");
+  });
+
+  test("keeps the card cancelled when the remote execution resolves after abort", async () => {
+    const updates: AgentToolResult[] = [];
+    let finish!: (result: AgentToolResult) => void;
+    const started = startRemoteAsyncBashJob({
+      manager,
+      ownerId: "Main",
+      command: "sleep 30",
+      params: { command: "sleep 30", async: true },
+      remoteCwd: "/srv",
+      onUpdate: (update) => updates.push(update),
+      execute: () => new Promise((resolve) => { finish = resolve; }),
+    });
+    const jobId = (started.details as { async: { jobId: string } }).async.jobId;
+    expect(manager.cancel(jobId)).toBe(true);
+    finish(textResult("remote finished during cancellation"));
+    await settle(manager, jobId);
+    expect(manager.getJob(jobId)?.status).toBe("cancelled");
+    expect(updates).toEqual([{
+      content: [{ type: "text", text: "remote finished during cancellation" }],
+      details: { async: { state: "cancelled", jobId, type: "bash" }, remoteCwd: "/srv" },
+    }]);
+  });
+
+  test("forwards metadata-only running updates under the local job identity", async () => {
+    const updates: AgentToolResult[] = [];
+    const started = startRemoteAsyncBashJob({
+      manager,
+      ownerId: "Main",
+      command: "true",
+      params: { command: "true", async: true },
+      remoteCwd: "/srv",
+      onUpdate: (update) => updates.push(update),
+      execute: async (_params, _signal, onUpdate) => {
+        onUpdate({
+          content: [],
+          details: { timeoutSeconds: 60, async: { state: "running", jobId: "remote-id" }, remoteCwd: "/wrong" },
+        });
+        return textResult("");
+      },
+    });
+    const jobId = (started.details as { async: { jobId: string } }).async.jobId;
+    expect(updates[0]).toEqual({
+      content: [{ type: "text", text: "" }],
+      details: { timeoutSeconds: 60, async: { state: "running", jobId, type: "bash" }, remoteCwd: "/srv" },
+    });
+    await settle(manager, jobId);
+    expect(updates).toHaveLength(2);
+    expect(updates[1]?.details).toMatchObject({ async: { state: "completed", jobId } });
   });
 });
 

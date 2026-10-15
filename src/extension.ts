@@ -31,7 +31,8 @@ import {
   resolveLocalAsyncJobManager,
   startRemoteAsyncBashJob,
 } from "./omp/async-bash.ts";
-import { startRemoteService, completeService } from "./omp/service-jobs.ts";
+import { startRemoteService, completeService, completeStoppedService } from "./omp/service-jobs.ts";
+import { withReadinessSteering } from "./omp/readiness-steering.ts";
 import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -536,16 +537,20 @@ async function executeWithTarget(
       throw new Error(`OMP native fallback is unavailable for ${name}`);
     return ctx.invokeTool(params, { signal, onUpdate });
   }
-  if (!state.client) throw new Error("Remote runtime is disconnected");
+  const client = state.client;
+  if (!client) throw new Error("Remote runtime is disconnected");
+  const execute = async (steeringSignal?: AbortSignal) =>
+    await client.execute(name, toolCallId, params, signal, onUpdate,
+      { toolNames: state.activeToolNames(), steeringSignal }) as AgentToolResult;
   try {
-    return (await state.client.execute(
-      name,
-      toolCallId,
-      params,
-      signal,
-      onUpdate,
-      { toolNames: state.activeToolNames() },
-    )) as AgentToolResult;
+    if (name === "bash" && typeof params.name === "string" && params.ready !== undefined) {
+      const sessionFile = ctx.sessionManager.getSessionFile() ?? state.sessionFile;
+      const session = AgentRegistry.global().list().find((ref) =>
+        sessionFile && ref.sessionFile && resolvePath(ref.sessionFile) === resolvePath(sessionFile),
+      )?.session;
+      return await withReadinessSteering(session ?? undefined, execute);
+    }
+    return await execute();
   } catch (error) {
     throw new Error(
       `Remote ${name} failed (${state.remoteCwd ?? "disconnected"}): ${error instanceof Error ? error.message : String(error)}`,
@@ -564,6 +569,7 @@ function startRemoteAsyncBash(
   params: Record<string, unknown>,
   state: RemoteExtensionState,
   ctx: ExtensionContext,
+  onUpdate?: (update: AgentToolResult) => void,
 ): AgentToolResult {
   const client = state.client;
   if (!client) throw new Error("Remote runtime is disconnected");
@@ -592,6 +598,7 @@ function startRemoteAsyncBash(
     params,
     remoteCwd,
     maxTimeout: captureLocalExecutionSettings()["tools.maxTimeout"] as number | undefined,
+    onUpdate,
     execute: async (remoteParams, signal, onUpdate) => {
       if (state.client !== client || client.isClosed) {
         throw new Error(
@@ -641,7 +648,7 @@ function registerWrapper(
       const target = await executionTarget(name, params, state, ctx, signal);
       ensureCurrent();
       if (name === "bash" && target === "remote" && params.async === true && !params.name) {
-        return startRemoteAsyncBash(toolCallId, params, state, ctx);
+        return startRemoteAsyncBash(toolCallId, params, state, ctx, rawOnUpdate);
       }
       if (name === "read" && params.path === "proc://" && target === "remote") {
         const remote = await executeWithTarget(target, name, toolCallId, params, state, ctx, signal);
@@ -672,6 +679,9 @@ function registerWrapper(
         result = await execute();
       }
       ensureCurrent();
+      if (name === "write" && target === "remote" && state.client) {
+        completeStoppedService(state.client, result);
+      }
       if (
         (name === "ast_edit" ||
           (name === "write" &&

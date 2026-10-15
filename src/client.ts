@@ -139,7 +139,7 @@ export class RemoteRuntimeClient {
     args: Record<string, unknown>,
     signal?: AbortSignal,
     onUpdate?: (update: unknown) => void,
-    options: { toolNames?: readonly string[] } = {},
+    options: { toolNames?: readonly string[]; steeringSignal?: AbortSignal } = {},
   ): Promise<unknown> {
     if (this.#closed) throw new Error("Remote runtime is disconnected");
     if (signal?.aborted) {
@@ -157,6 +157,11 @@ export class RemoteRuntimeClient {
         } catch {}
       }
     };
+    const steerHandler = () => {
+      if (this.#pending.has(id)) {
+        try { this.#send({ type: "steer", id }); } catch {}
+      }
+    };
     signal?.addEventListener("abort", abortHandler, { once: true });
     try {
       this.#send({
@@ -166,10 +171,14 @@ export class RemoteRuntimeClient {
         tool,
         args,
         ...(options.toolNames ? { toolNames: [...options.toolNames] } : {}),
+        ...(options.steeringSignal ? { steering: true } : {}),
       });
+      options.steeringSignal?.addEventListener("abort", steerHandler, { once: true });
+      if (options.steeringSignal?.aborted) steerHandler();
       return await promise;
     } finally {
       signal?.removeEventListener("abort", abortHandler);
+      options.steeringSignal?.removeEventListener("abort", steerHandler);
       this.#pending.delete(id);
     }
   }

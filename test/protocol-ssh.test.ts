@@ -48,6 +48,13 @@ describe("protocol boundaries", () => {
     );
 
   });
+  test("readiness steering is distinct from cancellation and validated", () => {
+    expect(parseRequest({ type: "steer", id: "service-call" })).toEqual({ type: "steer", id: "service-call" });
+    const execute = { type: "execute" as const, id: "service-call", toolCallId: "call", tool: "bash", args: {}, steering: true };
+    expect(parseRequest(execute)).toEqual(execute);
+    expect(() => parseRequest({ ...execute, steering: "true" })).toThrow("steering must be a boolean");
+    expect(() => parseRequest({ type: "steer", id: 1 })).toThrow();
+  });
 });
 
 describe("SSH command safety", () => {

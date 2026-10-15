@@ -13,7 +13,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.8.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.9.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
@@ -56,6 +56,8 @@ export type ExecuteRequest = {
   args: Record<string, unknown>;
   /** Names of the tools active in the local session (bash interceptor input). */
   toolNames?: string[];
+  /** The host can interrupt readiness without cancelling the service. */
+  steering?: boolean;
 };
 
 export type CancelRequest = { type: "cancel"; id: string };
@@ -64,6 +66,7 @@ export type Request =
   | InitializeRequest
   | ExecuteRequest
   | CancelRequest
+  | { type: "steer"; id: string }
   | { type: "event-ack"; id: string }
   | ShutdownRequest;
 
@@ -164,6 +167,9 @@ export function parseRequest(raw: unknown): Request {
     ) {
       throw new Error("Protocol field toolNames must be a string array");
     }
+    if (value.steering !== undefined && typeof value.steering !== "boolean") {
+      throw new Error("Protocol field steering must be a boolean");
+    }
     return {
       type,
       id: stringField(value, "id"),
@@ -171,9 +177,11 @@ export function parseRequest(raw: unknown): Request {
       tool: stringField(value, "tool"),
       args: asRecord(value.args, "args"),
       ...(toolNames === undefined ? {} : { toolNames: toolNames as string[] }),
+      ...(value.steering === undefined ? {} : { steering: value.steering as boolean }),
     };
   }
   if (type === "cancel") return { type, id: stringField(value, "id") };
+  if (type === "steer") return { type, id: stringField(value, "id") };
   if (type === "event-ack") return { type, id: stringField(value, "id") };
   if (type === "shutdown") return { type };
   throw new Error(`Unknown protocol request type: ${type}`);
