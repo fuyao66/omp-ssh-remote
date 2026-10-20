@@ -2,6 +2,12 @@ import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
+import {
+  formatFullOutputReference,
+  formatOutputNotice,
+  stripRawOutputArtifactNotice,
+  type OutputMeta,
+} from "@oh-my-pi/pi-tui/tools/output-meta";
 
 const root = () => join(homedir(), ".cache/omp-ssh-remote/artifacts");
 const references = /remote-artifact:\/\/([a-f0-9-]{36})\/(\d+)/g;
@@ -118,7 +124,7 @@ export async function resolveRemoteArtifacts(value: unknown): Promise<unknown> {
 export type RemoteArtifacts = {
   namespace: string;
   manager: ArtifactManager;
-  publish: (value: unknown) => unknown;
+  publish: (value: unknown, toolName?: string) => unknown;
   /** Remove this namespace; call once the owning runtime is shutting down. */
   dispose: () => Promise<void>;
 };
@@ -142,20 +148,116 @@ export async function createRemoteArtifacts(
     await writeFile(join(dir, ARTIFACT_OWNER_FILE), JSON.stringify(owner), { mode: 0o600 });
   }
   const manager = new ArtifactManager(dir);
-  const publish = (value: unknown): unknown => {
-    if (typeof value === "string") return value.replace(/artifact:\/\/(\d+)/g, `remote-artifact://${namespace}/$1`);
-    if (Array.isArray(value)) return value.map(publish);
-    if (value && typeof value === "object") {
-      const record = value as Record<string, unknown>;
-      const result = Object.fromEntries(Object.entries(record).filter(([key]) => key !== "artifactId").map(([key, item]) => [key, publish(item)]));
-      const details = record.details as { meta?: { truncation?: { artifactId?: string } } } | undefined;
-      const id = details?.meta?.truncation?.artifactId;
-      if (typeof id === "string" && Array.isArray(result.content)) {
-        result.content = [...result.content, { type: "text", text: `Full output: remote-artifact://${namespace}/${id}` }];
+  const publish = (value: unknown, toolName?: string): unknown => {
+    const record = (item: unknown): Record<string, unknown> | undefined =>
+      item !== null && typeof item === "object" && !Array.isArray(item) ? item as Record<string, unknown> : undefined;
+    const result = record(value);
+    if (!result || !Array.isArray(result.content)) return value;
+    const remote = (id: string): string => `remote-artifact://${namespace}/${id}`;
+    const nativeId = (id: unknown): id is string => typeof id === "string" && /^\d+$/.test(id);
+    const mapUri = (uri: string): string => {
+      const match = /^artifact:\/\/(\d+)$/.exec(uri);
+      return match ? remote(match[1]!) : uri;
+    };
+    const recoveries = new Map<string, string>();
+    const sampledIds = new Set<string>();
+    const reference = (id: string, elided?: number, source?: OutputMeta["source"]): string => {
+      if (source?.type === "report" && !(elided && elided > 0)) {
+        return `Read ${remote(id)} for full report (${source.value})`;
       }
-      return result;
+      const text = formatFullOutputReference(id, elided).replace(`artifact://${id}`, remote(id));
+      return source?.type === "report" ? `${text} (report: ${source.value})` : text;
+    };
+    // Only these two OutputMeta slots own artifact ids. Rich values and arbitrary
+    // application records (including their own `meta`) never enter this adapter.
+    const adaptMeta = (value: unknown): OutputMeta | undefined => {
+      if (!record(value)) return undefined;
+      const meta = { ...value as OutputMeta };
+      if (meta.source && ["path", "url", "internal", "report"].includes(meta.source.type)) {
+        meta.source = { ...meta.source, value: mapUri(meta.source.value) };
+      }
+      if (meta.truncation && nativeId(meta.truncation.artifactId)) {
+        const { artifactId, ...truncation } = meta.truncation;
+        if ((truncation.artifactElidedBytes ?? 0) > 0) sampledIds.add(artifactId);
+        recoveries.set(remote(artifactId), reference(artifactId, truncation.artifactElidedBytes, meta.source));
+        meta.truncation = truncation;
+      }
+      if (meta.limits?.columnTruncated) {
+        const column = { ...meta.limits.columnTruncated };
+        const id = column.artifactId;
+        const nativeSampleSelector = nativeId(id) && column.selectorBase === `artifact://${id}`;
+        if (typeof column.selectorBase === "string") column.selectorBase = mapUri(column.selectorBase);
+        if (nativeId(id)) {
+          const uri = remote(id);
+          const sampled = (column.artifactElidedBytes ?? 0) > 0;
+          if (sampled) sampledIds.add(id);
+          if (sampled && nativeSampleSelector) {
+            // The capped artifact renumbers lines; it cannot address original lines.
+            delete column.selectorBase;
+          } else if (!sampled && column.selectorBase === undefined) {
+            column.selectorBase = uri;
+          }
+          let recovery = reference(id, column.artifactElidedBytes);
+          if (!sampled && column.lines && column.selectorBase === uri) {
+            // Reuse native wording for the canonical raw-line recovery hint.
+            recovery = formatOutputNotice({ limits: { columnTruncated: column } });
+          }
+          if (!recoveries.has(uri)) recoveries.set(uri, recovery);
+          delete column.artifactId;
+        }
+        meta.limits = { ...meta.limits, columnTruncated: column };
+      }
+      return meta;
+    };
+    const originalDetails = record(result.details);
+    const details = originalDetails ? { ...originalDetails } : undefined;
+    const originalMeta = record(originalDetails?.meta) ? originalDetails!.meta as OutputMeta : undefined;
+    const meta = adaptMeta(originalMeta);
+    if (details && meta) details.meta = meta;
+    if (toolName === "edit" && details && Array.isArray(details.perFileResults)) {
+      details.perFileResults = details.perFileResults.map(item => {
+        const file = record(item);
+        // Edit's typed per-file result has path and diff; this is not a generic meta walk.
+        if (!file || typeof file.path !== "string" || typeof file.diff !== "string") return item;
+        const fileMeta = adaptMeta(file.meta);
+        return fileMeta ? { ...file, meta: fileMeta } : item;
+      });
     }
-    return value;
+    const content = [...result.content];
+    let lastText = -1;
+    for (let index = content.length - 1; index >= 0; index--) {
+      const block = record(content[index]);
+      if (block?.type === "text" && typeof block.text === "string") {
+        lastText = index;
+        break;
+      }
+    }
+    const published = new Set<string>();
+    if (lastText >= 0) {
+      const block = record(content[lastText])!;
+      const text = block.text as string;
+      const originalNotice = formatOutputNotice(originalMeta);
+      const hasNotice = originalNotice.length > 0 && text.endsWith(originalNotice);
+      let body = hasNotice ? text.slice(0, -originalNotice.length) : text;
+      if (toolName === "bash") {
+        const { artifactId } = stripRawOutputArtifactNotice(body);
+        if (artifactId !== undefined) {
+          const footer = `[raw output: artifact://${artifactId}]`;
+          const end = body.trimEnd().length;
+          // The native helper identifies the footer. Replace that exact suffix,
+          // not its trimmed body, so every other whitespace byte survives.
+          body = body.slice(0, end - footer.length) + `[raw output: ${remote(artifactId)}]` + body.slice(end);
+          if (!sampledIds.has(artifactId)) published.add(remote(artifactId));
+        }
+      }
+      const notice = hasNotice ? formatOutputNotice(meta) : "";
+      const column = meta?.limits?.columnTruncated;
+      if (hasNotice && column?.lines && column.selectorBase !== undefined) published.add(column.selectorBase);
+      content[lastText] = { ...block, text: body + notice };
+    }
+    const pending = [...recoveries].filter(([uri]) => !published.has(uri)).map(([, text]) => text);
+    if (pending.length > 0) content.push({ type: "text", text: pending.join("\n") });
+    return { ...result, ...(details ? { details } : {}), content };
   };
   const dispose = async () => {
     await rm(dir, { recursive: true, force: true });

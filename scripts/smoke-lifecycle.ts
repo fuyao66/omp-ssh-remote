@@ -24,6 +24,10 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
     session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
     const originalInterruptMode = session.interruptMode;
     session.agent.setInterruptMode("immediate");
+    let unexpectedModelTurns = 0;
+    // The native yield queue can call raw prompt even when bridge turns are deferred.
+    // This one-off acceptance process must never contact a provider.
+    session.agent.prompt = async () => { unexpectedModelTurns++; throw new Error("Unexpected model turn in lifecycle acceptance"); };
     const text = (r: any): string => r.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n") ?? "";
     const invoke = async (name: string, params: object, onUpdate?: (result: any) => void) => {
       const tool = session.getToolByName(name); assert(tool, `Missing tool ${name}`);
@@ -80,7 +84,9 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       const launching = invoke("bash", { name: service, command: "echo SERVICE_BOOT; sleep 30", pty: false, ready: { log: "NEVER_READY", timeout: 20 } });
       session.agent.steer({ role: "user", content: [{ type: "text", text: "Acceptance-only readiness steer" }], timestamp: Date.now() });
       let started;
-      try { started = await launching; } catch (error) { throw new Error("Service readiness invocation failed", { cause: error }); } finally { session.clearQueue(); }
+      try { started = await launching; } catch (error) { throw new Error("Service readiness invocation failed", { cause: error }); } finally {
+        assert(session.takeQueuedMessage("Acceptance-only readiness steer", "steering"), "Synthetic steering was unexpectedly dequeued");
+      }
       assert(text(started).includes("Readiness wait interrupted"));
       console.log("SERVICE_READINESS_RETURNED", text(started));
       assert(text(await invoke("read", { path: `proc://${service}` })).includes("starting"));
@@ -95,21 +101,30 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       await serviceJob.promise;
       assert.equal(serviceJob.status, "completed");
       assert(serviceJob.resultText?.includes('"operation":"stop"'));
+      manager.consumeJobResults([serviceJob.id]);
+      assert(manager.isJobResultConsumed(serviceJob.id));
       console.log("SERVICE_STOP_TRACKING_PASS");
       const shortService = `${tag}-short`;
       await invoke("bash", { name: shortService, command: "echo SHORT_READY; sleep 1; exit 7", pty: false, ready: { log: "SHORT_READY", timeout: 5 } });
-      const completed = text(await invoke("wait", {}));
-      assert(completed.includes(shortService));
-      assert(completed.includes('"exitCode":7'));
+      const shortJob = manager.getAllJobs().find(j => j.label === `Remote service: ${shortService}`); assert(shortJob);
+      const waitedService = await invoke("wait", {});
+      const completed = (waitedService.details as { jobs?: { id: string; status: string; resultText?: string }[] })?.jobs?.find(j => j.id === shortJob.id);
+      assert(completed, JSON.stringify(waitedService.details));
+      assert.equal(completed.status, "completed", JSON.stringify(waitedService.details));
+      assert(completed.resultText?.includes('"exitCode":7'));
       console.log("SERVICE_NATURAL_EXIT_PASS");
       await invoke("bash", { command: `rm -- '${file}'` });
       await commands.get("remote-exit")!.handler("", ctx); connected = false;
       assert.equal(text(await invoke("bash", { command: "hostname" })).trim(), local);
       assert.throws(() => readTool.approvalCacheTargets!(remoteArgs), /binding changed/);
       assert(readTool.approvalCacheTargets({ path: file })?.some(target => target.startsWith("/")));
+      assert.equal(unexpectedModelTurns, 0, "An unconsumed completion tried to start a model turn");
       console.log("LIFECYCLE_SMOKE_PASS");
       process.exitCode = 0;
-    } catch (error) { console.error(error); process.exitCode = 1; }
+    } catch (error) {
+      await Bun.write(Bun.stderr, `LIFECYCLE_SMOKE_ERROR ${error instanceof Error ? error.stack : String(error)}\n`);
+      process.exitCode = 1;
+    }
     finally {
       session.clearQueue();
       if (connected) {

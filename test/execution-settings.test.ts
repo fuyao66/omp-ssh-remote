@@ -100,6 +100,7 @@ describe("protocol carries settings and tool names", () => {
   test("per-job shell scope cannot be attached to other tools or services", () => {
     const request = { type: "execute", id: "job", toolCallId: "job", tool: "bash", args: {}, bashScope: "job" };
     expect(parseRequest(JSON.stringify(request))).toMatchObject({ bashScope: "job" });
+    expect(parseRequest(JSON.stringify({ ...request, bashScope: "session" }))).toMatchObject({ bashScope: "session" });
     for (const name of ["", "  "]) expect(parseRequest(JSON.stringify({ ...request, args: { name } }))).toMatchObject({ bashScope: "job" });
     for (const change of [{ tool: "read" }, { bashScope: "other" }, { args: { name: "service" } }]) {
       expect(() => parseRequest(JSON.stringify({ ...request, ...change }))).toThrow(/bashScope/);

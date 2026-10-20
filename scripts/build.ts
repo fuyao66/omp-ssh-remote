@@ -32,6 +32,13 @@ await mkdir(ompOutdir, { recursive: true });
         build.onResolve({ filter: /^@oh-my-pi\/pi-agent-core\/thinking$/ }, () => ({
           path: Bun.resolveSync("@oh-my-pi/pi-agent-core/thinking", root),
         }));
+        // Pure source adapters are not all exposed by the compiled host shim.
+        build.onResolve({ filter: /^@oh-my-pi\/pi-coding-agent\/async$/ }, () => ({
+          path: Bun.resolveSync("@oh-my-pi/pi-coding-agent/async/auto-background", root),
+        }));
+        build.onResolve({ filter: /^@oh-my-pi\/pi-coding-agent\/job-widgets\/pipe-source$/ }, () => ({
+          path: Bun.resolveSync("@oh-my-pi/pi-coding-agent/job-widgets/pipe-source", root),
+        }));
       },
     }],
     external: [

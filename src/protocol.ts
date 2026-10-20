@@ -2,6 +2,7 @@ import {
   parseExecutionSettings,
   type RemoteExecutionSettings,
 } from "./omp/execution-settings.ts";
+import { parseJobCapturePayload, type JobCapturePayload } from "./omp/job-capture.ts";
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -13,7 +14,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.10.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.11.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
@@ -58,8 +59,8 @@ export type ExecuteRequest = {
   toolNames?: string[];
   /** The host can interrupt readiness without cancelling the service. */
   steering?: boolean;
-  /** Per-job native shell; never shares foreground variables or options. */
-  bashScope?: "job";
+  /** Job shells are isolated; session scope preserves foreground shell state. */
+  bashScope?: "job" | "session";
 };
 
 export type CancelRequest = { type: "cancel"; id: string };
@@ -93,6 +94,7 @@ export type ReadyMessage = {
 
 export type UpdateMessage = { type: "update"; id: string; result: unknown };
 export type ResultMessage = { type: "result"; id: string; result: unknown };
+export type CaptureMessage = { type: "capture"; id: string; capture: JobCapturePayload };
 export type ErrorMessage = {
   type: "error";
   id?: string;
@@ -108,6 +110,7 @@ export type Message =
   | ReadyMessage
   | UpdateMessage
   | ResultMessage
+  | CaptureMessage
   | ErrorMessage
   | EventMessage;
 
@@ -175,7 +178,7 @@ export function parseRequest(raw: unknown): Request {
     if (value.bashScope !== undefined) {
       const name = asRecord(value.args, "args").name;
       const named = name !== undefined && !(typeof name === "string" && name.trim() === "");
-      if (value.bashScope !== "job" || value.tool !== "bash" || named) {
+      if ((value.bashScope !== "job" && value.bashScope !== "session") || value.tool !== "bash" || named) {
         throw new Error("Protocol bashScope is only valid for unnamed bash jobs");
       }
     }
@@ -187,7 +190,7 @@ export function parseRequest(raw: unknown): Request {
       args: asRecord(value.args, "args"),
       ...(toolNames === undefined ? {} : { toolNames: toolNames as string[] }),
       ...(value.steering === undefined ? {} : { steering: value.steering as boolean }),
-      ...(value.bashScope === "job" ? { bashScope: "job" as const } : {}),
+      ...(value.bashScope === "job" || value.bashScope === "session" ? { bashScope: value.bashScope } : {}),
     };
   }
   if (type === "cancel") return { type, id: stringField(value, "id") };
@@ -235,6 +238,9 @@ export function parseMessage(line: string): Message {
         ? { capabilities: value.capabilities }
         : {}),
     };
+  }
+  if (type === "capture") {
+    return { type, id: stringField(value, "id"), capture: parseJobCapturePayload(value.capture) };
   }
   if (type === "update" || type === "result") {
     if (!("result" in value))

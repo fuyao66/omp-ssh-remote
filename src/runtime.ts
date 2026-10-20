@@ -19,8 +19,11 @@ import {
   type RemoteToolName,
 } from "./protocol.ts";
 import { pathShouldStayLocal } from "./path-domain.ts";
-import { createRemoteArtifacts, resolveRemoteArtifacts } from "./omp/artifacts.ts";
+import { createRemoteArtifacts } from "./omp/artifacts.ts";
+import { resolveRemoteArtifactArgs } from "./omp/artifact-input.ts";
 import type { RemoteExecutionSettings } from "./omp/execution-settings.ts";
+import { createCapturedBashTool } from "./omp/captured-bash.ts";
+import type { JobCaptureSender } from "./omp/job-capture.ts";
 export interface RemoteNativeTool {
   readonly name: string;
   readonly description: string;
@@ -107,7 +110,7 @@ export type NativeWorkerRuntime = {
   cwd: string;
   tools: Readonly<Record<RemoteToolName, RemoteNativeTool>>;
   session: ToolSession;
-  createJobBash: () => RemoteNativeTool;
+  createJobBash: (onCapture: JobCaptureSender, foreground?: boolean) => RemoteNativeTool;
   /** Release runtime-owned host resources (the output artifact namespace). Idempotent. */
   dispose: () => Promise<void>;
 };
@@ -212,8 +215,9 @@ export async function createNativeWorkerRuntime(
   const publishTool = (tool: RemoteNativeTool): RemoteNativeTool => {
     const execute = tool.execute.bind(tool);
     tool.execute = async (id, params, signal, onUpdate, context) => artifacts.publish(
-      await execute(id, await resolveRemoteArtifacts(params) as Record<string, unknown>, signal,
-        onUpdate ? (value) => onUpdate(artifacts.publish(value)) : undefined, context),
+      await execute(id, await resolveRemoteArtifactArgs(tool.name, params), signal,
+        onUpdate ? (value) => onUpdate(artifacts.publish(value, tool.name)) : undefined, context),
+      tool.name,
     );
     return tool;
   };
@@ -243,9 +247,10 @@ export async function createNativeWorkerRuntime(
   const dispose = () => (disposed ??= artifacts.dispose());
   return {
     cwd: absoluteCwd, tools, session, dispose,
-    createJobBash: () => {
-      const jobSessionId = `${sessionId}:async:${crypto.randomUUID()}`;
-      return publishTool(asRemoteNativeTool(new BashTool({ ...session, getSessionId: () => jobSessionId })));
+    createJobBash: (onCapture, foreground = false) => {
+      const jobSessionId = foreground ? sessionId : `${sessionId}:async:${crypto.randomUUID()}`;
+      const jobSettings = Settings.isolated({ ...(options.settings ?? {}), ...WORKER_OVERRIDES, "async.enabled": true });
+      return publishTool(createCapturedBashTool({ ...session, settings: jobSettings, getSessionId: () => jobSessionId }, onCapture, foreground));
     },
   };
 }

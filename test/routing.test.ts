@@ -181,6 +181,13 @@ describe("remote session boundaries", () => {
       remoteControlPlaneBlockReason("task", { task: "read", isolated: false }),
     ).toBeUndefined();
   });
+  test("keeps native conversation checkpoints local while blocking workspace scans", () => {
+    for (const name of ["checkpoint", "rewind"]) {
+      expect(remoteControlPlaneBlockReason(name, {})).toBeUndefined();
+      expect(remoteControlPlaneBlockReason("write", { path: `xd://${name}` })).toBeUndefined();
+    }
+    for (const name of ["find", "security_scan", "ida"]) expect(remoteControlPlaneBlockReason(name, {})).toContain("not remote-adapted");
+  });
   test("allows navigation only after a clean remote owner state", () => {
     expect(
       remoteSessionNavigationBlockReason({

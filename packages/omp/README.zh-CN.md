@@ -28,11 +28,17 @@ OMP 18.11 兼容：远端异步 Bash 转发实时和终态卡片更新，日志�
 
 OMP 18.12.3 审批保留本机原生文件／目录授权。远端使用哈希化的精确请求授权，按当前 binding、主机／用户／端口／密钥、目录和工具隔离，不能复用本机目录权限或另一台服务器的权限。重连／切换环境后失效；等待审批期间切换环境，会拒绝记录授权和执行旧请求。暂不提供远端整目录或跨 session 授权。
 
-显式远端异步命令使用每个 job 独立的原生 shell，前台命令继续保留 session 变量。进程列表保留原生渲染元数据；多 URI 进程查询不允许混合本机与远端。新版原始管道捕获（`proc://<job>/streams`）和自动生成的进度组件暂未桥接到远端 job：当前传输的是渲染后的预览／结果，不是可追加的原始管道数据；常规日志、实时输出卡片、取消和 `wait` 继续可用。需要各阶段输出时请显式写日志。远端 eval 跟随原生 18.12.3，使用 `print` 或 JS `console.log`，不再使用已移除的 `display`。
+显式远端异步命令使用每个 job 独立的原生 shell。符合条件的前台调用按宿主的自动后台化阈值和插话规则切到后台，继续同一个请求及采集源，不重启命令。前台转后台保留 session shell 状态；立即后台启动则使用隔离的 job shell。本机 manager 不可用或满额时，普通命令保持前台执行。进程列表保留原生渲染元数据，多 URI 查询不允许混合本机和远端。
+
+远端 job 通过真实原生采集接入本机 `proc://<本机job-id>/streams[/<n>]` 和原生进度组件。管道数据在 `tail` 等下游命令处理前采集，不从累计工具预览反推。`out` 是原生清洗后的文本，不是任意 stdout/stderr 原始字节；管道源保留真实字节。留存有界：原生文本约 256 Ki UTF-16 单元，每条管道 1 MiB，仅保留最新四条已结束管道。传输保留真实偏移、缺失前缀和管道淘汰状态，原生缓冲区已经丢掉的数据不能补回。成功／失败结果结束前完成最后一轮留存数据同步；取消可打断阻塞的传输。远端的每请求 manager 只负责原生执行，公开 job ID、取消、`wait`、组件模型请求和凭据仍由本机管理。
+
+组件遵循宿主 `async.widgets` 和 `widget` 模型角色配置。任务需要正在展示、运行足够久且有足够输出，短任务可能只有回退状态文字。生成规则可能增加本机模型请求，可用 `async.widgets: false` 关闭；不会在远端创建模型凭据或对话循环。
+
+远端 eval 跟随原生 18.12.3，使用 `print` 或 JS `console.log`，不再使用已移除的 `display`。较大或多行的普通对象生成 JSON 视图，小对象仍是文本。表格、Markdown 和图像数据交给本机原生 renderer，不需要远端 UI；pandas 等库须已安装在远端。JSON 值、表头／单元格、Markdown、输出锚点和回显代码都是应用数据，原样保留；artifact 发布只适配原生拥有的输出元数据及精确生成的尾注，区分完整输出与有上限的首尾样本。URI 解析只针对 read／grep 的资源路径及已有 Bash 路径简写，不插值 write 正文、eval 源码或搜索模式。
 
 `lsp.requestTimeout` 同样按秒转发，保留每次调用单独设置 timeout 的能力。
 
-连接期间明确拒绝用户直接 shell（`!`/`!!`）和 Python 快捷入口，避免静默执行本机命令；请使用远端 `bash`/`eval`，或退出连接后使用本机快捷入口。未适配的 `find`、`security_scan`、`checkpoint`、`rewind`、`ida`（包括 xdev 入口）明确拒绝。远端 eval 只支持计算和远端工作区工具回调，不桥接本机 agent/workpool、judge/completion、archive、browser、todo；固定的工作区说明解释此边界，本机编排请用顶层工具。
+连接期间明确拒绝用户直接 shell（`!`/`!!`）和 Python 快捷入口，避免静默执行本机命令；请使用远端 `bash`/`eval`，或退出连接后使用本机快捷入口。未适配的 `find`、`security_scan`、`ida`（包括 xdev 入口）仍明确拒绝。原生 `checkpoint`、`rewind` 留在本机并允许使用：只修改对话历史，不回滚远端项目文件或内核状态。远端 eval 只支持计算和远端工作区工具回调，不桥接本机 agent/workpool、judge/completion、archive、browser、todo；固定工作区说明解释此边界，本机编排请用顶层工具。
 
 截断输出保存在远端 `~/.cache/omp-ssh-remote/artifacts/<namespace>`。连接到同一主机后，可用 `read` selector 或 `grep` 读取返回的 `remote-artifact://<namespace>/<id>`。companion 正常退出时删除自己的 namespace，启动时清扫超过一小时且所属 worker 已不存在的 namespace；因此 transport 丢失遗留的 artifact 会过期，但永远不会复制到本机。本机 `artifact://` 仍保持本机语义。`xd://debug` 与直接 debug 一样在远端执行。
 
@@ -81,7 +87,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 链接后重启 OMP。更新时执行 `git pull`，重新构建 extension 和 workers，再重启或 reload plugin。连接状态下 reload 会关闭该 session 的 companion，之后需要重新连接。
 
-当前 companion 基于 OMP 18.12.3 构建，runtime contract 为 0.10.0。更新 runtime 依赖时即使 wire schema 不变，也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本和 schema 差异。
+当前 companion 基于 OMP 18.12.3 构建，runtime contract 为 0.11.0。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本和 schema 差异。
 
 ## 连接与操作
 
@@ -138,7 +144,13 @@ worker 初始化 `2439 ms`。另一次首次上传／部署耗时 `88.36 s`，�
 
 `scripts/smoke-cache.ts` 在真实 OMP 中使用本地 HTTP 接收端和合成回复，对比本机、连接、重连、断开前后的实际序列化工具、系统消息和完整历史前缀，同时通过 SSH 执行真实工作区命令。它验证前缀相等，**不伪造供应商 cached tokens 或费用节省数字**。可复现命令见 [English README](README.md#prompt-cache-stability)。
 
-`scripts/smoke-lifecycle.ts` 另行验证真实文件／编辑／计算／artifact、异步输出卡片与原生 `wait`、服务插话、主动停止追踪、自然退出状态和本机恢复。验收期间延后由 agent 发起的模型回合，避免测试触发模型请求。按上述英文说明用相同参数把脚本打包到 worker 旁，执行命令改为 `/remote-lifecycle-smoke`，结束后删除生成的 bundle。
+`scripts/smoke-lifecycle.ts` 另行验证真实文件／编辑／计算／artifact、异步输出卡片与原生 `wait`、服务插话、主动停止追踪、自然退出状态和本机恢复。用 `bun scripts/build-smoke.ts lifecycle` 构建，再执行 `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts lifecycle`。结束后删除生成的 bundle。
+
+`scripts/smoke-capture.ts` 验证 `tail` 前的真实字节、原生组件的数值及渲染、自动后台化不重启命令、session／隔离 shell、取消，以及断连后的本机留存数据。只替换模型边界为固定 author，规格校验、数据摄取和渲染均使用原生实现；不会调用供应商。用 `bun scripts/build-smoke.ts capture` 构建，再执行 `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts capture`。runner 自动创建短阈值的临时配置，不修改用户配置。
+
+`scripts/smoke-rich-output.ts` 对照真实本机与 SSH 原生结果，验证 JSON、表格、Markdown、有效 PNG、字面 URI、写读／搜索／查询及输出锚点。用 `bun scripts/build-smoke.ts rich-output` 构建，再执行 `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts rich-output`；不需要模型请求或额外 Python 包。结束后删除生成的 bundle。直接运行 `bun scripts/build-smoke.ts` 可将四个验收 helper 一起构建到 worker 旁。
+
+runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在同一 session 中提交验收命令；命令缺失时不会发送 prompt。超时预算包含首次上传，缓存命中后可排除部署耗时。成功时删除临时 session，失败时保留供定位。
 
 升级或 reload 插件本身可能引起一次初始前缀变化。模型／配置切换、其他插件、上下文压缩以及供应商缓存过期不属于连接切换保证。缓存前缀稳定机制本身只需构建本机扩展；更新 runtime 依赖或协议时仍须重新构建并部署 companion 二进制。
 
@@ -147,7 +159,7 @@ worker 初始化 `2439 ms`。另一次首次上传／部署耗时 `88.36 s`，�
 - 仅支持 Linux glibc x86_64 和 ARM64；
 - OMP `>=18.12.3`，且 companion schema 匹配；
 - 远端须有 util-linux 的 `flock`，用于保护活跃 worker 可执行文件；
-- 支持显式 async Bash；不桥接自动后台化和交互 Bash PTY；
+- 支持显式 async Bash 和符合条件的自动后台化，不桥接交互 Bash PTY；
 - 不支持 `task isolated:true` 远端 worktree；
 - 不支持远端到本机 artifact bridge；
 - 白名单之外的 settings 在 companion 中保持编译默认值，不提供任意 settings 透传；

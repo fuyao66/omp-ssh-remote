@@ -11,6 +11,7 @@ import {
 } from "./protocol.ts";
 import type { RemoteRuntimeHandshake } from "./runtime-contract.ts";
 import type { RemoteExecutionSettings } from "./omp/execution-settings.ts";
+import type { JobCapturePayload } from "./omp/job-capture.ts";
 
 export type SpawnSpec = {
   command: string[];
@@ -22,6 +23,7 @@ type PendingCall = {
   resolve(value: unknown): void;
   reject(error: Error): void;
   onUpdate?: (update: unknown) => void;
+  onCapture?: (capture: JobCapturePayload) => void;
 };
 async function withTimeout<T>(
   promise: Promise<T>,
@@ -139,7 +141,7 @@ export class RemoteRuntimeClient {
     args: Record<string, unknown>,
     signal?: AbortSignal,
     onUpdate?: (update: unknown) => void,
-    options: { toolNames?: readonly string[]; steeringSignal?: AbortSignal; bashScope?: "job" } = {},
+    options: { toolNames?: readonly string[]; steeringSignal?: AbortSignal; bashScope?: "job" | "session"; onCapture?: (capture: JobCapturePayload) => void } = {},
   ): Promise<unknown> {
     if (this.#closed) throw new Error("Remote runtime is disconnected");
     if (signal?.aborted) {
@@ -148,7 +150,7 @@ export class RemoteRuntimeClient {
     }
     const id = `req_${this.#nextId++}`;
     const promise = new Promise<unknown>((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject, onUpdate });
+      this.#pending.set(id, { resolve, reject, onUpdate, onCapture: options.onCapture });
     });
     const abortHandler = () => {
       if (this.#pending.has(id)) {
@@ -253,6 +255,10 @@ export class RemoteRuntimeClient {
           if (typeof id === "string") this.#send({ type: "event-ack", id });
         }).catch((error) => this.#terminate(error));
       }
+      return;
+    }
+    if (message.type === "capture") {
+      this.#pending.get(message.id)?.onCapture?.(message.capture);
       return;
     }
     if (message.type === "update") {

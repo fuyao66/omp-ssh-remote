@@ -30,6 +30,8 @@ import {
   resolveJobOwnerId,
   resolveLocalAsyncJobManager,
   startRemoteAsyncBashJob,
+  runRemoteForegroundBashJob,
+  type RemoteAsyncBashJobOptions,
 } from "./omp/async-bash.ts";
 import { startRemoteService, completeService, completeStoppedService } from "./omp/service-jobs.ts";
 import { withReadinessSteering } from "./omp/readiness-steering.ts";
@@ -314,12 +316,12 @@ export function remoteControlPlaneBlockReason(
   input: unknown,
   sessionFile?: string,
 ): string | undefined {
-  if (["find", "security_scan", "checkpoint", "rewind", "ida"].includes(toolName)) {
+  if (["find", "security_scan", "ida"].includes(toolName)) {
     return `${toolName} is not remote-adapted. Disconnect before using it on the local workspace; use remote grep/glob/bash for remote files.`;
   }
   if ((toolName === "read" || toolName === "write") && typeof asRecord(input).path === "string") {
     const device = xdevDevice(asRecord(input).path as string);
-    if (device && ["find", "security_scan", "checkpoint", "rewind", "ida"].includes(device)) {
+    if (device && ["find", "security_scan", "ida"].includes(device)) {
       return `${device} is not remote-adapted; local workspace execution is blocked while connected.`;
     }
   }
@@ -562,13 +564,13 @@ export function remoteWrapperRenderer(name: RemoteToolName) {
   return (toolRenderers[name] ?? {}) as Omit<(typeof toolRenderers)[string], "renderCall" | "renderResult"> & Pick<ToolDefinition, "renderCall" | "renderResult">;
 }
 
-function startRemoteAsyncBash(
+function remoteBashJobOptions(
   toolCallId: string,
   params: Record<string, unknown>,
   state: RemoteExtensionState,
   ctx: ExtensionContext,
   onUpdate?: (update: AgentToolResult) => void,
-): AgentToolResult {
+): RemoteAsyncBashJobOptions {
   const client = state.client;
   if (!client) throw new Error("Remote runtime is disconnected");
   const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? state.sessionFile;
@@ -589,7 +591,7 @@ function startRemoteAsyncBash(
     );
   }
   const remoteCwd = state.remoteCwd ?? "remote";
-  return startRemoteAsyncBashJob({
+  return {
     manager,
     ownerId,
     command,
@@ -597,7 +599,7 @@ function startRemoteAsyncBash(
     remoteCwd,
     maxTimeout: captureLocalExecutionSettings()["tools.maxTimeout"] as number | undefined,
     onUpdate,
-    execute: async (remoteParams, signal, onUpdate) => {
+    execute: async (remoteParams, signal, onUpdate, onCapture, scope = "job") => {
       if (state.client !== client || client.isClosed) {
         throw new Error(
           `Remote bash job lost its runtime (${remoteCwd}); the connection was closed`,
@@ -609,10 +611,10 @@ function startRemoteAsyncBash(
         remoteParams,
         signal,
         onUpdate,
-        { toolNames: state.activeToolNames(), bashScope: "job" },
+        { toolNames: state.activeToolNames(), bashScope: scope, onCapture },
       )) as AgentToolResult;
     },
-  });
+  };
 }
 
 function registerWrapper(
@@ -655,7 +657,20 @@ function registerWrapper(
       ensureCurrent();
       const serviceName = name === "bash" && target === "remote" && typeof params.name === "string" ? params.name.trim() || undefined : undefined;
       if (name === "bash" && target === "remote" && params.async === true && !serviceName) {
-        return startRemoteAsyncBash(toolCallId, params, state, ctx, rawOnUpdate);
+        return startRemoteAsyncBashJob(remoteBashJobOptions(toolCallId, params, state, ctx, rawOnUpdate));
+      }
+      if (name === "bash" && target === "remote" && !serviceName && !params.pty) {
+        const file = ctx.sessionManager?.getSessionFile?.() ?? state.sessionFile;
+        const liveSession = AgentRegistry.global().list().find(ref => ref.sessionFile === file)?.session;
+        const autoManager = resolveLocalAsyncJobManager(file);
+        if (liveSession && lookup("bash.autoBackground.enabled")?.get(liveSession.settings) === true && autoManager && !autoManager.atCapacity) {
+          const result = await withReadinessSteering(liveSession, steeringSignal => runRemoteForegroundBashJob({
+            ...remoteBashJobOptions(toolCallId, params, state, ctx, rawOnUpdate), signal, steeringSignal,
+            thresholdMs: Math.floor(Number(lookup("bash.autoBackground.thresholdMs")?.get(liveSession.settings) ?? 60_000)),
+          }));
+          ensureCurrent();
+          return result;
+        }
       }
       if (name === "read" && params.path === "proc://" && target === "remote") {
         const remote = await executeWithTarget(target, name, toolCallId, params, state, ctx, signal);

@@ -28,11 +28,17 @@ Successful explicit service stops also settle their local coordination jobs from
 
 OMP 18.12.3 approvals retain native local file/folder grants. Remote targets are hashed, exact-request grants scoped to the current binding, host/user/port/identity, directory, and tool; they never reuse local folder permissions or a different server's permissions. Reconnect or switching bindings invalidates them. A binding change while approval is pending rejects grant recording and execution. Remote folder-wide and cross-session grants are not provided.
 
-Explicit remote async commands use independent per-job native shells; foreground calls retain their session variables. Process listings preserve native renderer metadata, and multi-URI process searches reject mixed local/remote ownership. New native raw pipeline captures (`proc://<job>/streams`) and generated progress widgets are not bridged for remote jobs: the transport supplies rendered previews/results, not append-only raw pipe data. Regular logs, live output cards, cancellation, and `wait` remain supported. Capture per-stage logs explicitly when needed. Remote eval follows native 18.12.3: use `print` or JavaScript `console.log`, not the removed `display`.
+Explicit remote async commands use independent per-job native shells. Eligible foreground calls follow the host's automatic-background threshold and steering behavior: promotion keeps the same running request and capture sources, rather than restarting the command. Foreground-backed calls preserve session shell state; immediately backgrounded calls use isolated job shells. A full or unavailable local manager leaves ordinary calls foreground-only. Process listings preserve native renderer metadata, and multi-URI process searches reject mixed local/remote ownership.
+
+Remote jobs supply genuine native capture to local `proc://<local-job-id>/streams[/<n>]` and native progress widgets. Pipeline data is captured before downstream commands such as `tail`; it is not reconstructed from cumulative tool previews. The `out` source is native sanitized text, not arbitrary stdout/stderr bytes. Pipeline sources retain actual bytes. Capture is bounded: native output keeps about 256 Ki UTF-16 units, each pipe keeps 1 MiB, and only the four newest finished pipes remain. Transfer preserves offsets, missing prefixes and stream removals; data the native buffer has already discarded cannot be recovered. Final retained windows are drained before successful/error results settle; cancellation can interrupt a blocked transport write. The per-request remote manager is execution-only: public IDs, cancellation, `wait`, widget model requests and credentials remain local.
+
+Widgets use the host's normal `async.widgets` and `widget` model-role behavior. They need a visible, sufficiently long-running job with enough output; short jobs may show only fallback status. Authoring can make extra local model requests; `async.widgets: false` disables it. No remote model credentials or conversation loop are created.
+
+Remote eval follows native 18.12.3: use `print` or JavaScript `console.log`, not the removed `display`. Larger or multiline plain objects produce JSON views; small objects remain text. Native tables, Markdown and image content are forwarded to the local renderer without requiring a remote UI. Libraries such as pandas must already be installed remotely. JSON values, table cells/headers, Markdown, output anchors and echoed code remain literal application data; artifact publication adapts only owned output metadata and exact native-generated footers. Recovery links distinguish full outputs from capped head/tail samples. URI resolution is limited to read/grep resource operands and the established Bash operand shorthand, not write bodies, eval source or search patterns.
 
 `lsp.requestTimeout` is also forwarded in seconds, preserving per-call timeout overrides.
 
-While connected, direct user shell (`!`/`!!`) and Python shortcuts are explicitly refused rather than silently executed locally. Use remote `bash`/`eval`, or disconnect before using local shortcuts. `find`, `security_scan`, `checkpoint`, `rewind`, and `ida` are not remote-adapted and are blocked (including their xdev entrypoints). Remote eval supports computation and remote workspace callbacks only: local agent/workpool, judge/completion, archive, browser, and todo helpers are not bridged. The fixed workspace contract explains this distinction; use top-level local orchestration tools instead.
+While connected, direct user shell (`!`/`!!`) and Python shortcuts are explicitly refused rather than silently executed locally. Use remote `bash`/`eval`, or disconnect before using local shortcuts. `find`, `security_scan`, and `ida` are not remote-adapted and remain blocked, including xdev entrypoints. Native `checkpoint` and `rewind` stay local and are allowed: they change conversation history, not remote project files or kernel state. Remote eval supports computation and remote workspace callbacks only: local agent/workpool, judge/completion, archive, browser, and todo helpers are not bridged. The fixed workspace contract explains this distinction; use top-level local orchestration tools instead.
 
 Truncated output is stored remotely under `~/.cache/omp-ssh-remote/artifacts/<namespace>`. Use returned `remote-artifact://<namespace>/<id>` references with `read` selectors or `grep` while connected to that host. The companion deletes its own namespace on normal exit and, at startup, sweeps namespaces older than one hour whose owning worker is gone; artifacts left by a transport loss therefore expire, they are never copied locally. Local `artifact://` references remain local. The `xd://debug` entry executes remotely like direct debug.
 
@@ -81,7 +87,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 Restart OMP after linking. Updating requires `git pull`, rebuilding the extension and workers, then restarting or reloading the plugin. Reloading while connected closes that session's companion; reconnect afterward.
 
-The companion is built against OMP 18.12.3 (runtime contract 0.10.0). Rebuild both workers when updating runtime dependencies, even if wire schemas have not changed. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Handshake failures report version and schema drift.
+The companion is built against OMP 18.12.3 (runtime contract 0.11.0). Rebuild both workers when updating runtime dependencies or capture protocol behavior, even if tool schemas have not changed. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Handshake failures report version and schema drift.
 
 Connection UI reports probe/check/upload/activation stages. The `remote_connect` tool honors cancellation; `/remote-exit` cancels a pending command deployment. Same-host deployments in one extension instance are serialized and recheck the cache, avoiding duplicate uploads. Failed uploads are removed on a best-effort basis if SSH is still reachable. Host schema metadata is cached per loaded extension instance for reconnects and child sessions.
 
@@ -118,7 +124,7 @@ The adapter probes remote platform and home, selects the matching package-owned 
 
 Activation prunes older worker directories, keeping the activated build, the most recent previous build, and all live versions. Per-version shared `flock` leases protect worker self-reentry; pruning requires an exclusive lease and checks `/proc` for legacy workers. Protocol frames are limited to 16 MiB; deployment stdout/stderr is limited to 1 MiB. SSH uses batch mode, strict host checking, `ForwardAgent=no`, and `ClearAllForwardings=yes`. Transport loss rejects pending calls and never retries them locally. Foreground child processes receive cancellation; deliberately detached commands such as `nohup` or `setsid` are unmanaged remote processes and can survive disconnect.
 
-## Verified Performance
+## Historical Performance Baseline
 
 October 2026, OMP 18.9.1 on trialsfinder Linux x86_64, cached worker and persistent SSH ControlMaster. Ten interleaved echo/read/bash samples (including first calls):
 
@@ -130,6 +136,8 @@ October 2026, OMP 18.9.1 on trialsfinder Linux x86_64, cached worker and persist
 
 Worker initialization was `2439 ms`. A separate initial upload/deployment took `88.36 s`; that run's read/bash medians were roughly `0.8 s`. The later interleaved control returned to the values above. Do not treat these runs as a controlled speedup comparison. Host schema caching avoids repeated metadata-runtime construction but does not reduce each worker's baseline memory; no memory reduction is claimed. ARM64 received build validation, not live performance acceptance.
 
+These measurements predate native capture and widgets; they are not performance claims for the current capture implementation. ARM64 now also has functional capture acceptance, not a performance benchmark.
+
 ## Prompt Cache Stability
 
 Connect, disconnect and reconnect change the execution binding, not the tool roster or descriptions. The fixed `remote_workspace_status` description explains routing, remote limitations and when to query status. Native approvals and renderers remain attached; other plugins' tools are not replaced. Tools not bound at startup fail closed remotely rather than being dynamically registered on reconnect.
@@ -140,12 +148,24 @@ On a binding change, a short notice is appended to the next provider context wit
 
 ```sh
 bun run build
-bun build scripts/smoke-cache.ts --target=bun --minify --external '@oh-my-pi/pi-coding-agent' --external '@oh-my-pi/pi-agent-core' --external '@oh-my-pi/pi-natives' --outfile=packages/omp/dist/cache-smoke.js
-REMOTE_CONNECT_ARGS='gpu-box /tmp' omp --no-extensions --no-skills --no-rules --no-title --session-dir /tmp/omp-cache-smoke-sessions -e "$PWD/packages/omp/dist/cache-smoke.js" --approval-mode yolo -p /remote-cache-smoke
+bun scripts/build-smoke.ts cache
+REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts cache
 rm packages/omp/dist/cache-smoke.js
 ```
 
-`scripts/smoke-lifecycle.ts` additionally checks real file/edit/compute/artifact behavior, async live frames and native `wait`, service steering, explicit-stop tracking, natural exit status, and local restoration. It defers agent-initiated model turns during the model-free test. Bundle it beside the workers with the same flags above, then run `/remote-lifecycle-smoke` instead of `/remote-cache-smoke`; remove the generated bundle afterward.
+`scripts/smoke-lifecycle.ts` additionally checks real file/edit/compute/artifact behavior, async live frames and native `wait`, service steering, explicit-stop tracking, natural exit status, and local restoration. Build it with `bun scripts/build-smoke.ts lifecycle`, then run `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts lifecycle`. Remove the generated bundle afterward.
+
+`scripts/smoke-capture.ts` validates exact pre-`tail` bytes, native widget numbers and rendering, automatic foreground promotion without command replay, persistent versus isolated shells, cancellation, and retained local stream reads after disconnect. Its deterministic author replaces only the model boundary; native spec validation, ingestion and rendering still run. The runner creates a temporary configuration with a short automatic-background threshold and leaves user settings untouched:
+
+```sh
+bun scripts/build-smoke.ts capture
+REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts capture
+rm packages/omp/dist/capture-smoke.js
+```
+
+`scripts/smoke-rich-output.ts` compares actual native-local and SSH results for JSON, tables, Markdown, valid PNG bytes, literal artifact-like strings, write/read/search/query round trips, and view anchors. Build with `bun scripts/build-smoke.ts rich-output`, then run `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts rich-output`. Neither acceptance script needs a provider request or extra Python packages. Remove its generated bundle afterward. `bun scripts/build-smoke.ts` builds all four acceptance helpers beside the workers.
+
+The runner verifies extension command registration through RPC `get_available_commands` and submits the smoke prompt in the same session only after admission. Missing commands fail before a prompt is sent. The deadline includes the native first-upload budget; cache-hit acceptance avoids deployment timing. Successful temporary sessions are removed; failed sessions are retained for diagnosis.
 
 One plugin upgrade/reload can change the initial prefix. Model/configuration changes, other extensions, compaction and provider cache expiration are outside the connection-switch guarantee. The prefix-stability mechanism itself requires only a local extension rebuild; runtime dependency or protocol changes still require rebuilding and deploying companion binaries.
 
@@ -154,7 +174,7 @@ One plugin upgrade/reload can change the initial prefix. Model/configuration cha
 - Linux glibc x86_64 and ARM64 only;
 - OMP `>=18.12.3` with matching compiled companion schemas;
 - remote `flock` (util-linux) is required: workers hold shared per-version leases so cache pruning cannot delete a live worker's self-reentry executable;
-- explicit async Bash is supported; automatic backgrounding and interactive Bash PTY are not bridged;
+- explicit async Bash and eligible automatic backgrounding are supported; interactive Bash PTY is not bridged;
 - no `task isolated:true` remote worktrees;
 - no remote-to-local artifact bridge;
 - settings outside the forwarded allowlist keep the companion's compiled defaults; there is no arbitrary settings passthrough;

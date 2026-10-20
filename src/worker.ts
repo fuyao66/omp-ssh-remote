@@ -110,6 +110,13 @@ function send(message: Message): void {
   process.stdout.write(encodeMessage(message));
 }
 
+/** One awaited write per capture chunk bounds buffering on slow SSH links. */
+async function sendCapture(message: Message): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    process.stdout.write(encodeMessage(message), error => error ? reject(error) : resolve());
+  });
+}
+
 function serializeError(error: unknown): { name: string; message: string; stack?: string } {
   if (error instanceof Error) return { name: error.name, message: error.message, stack: error.stack };
   return { name: "Error", message: String(error) };
@@ -160,13 +167,16 @@ async function initialize(request: InitializeRequest): Promise<void> {
     hostVersion,
     runtimeVersion: TOOL_RUNTIME_VERSION,
     cwd: runtime.cwd,
+    capabilities: { jobCapture: "native-retained" },
     tools,
   });
 }
 
 function startExecute(request: ExecuteRequest): void {
   const toolName = request.tool as RemoteToolName;
-  const tool = request.bashScope === "job" ? runtime?.createJobBash() : runtime?.tools[toolName];
+  const tool = request.bashScope
+    ? runtime?.createJobBash(capture => sendCapture({ type: "capture", id: request.id, capture }), request.bashScope === "session")
+    : runtime?.tools[toolName];
   if (!tool) {
     send({
       type: "error",
