@@ -139,7 +139,7 @@ export class RemoteRuntimeClient {
     args: Record<string, unknown>,
     signal?: AbortSignal,
     onUpdate?: (update: unknown) => void,
-    options: { toolNames?: readonly string[]; steeringSignal?: AbortSignal } = {},
+    options: { toolNames?: readonly string[]; steeringSignal?: AbortSignal; bashScope?: "job" } = {},
   ): Promise<unknown> {
     if (this.#closed) throw new Error("Remote runtime is disconnected");
     if (signal?.aborted) {
@@ -172,6 +172,7 @@ export class RemoteRuntimeClient {
         args,
         ...(options.toolNames ? { toolNames: [...options.toolNames] } : {}),
         ...(options.steeringSignal ? { steering: true } : {}),
+        ...(options.bashScope ? { bashScope: options.bashScope } : {}),
       });
       options.steeringSignal?.addEventListener("abort", steerHandler, { once: true });
       if (options.steeringSignal?.aborted) steerHandler();

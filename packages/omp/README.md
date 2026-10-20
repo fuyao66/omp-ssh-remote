@@ -26,6 +26,12 @@ OMP 18.11 compatibility: remote async Bash forwards live and terminal card updat
 
 Successful explicit service stops also settle their local coordination jobs from the native stop receipt. They are not treated as natural exits: the broker deliberately sends no `daemon-completed` event for an explicit stop. Failed stops leave tracking intact.
 
+OMP 18.12.3 approvals retain native local file/folder grants. Remote targets are hashed, exact-request grants scoped to the current binding, host/user/port/identity, directory, and tool; they never reuse local folder permissions or a different server's permissions. Reconnect or switching bindings invalidates them. A binding change while approval is pending rejects grant recording and execution. Remote folder-wide and cross-session grants are not provided.
+
+Explicit remote async commands use independent per-job native shells; foreground calls retain their session variables. Process listings preserve native renderer metadata, and multi-URI process searches reject mixed local/remote ownership. New native raw pipeline captures (`proc://<job>/streams`) and generated progress widgets are not bridged for remote jobs: the transport supplies rendered previews/results, not append-only raw pipe data. Regular logs, live output cards, cancellation, and `wait` remain supported. Capture per-stage logs explicitly when needed. Remote eval follows native 18.12.3: use `print` or JavaScript `console.log`, not the removed `display`.
+
+`lsp.requestTimeout` is also forwarded in seconds, preserving per-call timeout overrides.
+
 While connected, direct user shell (`!`/`!!`) and Python shortcuts are explicitly refused rather than silently executed locally. Use remote `bash`/`eval`, or disconnect before using local shortcuts. `find`, `security_scan`, `checkpoint`, `rewind`, and `ida` are not remote-adapted and are blocked (including their xdev entrypoints). Remote eval supports computation and remote workspace callbacks only: local agent/workpool, judge/completion, archive, browser, and todo helpers are not bridged. The fixed workspace contract explains this distinction; use top-level local orchestration tools instead.
 
 Truncated output is stored remotely under `~/.cache/omp-ssh-remote/artifacts/<namespace>`. Use returned `remote-artifact://<namespace>/<id>` references with `read` selectors or `grep` while connected to that host. The companion deletes its own namespace on normal exit and, at startup, sweeps namespaces older than one hour whose owning worker is gone; artifacts left by a transport loss therefore expire, they are never copied locally. Local `artifact://` references remain local. The `xd://debug` entry executes remotely like direct debug.
@@ -44,7 +50,7 @@ flowchart LR
 
 ## Requirements
 
-- local Linux or WSL with OMP `>=18.11.0`, Bun `1.3.14+`, npm, tar, OpenSSH, and SCP;
+- local Linux or WSL with OMP `>=18.12.3`, Bun `1.3.14+`, npm, tar, OpenSSH, and SCP;
 - remote glibc Linux `x86_64` or `aarch64`;
 - public-key SSH that succeeds in batch mode;
 - an existing remote project directory;
@@ -75,13 +81,15 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 Restart OMP after linking. Updating requires `git pull`, rebuilding the extension and workers, then restarting or reloading the plugin. Reloading while connected closes that session's companion; reconnect afterward.
 
-The companion is built against OMP 18.11.0 (runtime contract 0.9.0), including the native broker IPC migration. Rebuild both workers when updating runtime dependencies, even if wire schemas have not changed. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Handshake failures report version and schema drift.
+The companion is built against OMP 18.12.3 (runtime contract 0.10.0). Rebuild both workers when updating runtime dependencies, even if wire schemas have not changed. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Handshake failures report version and schema drift.
 
 Connection UI reports probe/check/upload/activation stages. The `remote_connect` tool honors cancellation; `/remote-exit` cancels a pending command deployment. Same-host deployments in one extension instance are serialized and recheck the cache, avoiding duplicate uploads. Failed uploads are removed on a best-effort basis if SSH is still reachable. Host schema metadata is cached per loaded extension instance for reconnects and child sessions.
 
 ## Connect and Operate
 
 Use a standard `~/.ssh/config` alias or an OMP `/ssh add` entry:
+
+Configured aliases remain the SSH/SCP destination names for `Host` matching; the resolved hostname, user, port and identity still select the actual destination. Alias-only `ProxyCommand`, `ProxyJump` and other OpenSSH settings therefore apply to probes, upload and worker connections without adding duplicate IP-address `Host` entries.
 
 ```text
 /remote-connect gpu-box /srv/project
@@ -144,7 +152,7 @@ One plugin upgrade/reload can change the initial prefix. Model/configuration cha
 ## Limits
 
 - Linux glibc x86_64 and ARM64 only;
-- OMP `>=18.11.0` with matching compiled companion schemas;
+- OMP `>=18.12.3` with matching compiled companion schemas;
 - remote `flock` (util-linux) is required: workers hold shared per-version leases so cache pruning cannot delete a live worker's self-reentry executable;
 - explicit async Bash is supported; automatic backgrounding and interactive Bash PTY are not bridged;
 - no `task isolated:true` remote worktrees;

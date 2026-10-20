@@ -4,6 +4,7 @@ import { posix } from "node:path";
 
 export type SshConnectionOptions = {
   target: string;
+  sshAlias?: string;
   port?: number;
   identityFile?: string;
   knownHostsFile?: string;
@@ -15,6 +16,16 @@ function validateTarget(target: string): void {
   if (!/^[A-Za-z0-9_.@-]+$/.test(target) || target.startsWith("-")) {
     throw new Error(`Unsafe SSH target: ${target}`);
   }
+}
+
+export function getSshDestination(options: SshConnectionOptions): string {
+  validateTarget(options.target);
+  if (options.sshAlias === undefined) return options.target;
+  if (!/^[A-Za-z0-9_.-]+$/.test(options.sshAlias) || options.sshAlias.startsWith("-")) {
+    throw new Error("Unsafe SSH alias");
+  }
+  const userPrefix = options.target.slice(0, options.target.lastIndexOf("@") + 1);
+  return `${userPrefix}${options.sshAlias}`;
 }
 
 function expandHome(path: string): string {
@@ -33,7 +44,12 @@ function appendCommonOptions(
   command: string[],
   options: SshConnectionOptions,
 ): void {
-  validateTarget(options.target);
+  getSshDestination(options);
+  if (options.sshAlias !== undefined) {
+    // Match the original Host alias without allowing its HostName to replace
+    // the resolved destination (including higher-priority OMP host settings).
+    command.push("-o", `HostName=${options.target.slice(options.target.lastIndexOf("@") + 1)}`);
+  }
   command.push(
     "-o",
     "IdentitiesOnly=yes",
@@ -94,7 +110,7 @@ export function buildScpBaseCommand(options: SshConnectionOptions): string[] {
 export function buildSshWorkerCommand(options: SshWorkerOptions): string[] {
   return [
     ...buildSshBaseCommand(options),
-    options.target,
+    getSshDestination(options),
     `exec flock --shared ${quoteRemoteArgument(posix.join(posix.dirname(options.workerPath), ".worker.lock"))} ${quoteRemoteArgument(options.workerPath)}`,
   ];
 }

@@ -33,6 +33,8 @@ import {
 } from "./omp/async-bash.ts";
 import { startRemoteService, completeService, completeStoppedService } from "./omp/service-jobs.ts";
 import { withReadinessSteering } from "./omp/readiness-steering.ts";
+import { remoteWrapperApproval } from "./omp/approval-targets.ts";
+import { processExecutionTarget, mergeProcessListings } from "./omp/process-routing.ts";
 import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -475,15 +477,11 @@ async function executionTarget(
   signal?: AbortSignal,
 ): Promise<ExecutionTarget> {
   if (!state.selected) return "local";
-  const processPath = typeof params.path === "string" ? /^proc:\/\/([^/:;?#]*)(?:\/|$)/.exec(params.path) : undefined;
-  if (processPath?.[1]) {
-    const id = processPath[1];
+  const processTarget = processExecutionTarget(name, params, id => {
     const manager = resolveLocalAsyncJobManager(state.sessionFile);
-    const localJob = manager?.getAllJobs().some((job) => job.id === id);
-    const localAgent = AgentRegistry.global().list().some((agent) => agent.id === id);
-    if (localJob || localAgent) return "local";
-    return "remote";
-  }
+    return manager?.getAllJobs().some(job => job.id === id) === true || AgentRegistry.global().list().some(agent => agent.id === id);
+  });
+  if (processTarget) return processTarget;
   let target: ExecutionTarget;
   if (name !== "write") {
     target = pathShouldStayLocal(name, params) ? "local" : "remote";
@@ -611,7 +609,7 @@ function startRemoteAsyncBash(
         remoteParams,
         signal,
         onUpdate,
-        { toolNames: state.activeToolNames() },
+        { toolNames: state.activeToolNames(), bashScope: "job" },
       )) as AgentToolResult;
     },
   });
@@ -627,6 +625,12 @@ function registerWrapper(
     (ref) => ref.sessionFile === state.sessionFile,
   )?.session;
   const original = hostSession?.getToolByName(name);
+  const approval = remoteWrapperApproval(
+    name,
+    typeof original?.approval === "function" ? original.approval.bind(original) : original?.approval ?? approvalFor(name),
+    original?.approvalCacheTargets?.bind(original),
+    () => state,
+  );
   pi.registerTool({
     name,
     label: original?.label ?? TOOL_LABELS[name],
@@ -638,8 +642,10 @@ function registerWrapper(
     deferrable: original?.deferrable,
     strict: original?.strict,
     ...{ customWireName: original?.customWireName },
-    approval: original?.approval ?? approvalFor(name),
+    approval: approval.approval,
+    approvalCacheTargets: approval.approvalCacheTargets,
     async execute(toolCallId, rawParams, signal, rawOnUpdate, ctx) {
+      approval.assertBinding(rawParams);
       const params = rawParams as Record<string, unknown>;
       const binding = state.binding;
       const ensureCurrent = () => {
@@ -647,7 +653,8 @@ function registerWrapper(
       };
       const target = await executionTarget(name, params, state, ctx, signal);
       ensureCurrent();
-      if (name === "bash" && target === "remote" && params.async === true && !params.name) {
+      const serviceName = name === "bash" && target === "remote" && typeof params.name === "string" ? params.name.trim() || undefined : undefined;
+      if (name === "bash" && target === "remote" && params.async === true && !serviceName) {
         return startRemoteAsyncBash(toolCallId, params, state, ctx, rawOnUpdate);
       }
       if (name === "read" && params.path === "proc://" && target === "remote") {
@@ -655,9 +662,8 @@ function registerWrapper(
         ensureCurrent();
         const local = await executeWithTarget("local", name, `${toolCallId}:local`, params, state, ctx, signal);
         ensureCurrent();
-        return { content: [...local.content, { type: "text", text: "Remote services:" }, ...remote.content], details: { local: local.details, remote: remote.details } };
+        return mergeProcessListings(local, remote);
       }
-      const serviceName = name === "bash" && target === "remote" && typeof params.name === "string" ? params.name : undefined;
       const manager = resolveLocalAsyncJobManager(state.sessionFile);
       if (serviceName && (manager?.getAllJobs().some((job) => job.id === serviceName) || AgentRegistry.global().list().some((agent) => agent.id === serviceName))) {
         throw new Error(`Remote service name ${serviceName} conflicts with a local job or agent`);

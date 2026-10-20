@@ -60,6 +60,13 @@ describe("execution settings whitelist", () => {
     expect(() => parseExecutionSettings({ "read.defaultLimit": "500" })).toThrow(/read\.defaultLimit/);
     expect(() => parseExecutionSettings([])).toThrow(/must be an object/);
   });
+
+  test("LSP request timeout is forwarded in seconds without coercion", () => {
+    expect(captureExecutionSettings({ get: key => key === "lsp.requestTimeout" ? 45 : undefined, isConfigured: key => key === "lsp.requestTimeout" })).toEqual({ "lsp.requestTimeout": 45 });
+    expect(parseExecutionSettings({ "lsp.requestTimeout": 0 })).toEqual({ "lsp.requestTimeout": 0 });
+    expect(() => parseExecutionSettings({ "lsp.requestTimeout": -1 })).toThrow(/lsp.requestTimeout/);
+    expect(() => parseExecutionSettings({ "lsp.requestTimeout": "45" })).toThrow(/lsp.requestTimeout/);
+  });
 });
 
 describe("protocol carries settings and tool names", () => {
@@ -88,5 +95,14 @@ describe("protocol carries settings and tool names", () => {
     expect(() =>
       parseRequest(JSON.stringify({ type: "execute", id: "1", toolCallId: "c1", tool: "bash", args: {}, toolNames: [1] })),
     ).toThrow(/toolNames/);
+  });
+
+  test("per-job shell scope cannot be attached to other tools or services", () => {
+    const request = { type: "execute", id: "job", toolCallId: "job", tool: "bash", args: {}, bashScope: "job" };
+    expect(parseRequest(JSON.stringify(request))).toMatchObject({ bashScope: "job" });
+    for (const name of ["", "  "]) expect(parseRequest(JSON.stringify({ ...request, args: { name } }))).toMatchObject({ bashScope: "job" });
+    for (const change of [{ tool: "read" }, { bashScope: "other" }, { args: { name: "service" } }]) {
+      expect(() => parseRequest(JSON.stringify({ ...request, ...change }))).toThrow(/bashScope/);
+    }
   });
 });

@@ -107,6 +107,7 @@ export type NativeWorkerRuntime = {
   cwd: string;
   tools: Readonly<Record<RemoteToolName, RemoteNativeTool>>;
   session: ToolSession;
+  createJobBash: () => RemoteNativeTool;
   /** Release runtime-owned host resources (the output artifact namespace). Idempotent. */
   dispose: () => Promise<void>;
 };
@@ -208,13 +209,15 @@ export async function createNativeWorkerRuntime(
     eval: asRemoteNativeTool(new EvalTool(session)),
     debug: asRemoteNativeTool(new DebugTool(session)),
   };
-  for (const tool of Object.values(tools)) {
+  const publishTool = (tool: RemoteNativeTool): RemoteNativeTool => {
     const execute = tool.execute.bind(tool);
     tool.execute = async (id, params, signal, onUpdate, context) => artifacts.publish(
       await execute(id, await resolveRemoteArtifacts(params) as Record<string, unknown>, signal,
         onUpdate ? (value) => onUpdate(artifacts.publish(value)) : undefined, context),
     );
-  }
+    return tool;
+  };
+  Object.values(tools).forEach(publishTool);
   const evalCallableNames = REMOTE_TOOL_NAMES.filter(
     (name) => name !== "eval" && name !== "ast_edit",
   );
@@ -238,5 +241,11 @@ export async function createNativeWorkerRuntime(
     xdevTools.set(name, tools[name as RemoteToolName]);
   let disposed: Promise<void> | undefined;
   const dispose = () => (disposed ??= artifacts.dispose());
-  return { cwd: absoluteCwd, tools, session, dispose };
+  return {
+    cwd: absoluteCwd, tools, session, dispose,
+    createJobBash: () => {
+      const jobSessionId = `${sessionId}:async:${crypto.randomUUID()}`;
+      return publishTool(asRemoteNativeTool(new BashTool({ ...session, getSessionId: () => jobSessionId })));
+    },
+  };
 }

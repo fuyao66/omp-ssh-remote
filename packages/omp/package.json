@@ -11,7 +11,7 @@
     "README.zh-CN.md"
   ],
   "peerDependencies": {
-    "@oh-my-pi/pi-coding-agent": ">=18.11.0"
+    "@oh-my-pi/pi-coding-agent": ">=18.12.3"
   },
   "omp": {
     "extensions": [

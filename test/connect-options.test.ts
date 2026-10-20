@@ -18,6 +18,7 @@ describe("remote connection aliases", () => {
     expect(parseConnectArgs("gpu-box", [gpuBox])).toEqual({
       target: "developer@remote.example.com",
       displayTarget: "gpu-box",
+      sshAlias: "gpu-box",
       port: 2222,
       identityFile: "~/.ssh/gpu-box.pem",
     });
@@ -27,6 +28,7 @@ describe("remote connection aliases", () => {
     expect(parseConnectArgs("gpu-box /srv/project", [gpuBox])).toMatchObject({
       target: "developer@remote.example.com",
       displayTarget: "gpu-box",
+      sshAlias: "gpu-box",
       cwd: "/srv/project",
     });
   });
@@ -40,6 +42,7 @@ describe("remote connection aliases", () => {
     ).toEqual({
       target: "developer@remote.example.com",
       displayTarget: "gpu-box",
+      sshAlias: "gpu-box",
       cwd: "/srv/project",
       port: 2200,
       identityFile: "~/.ssh/override",
@@ -58,6 +61,30 @@ describe("remote connection aliases", () => {
       cwd: "/srv/project",
       port: 2222,
       identityFile: "~/.ssh/key",
+    });
+  });
+
+  test("does not reinterpret explicit targets as configured alias names", () => {
+    for (const requestedTarget of ["developer@remote.example.com", "192.0.2.10"]) {
+      const misleadingAlias = { ...gpuBox, name: requestedTarget };
+      expect(parseConnectArgs(requestedTarget, [misleadingAlias])).toEqual({
+        target: requestedTarget,
+        displayTarget: requestedTarget,
+      });
+    }
+    expect(parseConnectArgs("remote.example.com", [gpuBox])).toEqual({
+      target: "remote.example.com",
+      displayTarget: "remote.example.com",
+    });
+  });
+
+  test("keeps the configured destination when an OMP alias overrides SSH config", () => {
+    const project = { ...gpuBox, host: "project.example.com", username: "project-user" };
+    const sshConfig = { ...gpuBox, host: "ssh-config.example.com", username: "ssh-user" };
+    const configured = mergeConfiguredSshHosts([project], [], [sshConfig]);
+    expect(parseConnectArgs("gpu-box", configured)).toMatchObject({
+      target: "project-user@project.example.com",
+      sshAlias: "gpu-box",
     });
   });
 

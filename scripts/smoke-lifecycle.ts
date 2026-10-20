@@ -35,12 +35,19 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
     let connected = false;
     try {
       const local = text(await invoke("bash", { command: "hostname" })).trim();
+      const readTool = session.getToolByName("read"); assert(readTool?.approvalCacheTargets);
+      const beforeArgs = { path: file };
+      assert(readTool.approvalCacheTargets(beforeArgs)?.some(target => target.startsWith("/")));
       const began = performance.now();
       await commands.get("remote-connect")!.handler(args, ctx); connected = true;
       console.log("LIFECYCLE_CONNECT_MS", performance.now() - began);
       const remote = text(await invoke("bash", { command: "hostname" })).trim();
       assert.notEqual(remote, local);
       console.log("REMOTE_HOST", remote);
+      const remoteArgs = { path: file };
+      const scoped = readTool.approvalCacheTargets(remoteArgs); assert(scoped?.[0]?.startsWith("remote-request\0"));
+      assert.throws(() => readTool.approvalCacheTargets!(beforeArgs), /binding changed/);
+      console.log("APPROVAL_SCOPE_PASS");
       await invoke("write", { path: file, content: "first\n" });
       const read = text(await invoke("read", { path: file }));
       const header = read.match(/\[[^\]\n]+#[A-F0-9]+\]/)?.[0]; assert(header);
@@ -54,13 +61,16 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       console.log("CORE_EVAL_ARTIFACT_PASS");
 
       const frames: any[] = [];
-      const jobResult = await invoke("bash", { command: "printf LIVE_OUTPUT; sleep 0.3; printf DONE_OUTPUT", async: true }, update => frames.push(update));
+      await invoke("bash", { command: "export OMP_SMOKE_SCOPE=foreground" });
+      const jobResult = await invoke("bash", { name: "  ", command: 'printf "ASYNC_SCOPE=%s\\n" "${OMP_SMOKE_SCOPE-unset}"; export OMP_SMOKE_SCOPE=background; printf LIVE_OUTPUT; sleep 0.3; printf DONE_OUTPUT', async: true }, update => frames.push(update));
       const jobId = (jobResult.details as any)?.async?.jobId; assert(jobId);
       const waited = text(await invoke("wait", {}));
       assert(waited.includes(jobId));
       const manager = session.asyncJobManager; assert(manager);
       const job = manager.getJob(jobId); assert(job); await job.promise;
       assert.equal(job.status, "completed");
+      assert(job.resultText?.includes("ASYNC_SCOPE=unset"));
+      assert(text(await invoke("bash", { command: 'printf "%s" "$OMP_SMOKE_SCOPE"' })).includes("foreground"));
       assert(frames.some(f => f.details?.async?.state === "running" && text(f).includes("LIVE_OUTPUT")));
       assert.equal(frames.at(-1)?.details?.async?.state, "completed");
       assert(text(frames.at(-1)).includes("DONE_OUTPUT"));
@@ -74,6 +84,10 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       assert(text(started).includes("Readiness wait interrupted"));
       console.log("SERVICE_READINESS_RETURNED", text(started));
       assert(text(await invoke("read", { path: `proc://${service}` })).includes("starting"));
+      const listing = await invoke("read", { path: "proc://" });
+      assert((listing.details as any)?.proc?.daemons?.some((daemon: any) => daemon.name === service));
+      await assert.rejects(() => invoke("grep", { path: `proc://${jobId};proc://${service}`, pattern: "SERVICE" }), /Mixed local and remote/);
+      console.log("PROCESS_ROUTING_PASS");
       console.log("SERVICE_PROC_READ_PASS");
       await invoke("write", { path: `proc://${service}/kill`, content: "" });
       console.log("SERVICE_STOP_PASS");
@@ -91,6 +105,8 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       await invoke("bash", { command: `rm -- '${file}'` });
       await commands.get("remote-exit")!.handler("", ctx); connected = false;
       assert.equal(text(await invoke("bash", { command: "hostname" })).trim(), local);
+      assert.throws(() => readTool.approvalCacheTargets!(remoteArgs), /binding changed/);
+      assert(readTool.approvalCacheTargets({ path: file })?.some(target => target.startsWith("/")));
       console.log("LIFECYCLE_SMOKE_PASS");
       process.exitCode = 0;
     } catch (error) { console.error(error); process.exitCode = 1; }

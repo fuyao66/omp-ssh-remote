@@ -165,6 +165,34 @@ describe("native worker round trip", () => {
     expect(JSON.stringify(result)).toContain("42");
   });
 
+  test("eval print remains available after native display removal", async () => {
+    const js = await client.execute("eval", "print-only-js", { language: "js", title: "print contract", code: 'console.log("JS_DISPLAY", typeof display); print("JS_PRINT", 42)' });
+    expect(js).not.toMatchObject({ isError: true });
+    expect(JSON.stringify(js)).toContain("JS_DISPLAY undefined");
+    expect(JSON.stringify(js)).toContain("JS_PRINT 42");
+    const py = await client.execute("eval", "print-only-py", { language: "py", title: "print contract", code: 'print("PY_DISPLAY", "display" in globals()); print("PY_PRINT", 42)' });
+    expect(py).not.toMatchObject({ isError: true });
+    expect(JSON.stringify(py)).toContain("PY_DISPLAY False");
+    expect(JSON.stringify(py)).toContain("PY_PRINT 42");
+  });
+
+  test("foreground bash retains session variables across remote calls", async () => {
+    await client.execute("bash", "shell-export", { command: "export OMP_REMOTE_SHELL_SENTINEL=remote_persisted" });
+    const result = await client.execute("bash", "shell-reuse", { command: 'printf "%s" "$OMP_REMOTE_SHELL_SENTINEL"' });
+    expect(JSON.stringify(result)).toContain("remote_persisted");
+  });
+
+  test("job shells neither inherit nor mutate the foreground session shell", async () => {
+    const scope = { bashScope: "job" as const };
+    await client.execute("bash", "isolation-export", { command: "export OMP_REMOTE_SCOPE=foreground" });
+    const first = await client.execute("bash", "isolated-first", { name: "", command: 'printf "INHERITED=%s" "${OMP_REMOTE_SCOPE-unset}"; export OMP_REMOTE_SCOPE=job' }, undefined, undefined, scope);
+    expect(JSON.stringify(first)).toContain("INHERITED=unset");
+    const second = await client.execute("bash", "isolated-second", { name: "  ", command: 'printf "NEXT=%s" "${OMP_REMOTE_SCOPE-unset}"' }, undefined, undefined, scope);
+    expect(JSON.stringify(second)).toContain("NEXT=unset");
+    const foreground = await client.execute("bash", "foreground-intact", { command: 'printf "FOREGROUND=%s" "$OMP_REMOTE_SCOPE"' });
+    expect(JSON.stringify(foreground)).toContain("FOREGROUND=foreground");
+  });
+
   test("remote eval tool bridge uses the same remote workspace", async () => {
     const result = await client.execute("eval", "eval-tool-read", {
       language: "js",

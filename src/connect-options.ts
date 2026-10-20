@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { join } from "node:path";
 
 function getSSHConfigPath(scope: "project" | "user", cwd = process.cwd()): string {
@@ -10,6 +11,7 @@ function getSSHConfigPath(scope: "project" | "user", cwd = process.cwd()): strin
 export type RemoteConnectRequest = {
   target: string;
   displayTarget: string;
+  sshAlias?: string;
   cwd?: string;
   port?: number;
   identityFile?: string;
@@ -218,9 +220,9 @@ export function parseConnectArgs(
   }
   const requestedTarget = positionals[0]!;
   const cwd = positionals[1];
-  const configured = configuredHosts.find(
-    (host) => host.name === requestedTarget,
-  );
+  const configured = requestedTarget.includes("@") || isIP(requestedTarget)
+    ? undefined
+    : configuredHosts.find((host) => host.name === requestedTarget);
   const target = configured
     ? `${configured.username ? `${configured.username}@` : ""}${configured.host}`
     : requestedTarget;
@@ -228,6 +230,7 @@ export function parseConnectArgs(
   return {
     target,
     displayTarget: configured?.name ?? requestedTarget,
+    ...(configured ? { sshAlias: configured.name } : {}),
     ...(cwd ? { cwd } : {}),
     ...(port ?? configured?.port
       ? { port: port ?? configured?.port }

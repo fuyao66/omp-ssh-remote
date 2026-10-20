@@ -12,6 +12,7 @@ import type {
 import {
   buildScpBaseCommand,
   buildSshBaseCommand,
+  getSshDestination,
   quoteRemoteArgument,
   type SshConnectionOptions,
 } from "./ssh.ts";
@@ -178,7 +179,7 @@ export async function resolveRemoteHome(
   options: WorkerDeploymentOptions,
 ): Promise<string> {
   const output = await run(
-    [...buildSshBaseCommand(options), options.target, `printf '%s\\n' "$HOME"`],
+    [...buildSshBaseCommand(options), getSshDestination(options), `printf '%s\\n' "$HOME"`],
     "Remote home probe",
   );
   if (!output.startsWith("/") || output.includes("\n")) {
@@ -217,7 +218,7 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
     await run(
       [
         ...buildSshBaseCommand(options),
-        options.target,
+        getSshDestination(options),
         "command -v flock >/dev/null && uname -s && uname -m && printf '%s' \"$HOME\"",
       ],
       "Probe remote host platform and home",
@@ -245,7 +246,7 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
   const exists = await run(
     [
       ...buildSshBaseCommand(options),
-      options.target,
+      getSshDestination(options),
       `test -x ${quotedWorker} && test "$(cat ${quotedMarker} 2>/dev/null)" = '${hash}' && printf present || printf missing`,
     ],
     "Remote worker check",
@@ -269,7 +270,7 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
   await run(
     [
       ...buildSshBaseCommand(options),
-      options.target,
+      getSshDestination(options),
       `mkdir -p ${quoteRemoteArgument(remoteDir)} && chmod 700 ${quoteRemoteArgument(remoteDir)}`,
     ],
     "Remote cache setup",
@@ -280,7 +281,7 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
   const scp = buildScpBaseCommand(options);
   // The worker is a ~200 MB uncompressed Bun executable; ssh-level compression
   // measured ~40% fewer bytes on the wire for the one-time upload per version.
-  scp.push("-C", localWorker, `${options.target}:${quoteRemoteArgument(temporary)}`);
+  scp.push("-C", localWorker, `${getSshDestination(options)}:${quoteRemoteArgument(temporary)}`);
   const quotedTemporary = quoteRemoteArgument(temporary);
   const quotedTemporaryMarker = quoteRemoteArgument(temporaryMarker);
   try {
@@ -288,14 +289,14 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
   await run(
     [
       ...buildSshBaseCommand(options),
-      options.target,
+      getSshDestination(options),
       `set -eu; actual=$(sha256sum ${quotedTemporary} | cut -d ' ' -f 1); test "$actual" = '${hash}'; chmod 700 ${quotedTemporary}; mv -f ${quotedTemporary} ${quotedWorker}; printf '%s\\n' '${hash}' > ${quotedTemporaryMarker}; chmod 600 ${quotedTemporaryMarker}; mv -f ${quotedTemporaryMarker} ${quotedMarker}`,
     ],
     "Worker activation",
   );
   } catch (error) {
     await deploymentContext.run({}, () => run([
-      ...buildSshBaseCommand(options), options.target,
+      ...buildSshBaseCommand(options), getSshDestination(options),
       `rm -f -- ${quotedTemporary} ${quotedTemporaryMarker}`,
     ], "Remove incomplete worker upload", 20000)).catch(() => {});
     throw error;
@@ -338,7 +339,7 @@ async function pruneStaleRemoteWorkers(
   await run(
     [
       ...buildSshBaseCommand(options),
-      options.target,
+      getSshDestination(options),
       buildPruneStaleWorkersCommand(namespaceDir, activeHash),
     ],
     "Remote worker cache prune",
@@ -388,7 +389,7 @@ async function deployCompanionArtifact(
   const exists = await run(
     [
       ...buildSshBaseCommand(options),
-      options.target,
+      getSshDestination(options),
       `test -x ${quotedRemoteArtifactBin} && test "$(cat ${quotedMarker} 2>/dev/null)" = '${artifactHash}' && printf present || printf missing`,
     ],
     `${artifact.id} companion artifact check`,
@@ -398,7 +399,7 @@ async function deployCompanionArtifact(
     await run(
       [
         ...buildSshBaseCommand(options),
-        options.target,
+        getSshDestination(options),
         `mkdir -p ${quoteRemoteArgument(remoteArtifactDir)} && chmod 700 ${quoteRemoteArgument(remoteArtifactDir)}`,
       ],
       `${artifact.id} companion artifact cache setup`,
@@ -409,13 +410,13 @@ async function deployCompanionArtifact(
     const scp = buildScpBaseCommand(options);
     scp.push(
       localArtifact,
-      `${options.target}:${quoteRemoteArgument(tempUpload)}`,
+      `${getSshDestination(options)}:${quoteRemoteArgument(tempUpload)}`,
     );
     await run(scp, `${artifact.id} companion artifact upload`);
     await run(
       [
         ...buildSshBaseCommand(options),
-        options.target,
+        getSshDestination(options),
         `set -eu; actual=$(sha256sum ${quoteRemoteArgument(tempUpload)} | cut -d ' ' -f 1); test "$actual" = '${artifactHash}'; chmod 700 ${quoteRemoteArgument(tempUpload)}; mv -f ${quoteRemoteArgument(tempUpload)} ${quotedRemoteArtifactBin}; printf '%s\n' '${artifactHash}' > ${quoteRemoteArgument(tempMarker)}; chmod 600 ${quoteRemoteArgument(tempMarker)}; mv -f ${quoteRemoteArgument(tempMarker)} ${quotedMarker}`,
       ],
       `${artifact.id} companion artifact activation`,
@@ -425,7 +426,7 @@ async function deployCompanionArtifact(
   await run(
     [
       ...buildSshBaseCommand(options),
-      options.target,
+      getSshDestination(options),
       `ln -sf ${quotedRemoteArtifactBin} ${quotedWorkerDir}/${quoteRemoteArgument(artifact.executableName)}`,
     ],
     `Link ${artifact.id} companion artifact to worker directory`,

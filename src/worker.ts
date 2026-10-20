@@ -166,7 +166,7 @@ async function initialize(request: InitializeRequest): Promise<void> {
 
 function startExecute(request: ExecuteRequest): void {
   const toolName = request.tool as RemoteToolName;
-  const tool = runtime?.tools[toolName];
+  const tool = request.bashScope === "job" ? runtime?.createJobBash() : runtime?.tools[toolName];
   if (!tool) {
     send({
       type: "error",

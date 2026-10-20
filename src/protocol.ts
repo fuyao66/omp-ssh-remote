@@ -13,7 +13,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.9.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.10.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
@@ -58,6 +58,8 @@ export type ExecuteRequest = {
   toolNames?: string[];
   /** The host can interrupt readiness without cancelling the service. */
   steering?: boolean;
+  /** Per-job native shell; never shares foreground variables or options. */
+  bashScope?: "job";
 };
 
 export type CancelRequest = { type: "cancel"; id: string };
@@ -170,6 +172,13 @@ export function parseRequest(raw: unknown): Request {
     if (value.steering !== undefined && typeof value.steering !== "boolean") {
       throw new Error("Protocol field steering must be a boolean");
     }
+    if (value.bashScope !== undefined) {
+      const name = asRecord(value.args, "args").name;
+      const named = name !== undefined && !(typeof name === "string" && name.trim() === "");
+      if (value.bashScope !== "job" || value.tool !== "bash" || named) {
+        throw new Error("Protocol bashScope is only valid for unnamed bash jobs");
+      }
+    }
     return {
       type,
       id: stringField(value, "id"),
@@ -178,6 +187,7 @@ export function parseRequest(raw: unknown): Request {
       args: asRecord(value.args, "args"),
       ...(toolNames === undefined ? {} : { toolNames: toolNames as string[] }),
       ...(value.steering === undefined ? {} : { steering: value.steering as boolean }),
+      ...(value.bashScope === "job" ? { bashScope: "job" as const } : {}),
     };
   }
   if (type === "cancel") return { type, id: stringField(value, "id") };

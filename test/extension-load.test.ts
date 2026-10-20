@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { describe, expect, test } from "bun:test";
 import remoteRuntimeExtension, {
   remoteWrapperRenderer,
@@ -105,6 +106,74 @@ describe("OMP extension loading", () => {
       mergeCallAndResult: true,
       inline: true,
     });
+  });
+
+  test("preserves native approval decisions and bound cache-target callbacks", async () => {
+    const tools = new Map<string, ToolDefinition>();
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+    const decision = { tier: "write", policy: "deny", reason: "native policy" } as const;
+    const targets = ["/native/workspace/file"];
+    const native = {
+      name: "read",
+      label: "Native read",
+      loadMode: "discoverable",
+      readsSkillUris: true,
+      deferrable: false,
+      strict: false,
+      customWireName: "native_read",
+      approval(args: unknown) {
+        expect(this).toBe(native);
+        expect(args).toEqual({ path: "file" });
+        return decision;
+      },
+      approvalCacheTargets(args: unknown) {
+        expect(this).toBe(native);
+        expect(args).toEqual({ path: "file" });
+        return targets;
+      },
+    };
+    const sessionFile = `/tmp/approval-metadata-${crypto.randomUUID()}.jsonl`;
+    const registry = AgentRegistry.global();
+    const ref = registry.register({
+      id: `ApprovalMetadata-${crypto.randomUUID()}`,
+      displayName: "approval metadata test",
+      kind: "main",
+      sessionFile,
+      session: {
+        getToolByName: () => native,
+        async runToolRegistryMutation(mutate: () => Promise<void>) { await mutate(); },
+      } as unknown as Parameters<AgentRegistry["register"]>[0]["session"],
+    });
+    const api = {
+      registerCommand() {},
+      registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
+      on(event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) { handlers.set(event, handler); },
+      getActiveTools: () => ["read"],
+      getAllTools: () => [{ name: "read", description: "Native description", parameters: {}, sourceInfo: { source: "builtin" } }],
+    };
+    try {
+      await remoteRuntimeExtension(api as unknown as ExtensionAPI);
+      await handlers.get("session_start")!({}, {
+        cwd: "/native/workspace",
+        sessionManager: { getSessionFile: () => sessionFile },
+        ui: { notify() {} },
+      });
+      const wrapper = tools.get("read")!;
+      expect(wrapper).toMatchObject({
+        label: native.label,
+        description: "Native description",
+        loadMode: "discoverable",
+        readsSkillUris: true,
+        deferrable: false,
+        strict: false,
+        customWireName: "native_read",
+      });
+      expect(typeof wrapper.approval).toBe("function");
+      expect((wrapper.approval as (args: unknown) => unknown)({ path: "file" })).toBe(decision);
+      expect(wrapper.approvalCacheTargets?.({ path: "file" })).toBe(targets);
+    } finally {
+      registry.unregister(ref.id, ref);
+    }
   });
 
   test("remote_reconnect fails closed when nothing is selected", async () => {

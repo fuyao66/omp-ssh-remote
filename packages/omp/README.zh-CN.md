@@ -26,6 +26,12 @@ OMP 18.11 兼容：远端异步 Bash 转发实时和终态卡片更新，日志�
 
 显式停止服务成功后，根据原生 stop 回执结束本机协调任务。不会把主动停止当成自然退出：broker 对显式 stop 不发送 `daemon-completed`。停止失败时继续保留追踪。
 
+OMP 18.12.3 审批保留本机原生文件／目录授权。远端使用哈希化的精确请求授权，按当前 binding、主机／用户／端口／密钥、目录和工具隔离，不能复用本机目录权限或另一台服务器的权限。重连／切换环境后失效；等待审批期间切换环境，会拒绝记录授权和执行旧请求。暂不提供远端整目录或跨 session 授权。
+
+显式远端异步命令使用每个 job 独立的原生 shell，前台命令继续保留 session 变量。进程列表保留原生渲染元数据；多 URI 进程查询不允许混合本机与远端。新版原始管道捕获（`proc://<job>/streams`）和自动生成的进度组件暂未桥接到远端 job：当前传输的是渲染后的预览／结果，不是可追加的原始管道数据；常规日志、实时输出卡片、取消和 `wait` 继续可用。需要各阶段输出时请显式写日志。远端 eval 跟随原生 18.12.3，使用 `print` 或 JS `console.log`，不再使用已移除的 `display`。
+
+`lsp.requestTimeout` 同样按秒转发，保留每次调用单独设置 timeout 的能力。
+
 连接期间明确拒绝用户直接 shell（`!`/`!!`）和 Python 快捷入口，避免静默执行本机命令；请使用远端 `bash`/`eval`，或退出连接后使用本机快捷入口。未适配的 `find`、`security_scan`、`checkpoint`、`rewind`、`ida`（包括 xdev 入口）明确拒绝。远端 eval 只支持计算和远端工作区工具回调，不桥接本机 agent/workpool、judge/completion、archive、browser、todo；固定的工作区说明解释此边界，本机编排请用顶层工具。
 
 截断输出保存在远端 `~/.cache/omp-ssh-remote/artifacts/<namespace>`。连接到同一主机后，可用 `read` selector 或 `grep` 读取返回的 `remote-artifact://<namespace>/<id>`。companion 正常退出时删除自己的 namespace，启动时清扫超过一小时且所属 worker 已不存在的 namespace；因此 transport 丢失遗留的 artifact 会过期，但永远不会复制到本机。本机 `artifact://` 仍保持本机语义。`xd://debug` 与直接 debug 一样在远端执行。
@@ -44,7 +50,7 @@ flowchart LR
 
 ## 环境要求
 
-- 本机 Linux 或 WSL，OMP `>=18.11.0`，并安装 Bun `1.3.14+`、npm、tar、OpenSSH 和 SCP；
+- 本机 Linux 或 WSL，OMP `>=18.12.3`，并安装 Bun `1.3.14+`、npm、tar、OpenSSH 和 SCP；
 - 远端为 glibc Linux `x86_64` 或 `aarch64`；
 - 公钥 SSH 可在 batch mode 下登录；
 - 远端项目目录已存在；
@@ -75,11 +81,13 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 链接后重启 OMP。更新时执行 `git pull`，重新构建 extension 和 workers，再重启或 reload plugin。连接状态下 reload 会关闭该 session 的 companion，之后需要重新连接。
 
-当前 companion 基于 OMP 18.11.0 构建，runtime contract 为 0.9.0，包含原生 broker IPC 迁移。更新 runtime 依赖时即使 wire schema 不变，也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本和 schema 差异。
+当前 companion 基于 OMP 18.12.3 构建，runtime contract 为 0.10.0。更新 runtime 依赖时即使 wire schema 不变，也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本和 schema 差异。
 
 ## 连接与操作
 
 可以使用标准 `~/.ssh/config` alias 或 OMP `/ssh add` 记录：
+
+已配置的别名会保留为 SSH／SCP 的目标名称以匹配 `Host`，实际主机地址、用户、端口和密钥仍按解析后的连接配置选择。因此仅写在别名下的 `ProxyCommand`、`ProxyJump` 等 OpenSSH 设置会应用到探测、上传和 worker 连接，不必额外添加 IP 地址的 `Host` 条目。
 
 ```text
 /remote-connect gpu-box /srv/project
@@ -137,7 +145,7 @@ worker 初始化 `2439 ms`。另一次首次上传／部署耗时 `88.36 s`，�
 ## 限制
 
 - 仅支持 Linux glibc x86_64 和 ARM64；
-- OMP `>=18.11.0`，且 companion schema 匹配；
+- OMP `>=18.12.3`，且 companion schema 匹配；
 - 远端须有 util-linux 的 `flock`，用于保护活跃 worker 可执行文件；
 - 支持显式 async Bash；不桥接自动后台化和交互 Bash PTY；
 - 不支持 `task isolated:true` 远端 worktree；
