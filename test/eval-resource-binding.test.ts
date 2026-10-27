@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { createOmpRuntimeHandshake } from "../src/omp/runtime-contract.ts";
 import { TOOL_RUNTIME_VERSION, parseMessage, parseRequest } from "../src/protocol.ts";
+import { resolveRemoteResourceArgs } from "../src/resource-routing.ts";
 
 const conflict = "<<<<<<< HEAD\nours value\n=======\ntheirs value\n>>>>>>> branch\n";
 
@@ -17,7 +18,9 @@ describe("runtime-owned resource binding reaches nested Eval tools", () => {
       await writeFile(join(cwd, "conflicted.txt"), conflict);
       const ready = await client.initialize(cwd, createOmpRuntimeHandshake({ hostVersion: "18.12.6", editMode: "hashline" }), undefined, { resourceBinding: binding });
       expect(ready.resourceBinding).toBe(binding);
-      const evalCode = (id: string, code: string) => client.execute("eval", id, { language: "js", title: id, code });
+      const evalCode = (id: string, code: string) => client.execute("eval", id, { language: "js", title: id, code }, undefined, undefined, {
+        onInvoke: (invocation, signal, onUpdate) => client.execute(invocation.tool, invocation.toolCallId, resolveRemoteResourceArgs(invocation.tool as Parameters<typeof resolveRemoteResourceArgs>[0], invocation.args, binding), signal, onUpdate),
+      });
       const first = await evalCode("publish-bound-read", 'print((await tool.read({ path: "conflicted.txt:conflicts" })).text)');
       const output = JSON.stringify(first);
       expect(output).toContain("REMOTE CONFLICT REFERENCES");

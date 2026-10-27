@@ -1,4 +1,4 @@
-import { resolve as resolvePath, sep } from "node:path";
+import { resolve as resolvePath } from "node:path";
 import type { AgentToolResult, ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { z } from "@oh-my-pi/omptype/zod";
 import type {
@@ -37,17 +37,24 @@ import {
 import { startRemoteService, completeService, completeStoppedService } from "./omp/service-jobs.ts";
 import { withReadinessSteering } from "./omp/readiness-steering.ts";
 import { remoteWrapperApproval } from "./omp/approval-targets.ts";
-import { isProcessListingPath, processExecutionTarget, mergeProcessListings } from "./omp/process-routing.ts";
+import { isProcessListingPath, mergeProcessListings } from "./omp/process-routing.ts";
 import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { captureExecutionSettings, type RemoteExecutionSettings } from "./omp/execution-settings.ts";
 import { WORKSPACE_RULES, workspaceAnnouncement, type WorkspaceBindingNotice } from "./omp/workspace-context.ts";
-import { resourceExecutionTarget, resolveRemoteResourceArgs } from "./resource-routing.ts";
+import { resolveRemoteResourceArgs } from "./resource-routing.ts";
 import { resolveEditMode } from "@oh-my-pi/pi-coding-agent/utils/edit-mode";
 import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
+import { getRemoteFamilyBroker, sessionFamilyRoot } from "./family-broker.ts";
+export { sessionBelongsToFamily } from "./family-broker.ts";
+import { assertNestedRemoteTool, nestedDispatchScope } from "./nested-dispatch.ts";
+import type { HostToolInvoker } from "./client.ts";
+import { validateAgentToolArguments } from "@oh-my-pi/pi-agent-core";
+import { resourceOwnershipTarget } from "./resource-ownership.ts";
+import type { ToolContextStore } from "@oh-my-pi/pi-coding-agent/tools/context";
 
 /**
  * Snapshot the execution-domain subset of the local session's settings.
@@ -264,15 +271,7 @@ type RemoteFamily = {
   closing: boolean;
 };
 
-const REMOTE_FAMILY_BROKER_KEY = Symbol.for("omp-ssh-remote/session-families");
-type RemoteFamilyBrokerGlobal = typeof globalThis & {
-  [REMOTE_FAMILY_BROKER_KEY]?: Map<string, RemoteFamily>;
-};
-const remoteFamilyGlobal = globalThis as RemoteFamilyBrokerGlobal;
-
-const REMOTE_FAMILIES = (remoteFamilyGlobal[REMOTE_FAMILY_BROKER_KEY] ??=
-  new Map<string, RemoteFamily>());
-const REVOKED_FAMILIES = new Map<string, RemoteFamily>();
+const remoteFamilyBroker = getRemoteFamilyBroker<RemoteFamily>();
 
 const SESSION_SHUTDOWN_REMOTE_CLOSE_TIMEOUT_MS = 1_000;
 
@@ -290,31 +289,6 @@ function effectiveHostEditMode(state: RemoteExtensionState, ctx?: ExtensionConte
   return resolveEditMode({ settings, getActiveModelString: () => model ? `${model.provider}/${model.id}` : undefined });
 }
 
-function sessionFamilyRoot(sessionFile: string): string {
-  const normalized = resolvePath(sessionFile);
-  return normalized.endsWith(".jsonl")
-    ? normalized.slice(0, -".jsonl".length)
-    : normalized;
-}
-
-export function sessionBelongsToFamily(
-  ownerSessionFile: string,
-  candidateSessionFile: string,
-): boolean {
-  const root = sessionFamilyRoot(ownerSessionFile);
-  return resolvePath(candidateSessionFile).startsWith(`${root}${sep}`);
-}
-
-function findRemoteFamily(sessionFile: string): RemoteFamily | undefined {
-  let best: RemoteFamily | undefined;
-  let bestRootLength = -1;
-  for (const [root, family] of [...REMOTE_FAMILIES, ...REVOKED_FAMILIES]) {
-    if (!sessionBelongsToFamily(root, sessionFile) || root.length <= bestRootLength) continue;
-    best = family;
-    bestRootLength = root.length;
-  }
-  return best;
-}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -510,16 +484,15 @@ async function executionTarget(
   ctx: ExtensionContext,
   signal?: AbortSignal,
 ): Promise<ExecutionTarget> {
-  const resourceTarget = resourceExecutionTarget(name, params, state.selected ? state.binding : undefined);
-  if (!state.selected) return "local";
-  if (resourceTarget) return resourceTarget;
-  const processTarget = processExecutionTarget(name, params, id => {
-    const manager = resolveLocalAsyncJobManager(state.sessionFile);
-    return manager?.getAllJobs().some(job => job.id === id) === true || AgentRegistry.global().list().some(agent => agent.id === id);
-  });
-  if (processTarget) return processTarget;
+  const ownership = {
+    selected: state.selected, binding: state.binding, editMode: effectiveHostEditMode(state, ctx),
+    isLocalProcessId: (id: string) => resolveLocalAsyncJobManager(state.sessionFile)?.getAllJobs().some(job => job.id === id) === true ||
+      AgentRegistry.global().list().some(agent => agent.id === id),
+  };
+  const owner = resourceOwnershipTarget(name, params, ownership);
   let target: ExecutionTarget;
-  if (name !== "write") {
+  if (owner) target = owner;
+  else if (name !== "write") {
     target = pathShouldStayLocal(name, params, effectiveHostEditMode(state, ctx)) ? "local" : "remote";
   } else {
     const path = normalizePathArgument(params.path);
@@ -535,12 +508,10 @@ async function executionTarget(
       target = "local";
     } else {
       const inner = parseDeviceArgs(params.content);
-      target =
-        !inner || !(await localXdevAvailable(device, ctx, signal))
-          ? "local"
-          : pathShouldStayLocal(device as RemoteToolName, inner, effectiveHostEditMode(state, ctx))
-            ? "local"
-            : "remote";
+      const innerOwner = inner ? resourceOwnershipTarget(device as RemoteToolName, inner, ownership) : undefined;
+      target = !inner || !(await localXdevAvailable(device, ctx, signal))
+        ? "local"
+        : innerOwner ?? (pathShouldStayLocal(device as RemoteToolName, inner, effectiveHostEditMode(state, ctx)) ? "local" : "remote");
     }
   }
   if (target === "remote" && (name === "read" || name === "edit") &&
@@ -558,6 +529,43 @@ async function executionTarget(
     return "local";
   }
   return target;
+}
+
+function hostEvalInvoker(state: RemoteExtensionState, client: RemoteRuntimeClient, ctx: ExtensionContext): HostToolInvoker {
+  const binding = state.binding;
+  const owner = hostSessionFor(state, ctx);
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  return async (invocation, signal, onUpdate) => {
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      if (!owner || hostSessionFor(state, ctx) !== owner || ctx.sessionManager.getSessionFile() !== sessionFile ||
+          state.client !== client || client.isClosed || state.binding !== binding || invocation.resourceBinding !== binding) {
+        throw new Error("Remote Eval invocation belongs to a closed or changed workspace/session binding");
+      }
+    };
+    assertCurrent();
+    assertNestedRemoteTool(invocation.tool, invocation.args, binding, effectiveHostEditMode(state, ctx));
+    if (!state.wrappedTools.has(invocation.tool)) throw new Error(`Remote Eval tool.${invocation.tool} is not owned by this remote wrapper`);
+    const tool = owner!.getToolForEvalBridge(invocation.tool);
+    if (!tool) throw new Error(`Remote Eval tool.${invocation.tool} is not enabled by the host`);
+    const args = validateAgentToolArguments(tool, {
+      type: "toolCall", id: invocation.toolCallId, name: invocation.tool, arguments: invocation.args,
+    }, "payload");
+    // Fresh native-shaped session context: never inherit a model-loop dispatch
+    // marker or the outer Eval's already-granted approval/provider metadata.
+    const context: ReturnType<ToolContextStore["getContext"]> = {
+      sessionManager: ctx.sessionManager, modelRegistry: ctx.modelRegistry,
+      model: owner!.model, settings: owner!.settings,
+      ui: ctx.ui, hasUI: ctx.hasUI, localProtocolOptions: ctx.localProtocolOptions,
+      toolNames: owner!.getActiveToolNames(), isIdle: () => ctx.isIdle(),
+      hasQueuedMessages: () => ctx.hasPendingMessages(), abort: () => ctx.abort(),
+    };
+    return nestedDispatchScope.run({ assertCurrent }, async () => {
+      const result = await tool.execute(invocation.toolCallId, args, signal, onUpdate, context);
+      assertCurrent();
+      return result;
+    });
+  };
 }
 
 async function executeWithTarget(
@@ -580,7 +588,7 @@ async function executeWithTarget(
   const remoteParams = resolveRemoteResourceArgs(name, params, state.binding);
   const execute = async (steeringSignal?: AbortSignal) =>
     await client.execute(name, toolCallId, remoteParams, signal, onUpdate,
-      { toolNames: state.activeToolNames(), steeringSignal }) as AgentToolResult;
+      { toolNames: state.activeToolNames(), steeringSignal, ...(name === "eval" ? { onInvoke: hostEvalInvoker(state, client, ctx) } : {}) }) as AgentToolResult;
   try {
     if (name === "bash" && typeof params.name === "string" && params.ready !== undefined) {
       const sessionFile = ctx.sessionManager.getSessionFile() ?? state.sessionFile;
@@ -687,14 +695,19 @@ function registerWrapper(
     approval: approval.approval,
     approvalCacheTargets: approval.approvalCacheTargets,
     async execute(toolCallId, rawParams, signal, rawOnUpdate, ctx) {
+      const nested = nestedDispatchScope.getStore();
+      nested?.assertCurrent();
+      if (nested) assertNestedRemoteTool(name, rawParams as Record<string, unknown>, state.binding, effectiveHostEditMode(state, ctx));
       approval.assertBinding(rawParams);
       const params = rawParams as Record<string, unknown>;
       const binding = state.binding;
       const ensureCurrent = () => {
+        nested?.assertCurrent();
         if (state.binding !== binding) throw new Error("Workspace binding changed during this call; execution was not retried in the new workspace. Recheck the current workspace before continuing.");
       };
       const target = await executionTarget(name, params, state, ctx, signal);
       ensureCurrent();
+      if (nested && target !== "remote") throw new Error(`Eval tool.${name} cannot access local host resources from the remote runtime`);
       const serviceName = name === "bash" && target === "remote" && typeof params.name === "string" ? params.name.trim() || undefined : undefined;
       if (name === "bash" && target === "remote" && params.async === true && !serviceName) {
         return startRemoteAsyncBashJob(remoteBashJobOptions(toolCallId, params, state, ctx, rawOnUpdate));
@@ -712,7 +725,7 @@ function registerWrapper(
           return result;
         }
       }
-      if (name === "read" && isProcessListingPath(params.path) && target === "remote") {
+      if (!nested && name === "read" && isProcessListingPath(params.path) && target === "remote") {
         const remote = await executeWithTarget(target, name, toolCallId, params, state, ctx, signal);
         ensureCurrent();
         const local = await executeWithTarget("local", name, `${toolCallId}:local`, params, state, ctx, signal);
@@ -758,7 +771,7 @@ function registerWrapper(
   });
   state.wrappedTools.add(name);
 }
-async function captureOmpHandshake(pi: ExtensionAPI, state: RemoteExtensionState, ctx?: ExtensionContext) {
+export async function captureOmpHandshake(pi: ExtensionAPI, state: RemoteExtensionState, ctx?: ExtensionContext) {
   const hostVersion = await resolveOmpHostVersion();
   const editMode = effectiveHostEditMode(state, ctx);
   const host = hostSessionFor(state, ctx);
@@ -768,7 +781,7 @@ async function captureOmpHandshake(pi: ExtensionAPI, state: RemoteExtensionState
   // Never substitute a default editor for the editor advertised by the host.
   const fallback = missing.length ? await createNativeWorkerRuntime(
     ctx?.cwd ?? state.localCwd ?? process.cwd(), hostVersion,
-    { settings: host ? captureExecutionSettings(host.settings) : captureLocalExecutionSettings() },
+    { editMode, settings: host ? captureExecutionSettings(host.settings) : captureLocalExecutionSettings() },
   ) : undefined;
   try {
     const localTools = REMOTE_TOOL_NAMES.map((name) => {
@@ -825,13 +838,8 @@ function detachRemoteState(
   );
   const family = state.family;
   if (restoreLocal) {
-    family?.members.delete(state);
+    if (family) remoteFamilyBroker.detach(family, state);
     state.family = undefined;
-    if (family?.closing && family.members.size === 0) {
-      for (const [root, revoked] of REVOKED_FAMILIES) {
-        if (revoked === family) REVOKED_FAMILIES.delete(root);
-      }
-    }
   }
   return current;
 }
@@ -848,11 +856,7 @@ export async function closeRemoteFamily(
   family: RemoteFamily,
   timeoutMs?: number,
 ): Promise<void> {
-  family.closing = true;
-  REMOTE_FAMILIES.delete(family.ownerSessionFile);
-  for (const member of family.members) {
-    if (!member.owner && member.sessionFile) REVOKED_FAMILIES.set(member.sessionFile, family);
-  }
+  remoteFamilyBroker.revoke(family);
   const clients = [...family.members]
     .map((member) => detachRemoteState(member, member.owner))
     .filter((client): client is RemoteRuntimeClient => client !== undefined);
@@ -1040,7 +1044,7 @@ async function attachFamilyMember(
   state.owner = false;
   state.family = family;
   state.remoteCwd = family.remoteCwd;
-  family.members.add(state);
+  remoteFamilyBroker.attach(family, state);
   if (family.closing) {
     state.connectionError = "Remote runtime family was revoked; descendants cannot fall back locally";
     return;
@@ -1165,7 +1169,7 @@ export default async function remoteRuntimeExtension(
         );
       }
       const normalizedSessionFile = resolvePath(sessionFile);
-      if (REMOTE_FAMILIES.has(normalizedSessionFile)) {
+      if (remoteFamilyBroker.hasOwner(normalizedSessionFile)) {
         throw new Error("This session already owns a remote runtime family");
       }
       const localCwd = ctx?.cwd ?? process.cwd();
@@ -1211,7 +1215,7 @@ export default async function remoteRuntimeExtension(
         state.family = family;
         state.connectionError = undefined;
         state.editMode = ready.editMode;
-        REMOTE_FAMILIES.set(normalizedSessionFile, family);
+        remoteFamilyBroker.register(family);
         ctx?.ui?.setStatus?.(
           "remote-runtime",
           `ssh ${request.displayTarget}:${ready.cwd}`,
@@ -1354,7 +1358,7 @@ export default async function remoteRuntimeExtension(
           "Remote runtime requires a persisted OMP session so subagents can inherit safely",
         );
       const normalizedSessionFile = resolvePath(sessionFile);
-      if (REMOTE_FAMILIES.has(normalizedSessionFile))
+      if (remoteFamilyBroker.hasOwner(normalizedSessionFile))
         throw new Error("This session already owns a remote runtime family");
       const configuredHosts = await loadConfiguredSshHosts(ctx.cwd);
 
@@ -1395,7 +1399,7 @@ export default async function remoteRuntimeExtension(
         state.family = family;
         state.connectionError = undefined;
         state.editMode = ready.editMode;
-        REMOTE_FAMILIES.set(normalizedSessionFile, family);
+        remoteFamilyBroker.register(family);
         ctx.ui.setStatus(
           "remote-runtime",
           `ssh ${request.displayTarget}:${ready.cwd}`,
@@ -1504,7 +1508,7 @@ export default async function remoteRuntimeExtension(
     state.sessionFile = normalized;
     state.editMode = effectiveHostEditMode(state, ctx);
     await registerActiveWrappers(pi, state);
-    const family = findRemoteFamily(normalized);
+    const family = remoteFamilyBroker.find(normalized);
     if (!family) return;
     await attachFamilyMember(pi, state, family, ctx);
   });

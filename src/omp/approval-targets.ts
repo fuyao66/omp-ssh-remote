@@ -4,9 +4,8 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { RemoteConnectRequest } from "../connect-options.ts";
 import { normalizePathArgument, pathShouldStayLocal } from "../path-domain.ts";
 import type { OmpEditMode, RemoteToolName } from "../protocol.ts";
-import { resourceExecutionTarget } from "../resource-routing.ts";
+import { resourceOwnershipTarget } from "../resource-ownership.ts";
 import { resolveLocalAsyncJobManager } from "./async-bash.ts";
-import { processExecutionTarget } from "./process-routing.ts";
 
 export type ApprovalTargetState = {
   selected: boolean;
@@ -21,13 +20,14 @@ export type ApprovalTargetState = {
 type CacheTargets = (args: unknown) => readonly string[] | undefined;
 
 function localTargets(name: RemoteToolName, args: Record<string, unknown>, state: ApprovalTargetState): boolean {
-  const resourceTarget = resourceExecutionTarget(name, args, state.selected ? state.binding : undefined);
-  if (resourceTarget) return false;
-  if (!state.selected) return true;
-  const processTarget = processExecutionTarget(name, args, id =>
-    AgentRegistry.global().list().some(agent => agent.id === id)
-      || (resolveLocalAsyncJobManager(state.sessionFile)?.getAllJobs().some(job => job.id === id) ?? false));
-  if (processTarget) return processTarget === "local";
+  const owner = resourceOwnershipTarget(name, args, {
+    selected: state.selected,
+    binding: state.binding,
+    editMode: state.editMode,
+    isLocalProcessId: id => AgentRegistry.global().list().some(agent => agent.id === id)
+      || (resolveLocalAsyncJobManager(state.sessionFile)?.getAllJobs().some(job => job.id === id) ?? false),
+  });
+  if (owner) return owner === "local";
   if (name === "write") {
     const device = /^xd:\/\/([^/?#]+)\/?(?:[?#].*)?$/i.exec(normalizePathArgument(args.path))?.[1]?.toLowerCase();
     if (device === "resolve" || device === "reject") return (state.proposalSources.at(-1) ?? "local") === "local";
@@ -37,7 +37,7 @@ function localTargets(name: RemoteToolName, args: Record<string, unknown>, state
       // Actual dispatch also checks device availability asynchronously. A possible
       // remote dispatch must not reuse a local grant, even if it later stays local.
       return inner === null || typeof inner !== "object" || Array.isArray(inner)
-        || pathShouldStayLocal(device as RemoteToolName, inner as Record<string, unknown>, state.editMode);
+        || localTargets(device as RemoteToolName, inner as Record<string, unknown>, state);
     }
     if (device) return true;
   }

@@ -20,6 +20,8 @@ Background execution is split by ownership rather than by tool name:
 
 Ordinary non-isolated subagents inherit connection configuration but receive independent companions. Admission compares the remote execution contract and native tool schemas. `task isolated:true` remains rejected. Native host approval rules are preserved; wrappers are installed at session initialization, before the first model request, not when connecting.
 
+Eval workspace callbacks use the same host invocation path as top-level tools: the companion requests an invocation, local OMP applies its native approval and tool hooks, and the registered remote wrapper dispatches execution back to the companion. Service startup and explicit stops therefore use the same local coordination jobs from either entrypoint. Each callback belongs to one active Eval request and workspace binding; cancellation or connection replacement invalidates it. Nested callbacks cannot select local resources, recursively invoke Eval, or stage AST edits. The companion does not run a second approval engine.
+
 Service coordination reserves a local job before remote startup; a full job manager cannot leave an untracked service running. Completion during startup is retained. Cancellation during readiness or after startup waits for cleanup of the launched instance; an incoming steer only ends the readiness wait and does not stop the service. Worker startup chooses one effective owner for both native execution and shutdown cleanup; an omitted session ID receives a unique worker identity.
 
 OMP 18.11 compatibility: remote async Bash forwards live and terminal card updates while the local job manager still owns logs and `wait`. Named service readiness observes the owning session's steering and peer-message queues; an incoming steer ends only the readiness wait, not the service. Follow-ups and `interruptMode: wait` do not trigger it. This uses public session events rather than the native tool's private steering signal; hidden internal steering without a session queue event is not bridged. Remote `read`/`grep` and hashline `edit` share the native truncated-line protection: reread complete lines with `:raw` before editing them.
@@ -62,7 +64,7 @@ flowchart LR
 
 ## Requirements
 
-- local Linux or WSL with OMP `>=18.12.6`, Bun `1.3.14+`, npm, tar, OpenSSH, and SCP;
+- local Linux or WSL with OMP `>=18.13.1`, Bun `1.3.14+`, npm, tar, OpenSSH, and SCP;
 - remote glibc Linux `x86_64` or `aarch64`;
 - public-key SSH that succeeds in batch mode;
 - an existing remote project directory;
@@ -93,7 +95,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 Restart OMP after linking. Rebuild the extension and both workers when updating. Run `/remote-exit` before disabling, suspending, or reloading the extension. OMP 18.12.6 dynamic suspension neither sends shutdown nor offers a before-suspend hook: suspending a connected extension restores native local tools but may retain its old worker. A plugin cannot guarantee interception or cleanup after its own hooks have been suspended.
 
-The companion is built against OMP 18.12.6 (runtime contract 0.12.0). Build identity comes from the installed source and native dependencies, never an OMP executable on PATH. Rebuild both workers when updating runtime dependencies or capture behavior, even if schemas are unchanged. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Admission reports version, edit-language, and schema drift.
+The companion is built against OMP 18.13.1 (runtime contract 0.14.0). Build identity comes from the installed source and native dependencies, never an OMP executable on PATH. Rebuild both workers when updating runtime dependencies or capture behavior, even if schemas are unchanged. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Admission reports version, edit-language, and schema drift.
 
 Uploads explicitly use `scp -O` (the SCP protocol), because remote destination paths are shell-quoted; the SFTP default in OpenSSH 9+ would treat those quotes as literal filename characters. The local SCP client must support `-O`.
 
@@ -173,7 +175,7 @@ The default mock uses native Chat Completions. Set `CACHE_SMOKE_API=openai-respo
 Set `SMOKE_KEEP_ARTIFACTS=1` to retain `mc.log`, `wire-requests.json` and the isolated session/database for inspection. Dynamic extension suspension while connected is unsupported; disconnect remote before disabling or reloading the extension.
 
 
-`scripts/smoke-lifecycle.ts` additionally checks real file/edit/compute/artifact behavior, async live frames and native `wait`, service steering, explicit-stop tracking, natural exit status, and local restoration. Build it with `bun scripts/build-smoke.ts lifecycle`, then run `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts lifecycle`. Remove the generated bundle afterward.
+`scripts/smoke-lifecycle.ts` additionally checks real file/edit/compute/artifact behavior, direct and nested native approval, nested service startup/stop coordination, async live frames and native `wait`, service steering, natural exit status, and local restoration. Build it with `bun scripts/build-smoke.ts lifecycle`, then run `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts lifecycle`. Remove the generated bundle afterward.
 
 `scripts/smoke-capture.ts` validates exact pre-`tail` bytes, native widget numbers and rendering, automatic foreground promotion without command replay, persistent versus isolated shells, cancellation, and retained local stream reads after disconnect. Its deterministic author replaces only the model boundary; native spec validation, ingestion and rendering still run. The runner creates a temporary configuration with a short automatic-background threshold and leaves user settings untouched:
 
@@ -194,12 +196,13 @@ One plugin upgrade/reload can change the initial prefix. Model/configuration cha
 ## Limits
 
 - Linux glibc x86_64 and ARM64 only;
-- OMP `>=18.12.6` with matching compiled companion schemas;
+- OMP `>=18.13.1` with matching compiled companion schemas;
 - remote `flock` (util-linux) is required: workers hold shared per-version leases so cache pruning cannot delete a live worker's self-reentry executable;
 - explicit async Bash and eligible automatic backgrounding are supported; interactive Bash PTY is not bridged;
 - no `task isolated:true` remote worktrees;
 - no remote-to-local artifact bridge;
 - settings outside the forwarded allowlist keep the companion's compiled defaults; there is no arbitrary settings passthrough;
+- `tools.restrictedFolders` applies to native local resources; remote filesystem restriction prompts are not implemented;
 - one companion process per session or subagent; concurrent children each cost an SSH channel and a worker process;
 - no output frame above 16 MiB;
 - no remote browser, desktop, model credentials, memory, or local session control plane.

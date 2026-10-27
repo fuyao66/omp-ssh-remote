@@ -14,7 +14,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.13.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.14.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
@@ -84,6 +84,19 @@ export type ExecuteRequest = {
   bashScope?: "job" | "session";
 };
 
+export type InvokeMessage = {
+  type: "invoke";
+  id: string;
+  parentId: string;
+  resourceBinding: string;
+  tool: string;
+  toolCallId: string;
+  args: Record<string, unknown>;
+};
+export type InvokeReply =
+  | { type: "invoke-result" | "invoke-update"; id: string; result: unknown }
+  | { type: "invoke-error"; id: string; error: { name: string; message: string } };
+
 export type CancelRequest = { type: "cancel"; id: string };
 export type ShutdownRequest = { type: "shutdown" };
 export type Request =
@@ -93,6 +106,7 @@ export type Request =
   | { type: "service-stop"; id: string; name: string; instanceId: string }
   | { type: "steer"; id: string }
   | { type: "event-ack"; id: string }
+  | InvokeReply
   | ShutdownRequest;
 
 export type ToolManifest = {
@@ -138,6 +152,8 @@ export type Message =
   | ResultMessage
   | CaptureMessage
   | ErrorMessage
+  | InvokeMessage
+  | { type: "invoke-cancel"; id: string }
   | EventMessage;
 
 function stringField(value: Record<string, unknown>, key: string): string {
@@ -225,6 +241,14 @@ export function parseRequest(raw: unknown): Request {
       ...(value.bashScope === "job" || value.bashScope === "session" ? { bashScope: value.bashScope } : {}),
     };
   }
+  if (type === "invoke-result" || type === "invoke-update") {
+    if (!("result" in value)) throw new Error(`Protocol ${type} requires result`);
+    return { type, id: stringField(value, "id"), result: value.result };
+  }
+  if (type === "invoke-error") {
+    const error = asRecord(value.error, "error");
+    return { type, id: stringField(value, "id"), error: { name: stringField(error, "name"), message: stringField(error, "message") } };
+  }
   if (type === "service-stop") {
     const name = stringField(value, "name");
     const instanceId = stringField(value, "instanceId");
@@ -301,6 +325,15 @@ export function parseMessage(line: string): Message {
         : {}),
     };
   }
+  if (type === "invoke") {
+    return {
+      type, id: stringField(value, "id"), parentId: stringField(value, "parentId"),
+      resourceBinding: parseResourceBinding(value.resourceBinding),
+      tool: stringField(value, "tool"), toolCallId: stringField(value, "toolCallId"),
+      args: asRecord(value.args, "args"),
+    };
+  }
+  if (type === "invoke-cancel") return { type, id: stringField(value, "id") };
   if (type === "capture") {
     return { type, id: stringField(value, "id"), capture: parseJobCapturePayload(value.capture) };
   }

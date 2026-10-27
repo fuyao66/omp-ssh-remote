@@ -1,5 +1,6 @@
-import { normalizePathArgument, pathShouldStayLocal } from "./path-domain.ts";
+import { normalizePathArgument, pathsShouldStayLocal } from "./path-domain.ts";
 import { isRecord, type RemoteToolName } from "./protocol.ts";
+import { processOperandExecutionTarget } from "./omp/process-routing.ts";
 
 const REMOTE_CONFLICT = "remote-conflict://";
 const CONFLICT_TARGET = /^remote-conflict:\/\/([^/]+)\/(\*|[1-9]\d*)(?:\/(ours|theirs|base))?$/;
@@ -23,7 +24,22 @@ function nativeConflictTarget(path: string, binding: string | undefined): string
   return `conflict://${match[2]}${match[3] ? `/${match[3]}` : ""}`;
 }
 
-/** Inspect only resource operands, never replacement text or application output. */
+/** Validate every bound namespace before any ownership or local-mode decision. */
+export function validateBoundResourceOperands(
+  name: RemoteToolName,
+  paths: string[],
+  binding?: string,
+): boolean {
+  const bound = paths.filter(path => normalizePathArgument(path).startsWith(REMOTE_CONFLICT));
+  if (bound.length === 0) return false;
+  for (const path of bound) nativeConflictTarget(path, binding);
+  if (name !== "read" && name !== "write") {
+    throw new Error("Bound remote conflict references support only read and write");
+  }
+  return true;
+}
+
+/** Remote-only validation; host dispatch additionally resolves process ownership. */
 export function resourceExecutionTarget(
   name: RemoteToolName,
   params: Record<string, unknown>,
@@ -34,13 +50,9 @@ export function resourceExecutionTarget(
     ...(typeof params.file === "string" ? [params.file] : []),
     ...(Array.isArray(params.paths) ? params.paths.filter((path): path is string => typeof path === "string") : []),
   ];
-  if (!paths.some(path => normalizePathArgument(path).startsWith(REMOTE_CONFLICT))) return undefined;
-  if (name !== "read" && name !== "write") {
-    throw new Error("Bound remote conflict references support only read and write");
-  }
-  for (const path of paths) nativeConflictTarget(path, binding);
+  if (!validateBoundResourceOperands(name, paths, binding)) return undefined;
   // Also reject a semicolon list that would send local conflict:// ids remotely.
-  pathShouldStayLocal(name, params);
+  if (!processOperandExecutionTarget(paths, () => false)) pathsShouldStayLocal(paths);
   return "remote";
 }
 

@@ -8,6 +8,7 @@ import {
   type Message,
   type ReadyMessage,
   type Request,
+  type InvokeMessage,
 } from "./protocol.ts";
 import type { RemoteRuntimeHandshake } from "./runtime-contract.ts";
 import type { RemoteExecutionSettings } from "./omp/execution-settings.ts";
@@ -24,7 +25,17 @@ type PendingCall = {
   reject(error: Error): void;
   onUpdate?: (update: unknown) => void;
   onCapture?: (capture: JobCapturePayload) => void;
+  tool?: string;
+  signal?: AbortSignal;
+  onInvoke?: HostToolInvoker;
+  invocationIds?: Set<string>;
 };
+
+export type HostToolInvoker = (
+  invocation: InvokeMessage,
+  signal: AbortSignal,
+  onUpdate: (value: unknown) => void,
+) => Promise<unknown>;
 async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
@@ -56,6 +67,7 @@ export class RemoteRuntimeClient {
   readonly #exitPromise: Promise<number | null>;
   readonly #eventListeners = new Set<(event: EventMessage) => void | Promise<void>>();
   readonly #closeListeners = new Set<(error: Error) => void>();
+  readonly #invocations = new Map<string, { parentId: string; controller: AbortController }>();
 
   onClose(listener: (error: Error) => void): () => void {
     if (this.#closed) listener(new Error("Remote transport is closed"));
@@ -183,7 +195,7 @@ export class RemoteRuntimeClient {
     args: Record<string, unknown>,
     signal?: AbortSignal,
     onUpdate?: (update: unknown) => void,
-    options: { toolNames?: readonly string[]; steeringSignal?: AbortSignal; bashScope?: "job" | "session"; onCapture?: (capture: JobCapturePayload) => void } = {},
+    options: { toolNames?: readonly string[]; steeringSignal?: AbortSignal; bashScope?: "job" | "session"; onCapture?: (capture: JobCapturePayload) => void; onInvoke?: HostToolInvoker } = {},
   ): Promise<unknown> {
     if (this.#closed) throw new Error("Remote runtime is disconnected");
     if (signal?.aborted) {
@@ -192,9 +204,12 @@ export class RemoteRuntimeClient {
     }
     const id = `req_${this.#nextId++}`;
     const promise = new Promise<unknown>((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject, onUpdate, onCapture: options.onCapture });
+      this.#pending.set(id, { resolve, reject, onUpdate, onCapture: options.onCapture, tool, signal, onInvoke: options.onInvoke });
     });
     const abortHandler = () => {
+      for (const call of this.#invocations.values()) {
+        if (call.parentId === id) call.controller.abort(signal?.reason ?? new Error("Remote Eval cancelled"));
+      }
       if (this.#pending.has(id)) {
         try {
           this.#send({ type: "cancel", id });
@@ -225,6 +240,9 @@ export class RemoteRuntimeClient {
       signal?.removeEventListener("abort", abortHandler);
       options.steeringSignal?.removeEventListener("abort", steerHandler);
       this.#pending.delete(id);
+      for (const call of this.#invocations.values()) {
+        if (call.parentId === id) call.controller.abort(new Error("Remote Eval parent call settled"));
+      }
     }
   }
 
@@ -300,6 +318,16 @@ export class RemoteRuntimeClient {
 
 
   #handle(message: Message): void {
+    if (message.type === "invoke") {
+      // Never await a callback in the frame reader: it may execute another
+      // native worker tool while the originating Eval waits for its reply.
+      void this.#invoke(message);
+      return;
+    }
+    if (message.type === "invoke-cancel") {
+      this.#invocations.get(message.id)?.controller.abort(new Error("Remote Eval invocation cancelled"));
+      return;
+    }
     if (message.type === "ready") {
       this.#resolveReady?.(message);
       this.#resolveReady = undefined;
@@ -310,7 +338,7 @@ export class RemoteRuntimeClient {
       if (this.#eventListeners.size > 0) {
         void Promise.all([...this.#eventListeners].map((listener) => listener(message))).then(() => {
           const id = message.payload.completionId;
-          if (typeof id === "string") this.#send({ type: "event-ack", id });
+          if (!this.#closed && typeof id === "string") this.#send({ type: "event-ack", id });
         }).catch((error) => this.#terminate(error));
       }
       return;
@@ -327,6 +355,7 @@ export class RemoteRuntimeClient {
       const pending = this.#pending.get(message.id);
       if (!pending) return;
       this.#pending.delete(message.id);
+      this.#abortInvocations(message.id, new Error("Remote Eval parent call settled"));
       pending.resolve(message.result);
       return;
     }
@@ -335,9 +364,50 @@ export class RemoteRuntimeClient {
       const pending = this.#pending.get(message.id);
       if (!pending) return;
       this.#pending.delete(message.id);
+      this.#abortInvocations(message.id, error);
       pending.reject(error);
     } else {
       this.#terminate(error);
+    }
+  }
+
+  #abortInvocations(parentId: string, reason: Error): void {
+    for (const invocation of this.#invocations.values()) {
+      if (invocation.parentId === parentId) invocation.controller.abort(reason);
+    }
+  }
+
+  async #invoke(message: InvokeMessage): Promise<void> {
+    const parent = this.#pending.get(message.parentId);
+    const controller = new AbortController();
+    const current = () => !this.#closed && this.#pending.get(message.parentId) === parent;
+    const token = { parentId: message.parentId, controller };
+    try {
+      if (this.#closed || !parent || parent.tool !== "eval" || !parent.onInvoke) throw new Error("Remote Eval invocation has no authorized active host parent");
+      // Replays are a transport violation, not a second result for the same
+      // correlation id. Never replace/delete the original cancellation token.
+      const seen = parent.invocationIds ??= new Set<string>();
+      if (seen.has(message.id) || this.#invocations.has(message.id)) {
+        this.#terminate(new Error("Duplicate remote Eval invocation id"));
+        return;
+      }
+      seen.add(message.id);
+      this.#invocations.set(message.id, token);
+      if (parent.signal?.aborted) controller.abort(parent.signal.reason);
+      controller.signal.throwIfAborted();
+      const result = await parent.onInvoke(message, controller.signal, value => {
+        if (current() && !controller.signal.aborted) this.#send({ type: "invoke-update", id: message.id, result: value });
+      });
+      controller.signal.throwIfAborted();
+      if (current()) this.#send({ type: "invoke-result", id: message.id, result });
+    } catch (error) {
+      if (!this.#closed) {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        try { this.#send({ type: "invoke-error", id: message.id, error: { name: failure.name, message: failure.message } }); }
+        catch (sendError) { this.#terminate(sendError); }
+      }
+    } finally {
+      if (this.#invocations.get(message.id) === token) this.#invocations.delete(message.id);
     }
   }
 
@@ -353,6 +423,8 @@ export class RemoteRuntimeClient {
   #close(error: Error): void {
     if (this.#closed) return;
     this.#closed = true;
+    for (const invocation of this.#invocations.values()) invocation.controller.abort(error);
+    this.#invocations.clear();
     this.#rejectReady?.(error);
     for (const pending of this.#pending.values()) pending.reject(error);
     this.#pending.clear();

@@ -13,8 +13,15 @@ test("process resource lists route every URI, including selectors and streams", 
   expect(processExecutionTarget("read", { path: "proc://" }, local)).toBe("remote");
   expect(processExecutionTarget("read", { path: "file.txt" }, local)).toBeUndefined();
 });
+test("process helper does not reroute debugger or LSP metadata", () => {
+  expect(processExecutionTarget("debug", { action: "terminate", file: "proc://bg_1" }, local)).toBeUndefined();
+  expect(processExecutionTarget("lsp", { file: "proc://bg_1" }, local)).toBeUndefined();
+  for (const tool of ["read", "write", "grep", "glob"] as const) {
+    expect(processExecutionTarget(tool, { path: "proc://bg_1" }, local)).toBe("local");
+  }
+});
 test("native proc URI identity handles scheme case and decoded ids without confusing roots", () => {
-  for (const path of ["PROC://bg_1", "proc://%62g_1", "PROC://%53cout:1-10", "proc://bg_1/"]) {
+  for (const path of ["PROC://bg_1", "proc://%62g_1", "PROC://%53cout:1-10", "proc://bg_1/", "[proc://bg_1#ABCD]", " proc://bg_1 "]) {
     expect(processExecutionTarget("read", { path }, local)).toBe("local");
     expect(isProcessListingPath(path)).toBe(false);
   }
@@ -47,6 +54,12 @@ test("mixed process ownership cannot send later resources to the first resource'
   for (const path of ["proc://bg_1;proc://web", "proc://web;proc://bg_1", "proc://bg_1;/tmp/remote.txt", "proc://web;agent://Scout", "PROC://%62g_1;proc://%77eb", "PROC:///;proc://bg_1", "proc://bg_1;PROC:///"]) {
     expect(() => processExecutionTarget("grep", { path }, local)).toThrow(/Mixed local and remote/);
   }
+});
+
+test("process ownership composes all path operand fields rather than only path", () => {
+  expect(() => processExecutionTarget("read", { path: "proc://web", file: "proc://bg_1" }, local)).toThrow("Mixed local and remote");
+  expect(() => processExecutionTarget("grep", { paths: ["proc://bg_1", "proc://web"] }, local)).toThrow("Mixed local and remote");
+  expect(processExecutionTarget("grep", { paths: ["PROC://%77eb", "proc://api"] }, local)).toBe("remote");
 });
 test("merged process listings retain native renderer data and source errors", () => {
   const localResult = { content: [{ type: "text" as const, text: "bg_1 running" }], details: { proc: { jobs: [{ id: "bg_1" }], agents: [{ id: "Scout" }], daemons: [] } } };

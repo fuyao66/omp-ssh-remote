@@ -25,14 +25,14 @@ import {
   type OmpEditMode,
   type ToolManifest,
 } from "./protocol.ts";
-import { pathShouldStayLocal } from "./path-domain.ts";
+import { assertNestedRemoteTool, NESTED_TOOL_NAMES } from "./nested-dispatch.ts";
 import { createRemoteArtifacts } from "./omp/artifacts.ts";
 import { resolveRemoteArtifactArgs } from "./omp/artifact-input.ts";
 import type { RemoteExecutionSettings } from "./omp/execution-settings.ts";
 import { createCapturedBashTool } from "./omp/captured-bash.ts";
 import type { JobCaptureSender } from "./omp/job-capture.ts";
 import { RemoteConflictHistory } from "./omp/conflict-resources.ts";
-import { bindRemoteResourceResult, resolveRemoteResourceArgs, resourceExecutionTarget } from "./resource-routing.ts";
+import { bindRemoteResourceResult } from "./resource-routing.ts";
 import type { executeOwnedRemoteService, stopRemoteServiceInstance, ServiceStopReceipt } from "./omp/service-lifecycle.ts";
 export interface RemoteNativeTool {
   readonly name: string;
@@ -126,6 +126,7 @@ export type NativeWorkerRuntime = {
   editMode: OmpEditMode;
   resourceBinding: string;
   session: ToolSession;
+  executeEval: (invoke: NonNullable<NativeWorkerRuntimeOptions["invokeTool"]>, ...args: Parameters<RemoteNativeTool["execute"]>) => Promise<unknown>;
   createJobBash: (onCapture: JobCaptureSender, foreground?: boolean) => RemoteNativeTool;
   stopService: (name: string, id: string) => Promise<ServiceStopReceipt>;
   /** Release runtime-owned host resources (the output artifact namespace). Idempotent. */
@@ -145,6 +146,9 @@ export type NativeWorkerRuntimeOptions = {
   bashServices?: boolean;
   /** Shared workspace resource namespace; independent runtimes get a fresh id. */
   resourceBinding?: string;
+  /** Host-authorized invocation; omitted in frontend schema-only snapshots. */
+  invokeTool?: RemoteNativeTool["execute"] extends (...args: infer A) => infer R
+    ? (name: RemoteToolName, ...args: A) => R : never;
   /** Worker-only broker adapter; frontend schema snapshots do not need it. */
   serviceLifecycle?: {
     execute: typeof executeOwnedRemoteService;
@@ -178,6 +182,9 @@ export async function createNativeWorkerRuntime(
   const xdevTools = new Map<string, RemoteNativeTool>();
   const xdevMountedNames = new Set<string>(["lsp", "ast_grep", "ast_edit", "debug"]);
   const callableTools = new Map<string, RemoteNativeTool>();
+  type EvalLease = { invoke: NonNullable<NativeWorkerRuntimeOptions["invokeTool"]>; active: boolean };
+  let evalLease: EvalLease | undefined;
+  let evalQueue: Promise<void> = Promise.resolve();
   const disposeCallbacks = new Set<() => void>();
   const conflictHistory = new RemoteConflictHistory();
   const session: ToolSession = {
@@ -222,10 +229,25 @@ export async function createNativeWorkerRuntime(
       return next;
     },
     isToolActive: (name) => REMOTE_TOOL_NAMES.includes(name as (typeof REMOTE_TOOL_NAMES)[number]),
-    getToolByName: (name) =>
-      callableTools.get(name) as unknown as ReturnType<
-        NonNullable<ToolSession["getToolByName"]>
-      >,
+    getToolByName: name => {
+      const tool = callableTools.get(name);
+      if (!tool) return undefined;
+      // Native JS/Python resolve ordinary tools synchronously while their
+      // per-run registration is still active. Snapshot ownership at lookup,
+      // never after an await in the callback's eventual execute path.
+      const lease = evalLease;
+      return {
+        ...tool,
+        async execute(...args: Parameters<RemoteNativeTool["execute"]>) {
+          args[2]?.throwIfAborted();
+          if (lease && (!lease.active || evalLease !== lease)) throw new Error("Remote Eval invocation lease is no longer active");
+          assertNestedRemoteTool(name, args[1], resourceBinding, resolveEditMode(session));
+          const invoke = lease?.invoke ?? options.invokeTool;
+          if (!invoke) throw new Error("Remote Eval nested tools require the host invocation bridge");
+          return invoke(name as RemoteToolName, ...args);
+        },
+      } as unknown as ReturnType<NonNullable<ToolSession["getToolByName"]>>;
+    },
     getToolChoiceQueue: () =>
       pendingInvokers as unknown as ReturnType<
         NonNullable<ToolSession["getToolChoiceQueue"]>
@@ -279,24 +301,11 @@ export async function createNativeWorkerRuntime(
     return tool;
   };
   Object.values(tools).forEach(publishTool);
-  const evalCallableNames = REMOTE_TOOL_NAMES.filter(
-    (name) => name !== "eval" && name !== "ast_edit",
-  );
+  const evalCallableNames = NESTED_TOOL_NAMES;
   for (const name of evalCallableNames) {
     const tool = tools[name];
-    callableTools.set(name, {
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
-      async execute(toolCallId, params, signal, onUpdate, context) {
-        const resourceTarget = resourceExecutionTarget(name, params, resourceBinding);
-        if (!resourceTarget && pathShouldStayLocal(name, params, editMode)) {
-          throw new Error(
-            `Eval tool.${name} cannot access local internal URIs from the remote runtime`,
-          );
-        }
-        return tool.execute(toolCallId, resolveRemoteResourceArgs(name, params, resourceBinding), signal, onUpdate, context);
-      },
+    callableTools.set(name, { name: tool.name, description: tool.description, parameters: tool.parameters,
+      execute: async () => { throw new Error("Eval callable tools must resolve an invocation lease"); },
     });
   }
   for (const name of xdevMountedNames)
@@ -305,6 +314,38 @@ export async function createNativeWorkerRuntime(
   const dispose = () => (disposed ??= artifacts.dispose());
   return {
     cwd: absoluteCwd, sessionId, tools, session, editMode, resourceBinding, dispose,
+    executeEval: async (invoke, ...args) => {
+      // Eval is natively exclusive. Serialize only Eval runs, never the native
+      // workspace requests that a leased Eval reenters through the host.
+      const previous = evalQueue;
+      // Native JS drains/removes its per-run pending entry; Python unregisters
+      // its unique run before backend completion. Ordinary callbacks resolve
+      // this session's tool synchronously before their first await. Worker
+      // speculation is disabled: adding shadows must revisit this lease proof.
+      const release = Promise.withResolvers<void>();
+      // A cancelled waiter may leave promptly, but later runs must still wait
+      // for both its predecessor and its own release before acquiring ownership.
+      evalQueue = Promise.all([previous, release.promise]).then(() => undefined);
+      const lease: EvalLease = { invoke, active: true };
+      try {
+        const signal = args[2];
+        if (signal) {
+          signal.throwIfAborted();
+          const cancelled = Promise.withResolvers<never>();
+          const abort = () => cancelled.reject(signal.reason instanceof Error ? signal.reason : new Error("Remote Eval cancelled while queued"));
+          signal.addEventListener("abort", abort, { once: true });
+          try { await Promise.race([previous, cancelled.promise]); }
+          finally { signal.removeEventListener("abort", abort); }
+        } else await previous;
+        args[2]?.throwIfAborted();
+        evalLease = lease;
+        return await tools.eval.execute(...args);
+      } finally {
+        lease.active = false;
+        if (evalLease === lease) evalLease = undefined;
+        release.resolve();
+      }
+    },
     stopService: async (name, id) => {
       if (!options.serviceLifecycle) throw new Error("Remote service lifecycle is unavailable in this runtime");
       return options.serviceLifecycle.stop(absoluteCwd, name, id);

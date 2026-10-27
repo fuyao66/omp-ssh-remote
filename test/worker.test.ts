@@ -237,13 +237,126 @@ describe("native worker round trip", () => {
     expect(JSON.stringify(foreground)).toContain("FOREGROUND=unset");
   });
 
-  test("remote eval tool bridge uses the same remote workspace", async () => {
-    const result = await client.execute("eval", "eval-tool-read", {
-      language: "js",
-      title: "tool read",
-      code: 'print(await tool.read({ path: "probe.txt" }))',
+  for (const language of ["js", "py"] as const) {
+    test(`remote ${language} eval tools reenter the same worker through their host callback`, async () => {
+      const invocations: string[] = [];
+      for (let run = 0; run < 3; run++) {
+        const result = await client.execute("eval", `eval-tool-read-${language}-${run}`, {
+          language,
+          title: "tool read",
+          code: 'print(await tool.read({ "path": "probe.txt" }))',
+        }, undefined, undefined, {
+          onInvoke: async (invocation, signal, onUpdate) => {
+            invocations.push(invocation.tool);
+            return client.execute(invocation.tool, invocation.toolCallId, invocation.args, signal, onUpdate);
+          },
+        });
+        expect(JSON.stringify(result)).toContain("edited remotely");
+        expect(invocations).toEqual(Array(run + 1).fill("read"));
+      }
     });
-    expect(JSON.stringify(result)).toContain("edited remotely");
+  }
+
+  test("remote eval nested tools fail closed without a host callback", async () => {
+    const result = await client.execute("eval", "eval-tool-no-host", {
+      language: "js", title: "no host bridge", code: 'await tool.read({ path: "probe.txt" })',
+    });
+    expect(JSON.stringify(result)).toContain("no authorized active host parent");
+  });
+
+  test("host callback denial prevents nested command execution without a provider check", async () => {
+    const result = await client.execute("eval", "eval-tool-denied", {
+      language: "js", title: "denied nested bash", code: 'await tool.bash({ command: "printf forbidden > denied-nested.txt" })',
+    }, undefined, undefined, {
+      onInvoke: async () => { throw new Error("host bash policy denied"); },
+    });
+    expect(JSON.stringify(result)).toContain("host bash policy denied");
+    expect(await Bun.file(join(cwd, "denied-nested.txt")).exists()).toBe(false);
+  });
+
+  test("cancelling an Eval aborts a pending host callback without blocking transport", async () => {
+    const entered = Promise.withResolvers<void>();
+    const aborted = Promise.withResolvers<void>();
+    const controller = new AbortController();
+    const result = client.execute("eval", "eval-tool-cancel", {
+      language: "js", title: "cancel callback", code: 'await tool.read({ path: "probe.txt" })',
+    }, controller.signal, undefined, {
+      onInvoke: async (_invocation, signal) => {
+        entered.resolve();
+        await new Promise<never>((_resolve, reject) => {
+          const abort = () => { aborted.resolve(); reject(signal.reason); };
+          signal.addEventListener("abort", abort, { once: true });
+          if (signal.aborted) abort();
+        });
+      },
+    });
+    await entered.promise;
+    controller.abort(new Error("cancel outer Eval"));
+    await aborted.promise;
+    await result.catch(() => undefined);
+    const later = await client.execute("read", "after-cancelled-callback", { path: "probe.txt" });
+    expect(JSON.stringify(later)).toContain("edited remotely");
+  });
+
+  test("a cancelled queued Eval cannot steal the active invocation lease", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const active = client.execute("eval", "eval-lease-active", {
+      language: "js", title: "held callback", code: 'print((await tool.read({ path: "probe.txt" })).text)',
+    }, undefined, undefined, {
+      onInvoke: async (invocation, signal, onUpdate) => {
+        entered.resolve();
+        await release.promise;
+        return client.execute(invocation.tool, invocation.toolCallId, invocation.args, signal, onUpdate);
+      },
+    });
+    await entered.promise;
+    const controller = new AbortController();
+    let queuedCalls = 0;
+    const queued = client.execute("eval", "eval-lease-cancel-queued", {
+      language: "js", title: "queued cancellation", code: 'await tool.read({ path: "probe.txt" })',
+    }, controller.signal, undefined, {
+      onInvoke: async () => { queuedCalls++; throw new Error("cancelled queued Eval executed"); },
+    });
+    controller.abort(new Error("cancel queued Eval"));
+    try {
+      // This must settle while the predecessor is still held, not merely
+      // avoid executing after its lease eventually becomes available.
+      await expect(queued).rejects.toThrow("cancelled");
+      expect(queuedCalls).toBe(0);
+    } finally {
+      release.resolve();
+    }
+    expect(JSON.stringify(await active)).toContain("edited remotely");
+  });
+
+  test("closing a transport aborts its pending nested callback and never reuses it", async () => {
+    const isolated = new RemoteRuntimeClient({ command: [process.execPath, join(import.meta.dir, "../src/worker.ts")] });
+    const entered = Promise.withResolvers<void>();
+    const aborted = Promise.withResolvers<void>();
+    try {
+      await isolated.initialize(cwd, OMP_RUNTIME_HANDSHAKE);
+      const result = isolated.execute("eval", "closed-callback-binding", {
+        language: "js", title: "close nested callback", code: 'await tool.read({ path: "probe.txt" })',
+      }, undefined, undefined, {
+        onInvoke: async (_invocation, signal) => {
+          entered.resolve();
+          await new Promise<never>((_resolve, reject) => {
+            signal.addEventListener("abort", () => { aborted.resolve(); reject(signal.reason); }, { once: true });
+          });
+        },
+      });
+      void result.catch(() => undefined);
+      await entered.promise;
+      const closing = isolated.close();
+      await aborted.promise;
+      await expect(result).rejects.toThrow("closed");
+      await closing;
+      expect(await isolated.waitForExit()).toBe(0);
+    } finally {
+      isolated.kill();
+      await isolated.waitForExit();
+    }
   });
 
   test("remote eval tool bridge rejects local and unsupported state domains", async () => {

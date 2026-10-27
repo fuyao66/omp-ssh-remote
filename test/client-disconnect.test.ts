@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RemoteRuntimeClient } from "../src/client.ts";
@@ -122,6 +122,47 @@ describe("remote runtime disconnects", () => {
       client.kill();
       client.kill();
       expect(client.isClosed).toBe(true);
+    });
+  });
+
+  test("a listener settling after close does not terminate graceful shutdown for an unsendable ACK", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omp-late-ack-"));
+    const marker = join(root, "shutdown.txt");
+    const client = new RemoteRuntimeClient({
+      command: [process.execPath, join(import.meta.dir, "fixtures/lifecycle-worker.ts"), "late-ack", marker],
+    });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    client.onEvent(() => { entered.resolve(); return release.promise; });
+    try {
+      await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+      await deadline(entered.promise, "completion listener entry");
+      const closing = client.close();
+      expect(client.isClosed).toBe(true);
+      release.resolve();
+      await deadline(closing, "late ACK graceful close");
+      expect(await client.waitForExit()).toBe(0);
+      expect(await readFile(marker, "utf8")).toBe("shutdown received");
+    } finally {
+      release.resolve();
+      client.kill();
+      await deadline(client.waitForExit(), "late ACK fixture exit");
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a real completion listener rejection still terminates a live transport", async () => {
+    await lifecycle("late-ack", async (client) => {
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const closed = Promise.withResolvers<Error>();
+      client.onClose(closed.resolve);
+      client.onEvent(() => { entered.resolve(); return release.promise; });
+      await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+      await deadline(entered.promise, "rejecting listener entry");
+      release.reject(new Error("completion listener failed"));
+      expect((await deadline(closed.promise, "listener failure closure")).message).toBe("completion listener failed");
+      expect(await deadline(client.waitForExit(), "listener failure exit")).not.toBe(0);
     });
   });
 

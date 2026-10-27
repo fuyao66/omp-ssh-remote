@@ -1,11 +1,12 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import remoteRuntimeExtension, {
   closeRemoteFamily,
   consumedResolution,
@@ -210,6 +211,72 @@ describe("extension workspace architecture", () => {
       expect(localPaths).toHaveLength(5);
       expect(remotePaths.at(-1)).toBe("proc://remote-web");
     } finally {
+      await harness.emit("session_shutdown");
+      broker.delete(ownerFile);
+    }
+  });
+
+  test("registered dispatch never sends mixed bound conflicts and local jobs to either host", async () => {
+    const ownerFile = `/tmp/resource-owner-${crypto.randomUUID()}.jsonl`;
+    const root = ownerFile.slice(0, -".jsonl".length);
+    const childFile = `${root}/subagent/child.jsonl`;
+    const family: Family = {
+      ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: "/remote/workspace",
+      connection: { target: "test@example.invalid", displayTarget: "test-remote", cwd: "/remote/workspace", workerPath: "/remote/worker.mjs" },
+      members: new Set(), closing: true,
+    };
+    const localPaths: unknown[] = [];
+    const remotePaths: unknown[] = [];
+    const harness = await extensionHarness(childFile, undefined, ["read"], async input => {
+      localPaths.push(input.path);
+      return { content: [{ type: "text", text: "native local" }] };
+    });
+    const broker = (globalThis as unknown as Record<symbol, Map<string, Family>>)[Symbol.for("omp-ssh-remote/session-families")]!;
+    broker.set(ownerFile, family);
+    const registry = spyOn(AgentRegistry, "global").mockReturnValue({ list: () => [
+      { id: "Main", sessionFile: childFile, session: {
+        getToolByName: () => undefined,
+        runToolRegistryMutation: async <T>(mutation: () => Promise<T>): Promise<T> => await mutation(),
+        asyncJobManager: { getAllJobs: () => [{ id: "bg_1" }] },
+      } },
+      { id: "Scout" },
+    ] } as never);
+    try {
+      await harness.emit("session_start");
+      const state = [...family.members][0]!;
+      state.connectionError = undefined;
+      state.client = {
+        isClosed: false,
+        async execute(_name: string, _id: string, params: Record<string, unknown>) {
+          remotePaths.push(params.path);
+          return { content: [{ type: "text", text: "native remote" }] };
+        },
+        async close() {},
+      } as unknown as Member["client"];
+      const conflict = `remote-conflict://${encodeURIComponent(state.binding)}/1`;
+      for (const proc of ["proc://bg_1", "PROC://%62g_1:1-5", "proc://Scout"]) {
+        for (const path of [`${conflict};${proc}`, `${proc};${conflict}`]) {
+          await expect(harness.executeTool("read", { path })).rejects.toThrow("Mixed local and remote");
+        }
+      }
+      expect(localPaths).toHaveLength(0);
+      expect(remotePaths).toHaveLength(0);
+      for (const path of [`${conflict};PROC://%77eb`, `PROC://%77eb;${conflict}`]) {
+        await harness.executeTool("read", { path });
+        expect(remotePaths.at(-1)).toBe(path.replace(conflict, "conflict://1"));
+      }
+      expect(remotePaths).toHaveLength(2);
+      await expect(harness.executeTool("read", { path: "remote-conflict://stale/1;proc://bg_1" })).rejects.toThrow("stale workspace binding");
+      expect(remotePaths).toHaveLength(2);
+      await harness.executeTool("read", { path: "PROC://%62g_1:1-5" });
+      expect(localPaths).toEqual(["PROC://%62g_1:1-5"]);
+      state.selected = false;
+      await expect(harness.executeTool("read", { path: conflict })).rejects.toThrow("stale workspace binding");
+      await harness.executeTool("read", { path: "proc://web;proc://bg_1" });
+      expect(localPaths.at(-1)).toBe("proc://web;proc://bg_1");
+      expect(remotePaths).toHaveLength(2);
+    } finally {
+      registry.mockRestore();
       await harness.emit("session_shutdown");
       broker.delete(ownerFile);
     }

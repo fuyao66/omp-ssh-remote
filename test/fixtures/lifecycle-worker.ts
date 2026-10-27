@@ -5,7 +5,10 @@ const mode = process.argv[2];
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 for await (const line of lines) {
   const request = JSON.parse(line);
-  if (request.type === "shutdown") process.exit(0);
+  if (request.type === "shutdown") {
+    if (mode === "late-ack") await Bun.write(process.argv[3]!, "shutdown received");
+    process.exit(0);
+  }
   if (request.type === "initialize") {
     if (mode === "stall") {
       process.stdout.write(encodeMessage({ type: "event", event: "launch-completion", payload: { phase: "initializing" } }));
@@ -29,6 +32,9 @@ for await (const line of lines) {
       capabilities: { bashServices: request.bashServices },
       tools: REMOTE_TOOL_NAMES.map(name => ({ name, description: name, parameters: { type: "object" } })),
     }));
+    if (mode === "late-ack") {
+      process.stdout.write(encodeMessage({ type: "event", event: "launch-completion", payload: { completionId: "late-completion" } }));
+    }
   } else if (request.type === "execute" && mode === "fatal-execute") {
     process.stdout.write(encodeMessage({ type: "error", error: { name: "FatalError", message: "fixture session failed" } }));
   }

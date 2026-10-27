@@ -166,6 +166,37 @@ describe("workspace approval targets", () => {
     expect(() => metadata.approvalCacheTargets({ path: "remote-conflict://remote-one/1", content: "@ours" })).toThrow("stale workspace binding");
   });
 
+  test("approval and cache selection reject mixed bound conflicts and local processes in either order", () => {
+    const state: ApprovalTargetState = { selected: true, binding: "current", sessionFile: "/tmp/approval-resource-session.jsonl", proposalSources: [] };
+    const registry = spyOn(AgentRegistry, "global").mockReturnValue({ list: () => [
+      { id: "Main", sessionFile: state.sessionFile, session: { asyncJobManager: { getAllJobs: () => [{ id: "bg_1" }] } } },
+      { id: "Scout" },
+    ] } as never);
+    let nativeCalls = 0;
+    let approvalCalls = 0;
+    const metadata = remoteWrapperApproval("read", () => { approvalCalls++; return "read"; }, () => { nativeCalls++; return ["native-local"]; }, () => state);
+    try {
+      for (const proc of ["proc://bg_1", "PROC://%62g_1:1-5", "[proc://bg_1#ABCD]", "proc://Scout"]) {
+        for (const path of [`remote-conflict://current/1;${proc}`, `${proc};remote-conflict://current/1`]) {
+          const args = { path };
+          expect(() => metadata.approvalCacheTargets(args)).toThrow("Mixed local and remote");
+          expect(() => metadata.assertBinding(args)).toThrow("Mixed local and remote");
+          expect(() => (metadata.approval as (input: unknown) => unknown)(args)).toThrow("Mixed local and remote");
+        }
+      }
+      expect(nativeCalls).toBe(0);
+      expect(approvalCalls).toBe(0);
+      for (const path of ["remote-conflict://current/1;PROC://%77eb", "PROC://%77eb;remote-conflict://current/1"]) {
+        expect(metadata.approvalCacheTargets({ path })?.[0]).toStartWith("remote-request\0");
+      }
+      state.selected = false;
+      expect(metadata.approvalCacheTargets({ path: "proc://bg_1;proc://web" })).toEqual(["native-local"]);
+      for (const path of ["remote-conflict://current/1;proc://bg_1", "proc://bg_1;remote-conflict://current/1"]) {
+        expect(() => metadata.approvalCacheTargets({ path })).toThrow("stale workspace binding");
+      }
+    } finally { registry.mockRestore(); }
+  });
+
   test("native conflict aliases cannot acquire remote approval targets after reconnect", () => {
     const state: ApprovalTargetState = { selected: true, binding: "remote-current", proposalSources: [] };
     for (const name of ["read", "write"] as const) {

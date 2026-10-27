@@ -20,6 +20,8 @@ OMP SSH Remote 将 Oh My Pi 控制面保留在本机，同时通过 SSH 在远�
 
 普通非隔离子代理继承连接配置，但各自使用独立 companion。准入比较远端执行契约和原生工具 schema。`task isolated:true` 继续明确拒绝。保留宿主原生审批规则；wrapper 在 session 初始化、首个模型请求前安装，不在连接时临时注册。
 
+Eval 的远端工具回调与顶层工具共用宿主调用路径：companion 发起调用请求，本机 OMP 执行原生审批及工具 hook，再由已注册的 remote wrapper 派发回远端。两个入口共用服务启动、显式停止和本机协调任务。每个回调只属于当前有效的 Eval 请求及工作区绑定，取消或更换连接后失效。嵌套调用不能访问本机资源、递归调用 Eval 或暂存 AST 编辑；companion 不另建审批引擎。
+
 服务在远端启动前先预留本机 job；本机容量满时不会先启动一个无人追踪的服务。启动期间的提前完成通知会保留。在等待就绪期间或成功启动后取消，都会等待本次服务实例清理；插话只结束就绪等待，不停止服务。worker 启动时确定唯一有效 owner，原生执行与退出清理共用；省略 session ID 时生成该 worker 独有的身份。
 
 OMP 18.11 兼容：远端异步 Bash 转发实时和终态卡片更新，日志及 `wait` 仍由本机 job manager 管理。服务等待就绪期间观察所属 session 的 steering／peer 消息队列；插话只结束就绪等待，不停止服务。follow-up 和 `interruptMode: wait` 不触发提前返回。这里使用公开 session 事件，而非原生工具的私有 steering signal；没有 session 队列事件的隐藏内部 steering 不在桥接范围内。远端 `read`／`grep` 与 hashline `edit` 共享原生截断行保护：先用 `:raw` 读完整行再编辑。
@@ -62,7 +64,7 @@ flowchart LR
 
 ## 环境要求
 
-- 本机 Linux 或 WSL，OMP `>=18.12.6`，并安装 Bun `1.3.14+`、npm、tar、OpenSSH 和 SCP；
+- 本机 Linux 或 WSL，OMP `>=18.13.1`，并安装 Bun `1.3.14+`、npm、tar、OpenSSH 和 SCP；
 - 远端为 glibc Linux `x86_64` 或 `aarch64`；
 - 公钥 SSH 可在 batch mode 下登录；
 - 远端项目目录已存在；
@@ -93,7 +95,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 链接后重启 OMP。更新时重新构建 extension 和双架构 worker。停用、暂停或 reload 插件前，必须先执行 `/remote-exit`。OMP 18.12.6 的动态暂停不发送 shutdown，也没有暂停前回调；连接中直接暂停会恢复本机工具但可能保留旧 worker，插件无法在自己的 hook 一起被暂停后保证拦截或清理。
 
-当前 companion 基于 OMP 18.12.6 构建，runtime contract 为 0.12.0。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。
+当前 companion 基于 OMP 18.13.1 构建，runtime contract 为 0.14.0。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。
 
 上传显式使用 `scp -O`（SCP 协议），与远端目标路径的 shell 转义保持一致；OpenSSH 9+ 默认的 SFTP 会把这些引号当作文件名字符。本机 SCP 客户端须支持 `-O`。
 
@@ -171,9 +173,10 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 ## 限制
 
 - 仅支持 Linux glibc x86_64 和 ARM64；
-- OMP `>=18.12.6`，且 companion schema 匹配；
+- OMP `>=18.13.1`，且 companion schema 匹配；
 - 远端须有 util-linux 的 `flock`，用于保护活跃 worker 可执行文件；
 - 支持显式 async Bash 和符合条件的自动后台化，不桥接交互 Bash PTY；
+- `tools.restrictedFolders` 适用于原生本机资源，尚未实现远端文件系统的目录限制审批；
 - 不支持 `task isolated:true` 远端 worktree；
 - 不支持远端到本机 artifact bridge；
 - 白名单之外的 settings 在 companion 中保持编译默认值，不提供任意 settings 透传；

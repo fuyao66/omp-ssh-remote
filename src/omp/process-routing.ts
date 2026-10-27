@@ -1,13 +1,18 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
-import { pathShouldStayLocal } from "../path-domain.ts";
+import { normalizePathArgument, pathsShouldStayLocal, resourcePathOperands } from "../path-domain.ts";
 import type { RemoteToolName } from "../protocol.ts";
+
+/** Native consumers resolve proc URLs; debugger/LSP path metadata does not. */
+export function consumesProcessResources(tool: RemoteToolName): boolean {
+  return tool === "read" || tool === "write" || tool === "grep" || tool === "glob";
+}
 
 /** Use the same selector peeling and authority decoding as the native tools. */
 function processResource(path: string) {
   const router = InternalUrlRouter.instance();
-  const bare = router.split(path).path;
+  const bare = router.split(normalizePathArgument(path)).path;
   if (!/^proc:\/\//i.test(bare)) return;
   const url = parseInternalUrl(bare);
   return url.protocol.toLowerCase() === "proc:" ? url : undefined;
@@ -22,22 +27,28 @@ export function isProcessListingPath(path: unknown): boolean {
     !url.search && !url.hash;
 }
 
+/** Resolve every process operand before composing it with other resource owners. */
+export function processOperandExecutionTarget(
+  paths: string[],
+  isLocalId: (id: string) => boolean,
+): "local" | "remote" | undefined {
+  const resources = paths.map(processResource);
+  if (!resources.some(Boolean)) return undefined;
+  const targets = paths.map((path, index) => resources[index]
+    ? resources[index]!.rawHost && isLocalId(resources[index]!.rawHost) ? "local" : "remote"
+    : pathsShouldStayLocal([path]) ? "local" : "remote");
+  if (new Set(targets).size > 1) throw new Error("Mixed local and remote process resources are not supported; read or search each execution domain separately");
+  return targets[0];
+}
+
 /** A multi-resource read/grep cannot send a local job to a remote broker. */
 export function processExecutionTarget(
   tool: RemoteToolName,
   params: Record<string, unknown>,
   isLocalId: (id: string) => boolean,
 ): "local" | "remote" | undefined {
-  if (typeof params.path !== "string") return undefined;
-  const paths = params.path.split(";");
-  const ids = paths.map(path => processResource(path)?.rawHost);
-  if (!ids.some(Boolean) && !paths.some(isProcessListingPath)) return undefined;
-  const targets = paths.map((path, index) => ids[index]
-    ? isLocalId(ids[index]!) ? "local" : "remote"
-    : isProcessListingPath(path) ? "remote"
-    : pathShouldStayLocal(tool, { ...params, path }) ? "local" : "remote");
-  if (new Set(targets).size > 1) throw new Error("Mixed local and remote process resources are not supported; read or search each execution domain separately");
-  return targets[0];
+  if (!consumesProcessResources(tool)) return undefined;
+  return processOperandExecutionTarget(resourcePathOperands(tool, params), isLocalId);
 }
 
 const record = (value: unknown): Record<string, unknown> =>

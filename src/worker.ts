@@ -73,12 +73,20 @@ let runtime: NativeWorkerRuntime | undefined;
 const active = new Map<string, { controller: AbortController; steering: AbortController; done: Promise<void> }>();
 let cleanupPromise: Promise<void> | undefined;
 const pendingEvents = new Map<string, { resolve(): void; reject(reason: Error): void }>();
+let nextInvocation = 1;
+const pendingInvocations = new Map<string, {
+  resolve(value: unknown): void;
+  reject(reason: Error): void;
+  onUpdate?: (value: unknown) => void;
+}>();
 
 async function cleanupWorker(reason: Error): Promise<void> {
   if (cleanupPromise) return cleanupPromise;
   cleanupPromise = (async () => {
     for (const event of pendingEvents.values()) event.reject(reason);
     pendingEvents.clear();
+    for (const invocation of pendingInvocations.values()) invocation.reject(reason);
+    pendingInvocations.clear();
     for (const call of active.values()) call.controller.abort(reason);
     await Promise.race([
       Promise.allSettled([...active.values()].map(call => call.done)),
@@ -180,11 +188,35 @@ async function initialize(request: InitializeRequest): Promise<void> {
   });
 }
 
+function hostInvoker(parentId: string): NonNullable<Parameters<typeof createNativeWorkerRuntime>[2]>["invokeTool"] {
+  return async (tool, toolCallId, args, signal, onUpdate) => {
+    if (!runtime || !active.has(parentId) || cleanupPromise) throw new Error("Remote Eval invocation has no active parent binding");
+    signal?.throwIfAborted();
+    const id = `invoke_${nextInvocation++}`;
+    const deferred = Promise.withResolvers<unknown>();
+    pendingInvocations.set(id, { ...deferred, onUpdate });
+    const abort = () => {
+      pendingInvocations.delete(id);
+      deferred.reject(signal?.reason instanceof Error ? signal.reason : new Error("Remote Eval invocation cancelled"));
+      send({ type: "invoke-cancel", id });
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      send({ type: "invoke", id, parentId, tool, toolCallId, args, resourceBinding: runtime.resourceBinding });
+      return await deferred.promise;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      pendingInvocations.delete(id);
+    }
+  };
+}
+
 function startExecute(request: ExecuteRequest): void {
   const toolName = request.tool as RemoteToolName;
+  const current = runtime;
   const tool = request.bashScope
-    ? runtime?.createJobBash(capture => sendCapture({ type: "capture", id: request.id, capture }), request.bashScope === "session")
-    : runtime?.tools[toolName];
+    ? current?.createJobBash(capture => sendCapture({ type: "capture", id: request.id, capture }), request.bashScope === "session")
+    : toolName === "eval" && current ? { execute: (...args: Parameters<NativeWorkerRuntime["tools"]["eval"]["execute"]>) => current.executeEval(hostInvoker(request.id)!, ...args) } : current?.tools[toolName];
   if (!tool) {
     send({
       type: "error",
@@ -205,7 +237,7 @@ function startExecute(request: ExecuteRequest): void {
     hasUI: false,
     ...(request.steering ? { toolCall: { steeringSignal: steering.signal } } : {}),
   };
-  const done = (async () => {
+  const done = Promise.resolve().then(async () => {
     try {
       const result = await tool.execute(
         request.toolCallId,
@@ -220,7 +252,7 @@ function startExecute(request: ExecuteRequest): void {
     } finally {
       active.delete(request.id);
     }
-  })();
+  });
   active.set(request.id, { controller, steering, done });
 }
 
@@ -249,6 +281,17 @@ async function dispatch(request: Request): Promise<boolean> {
     case "event-ack":
       pendingEvents.get(request.id)?.resolve();
       pendingEvents.delete(request.id);
+      return true;
+    case "invoke-update":
+      pendingInvocations.get(request.id)?.onUpdate?.(request.result);
+      return true;
+    case "invoke-result":
+      pendingInvocations.get(request.id)?.resolve(request.result);
+      pendingInvocations.delete(request.id);
+      return true;
+    case "invoke-error":
+      pendingInvocations.get(request.id)?.reject(new Error(`${request.error.name}: ${request.error.message}`));
+      pendingInvocations.delete(request.id);
       return true;
     case "shutdown":
       return false;

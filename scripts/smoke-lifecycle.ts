@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 // @ts-expect-error Generated release bundle has no declaration file.
 import extension from "../packages/omp/dist/extension.js";
 
@@ -141,6 +142,27 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       assert(text(await invoke("read", { path: `${uri}:19999-20000` })).includes("20000"));
       console.log("CORE_EVAL_ARTIFACT_PASS");
 
+      const patterns = lookup("bash.patterns"); assert(patterns);
+      const previousPatterns = patterns.get(session.settings);
+      const deniedCommand = "printf REMOTE_NESTED_DENY_SENTINEL";
+      patterns.override(session.settings, [{ match: deniedCommand, approval: "deny" }]);
+      try {
+        const direct = await invoke("bash", { command: deniedCommand }).catch(error => ({ isError: true, content: [{ type: "text", text: String(error) }] }));
+        assert(direct.isError, "Direct denied command executed");
+        assert.match(text(direct), /blocked by tool policy/);
+        const nested = await invoke("eval", { language: "js", code: `const result = await tool.bash({command: ${JSON.stringify(deniedCommand)}}); print(result.text);`, title: "nested approval" })
+          .catch(error => ({ isError: true, content: [{ type: "text", text: String(error) }] }));
+        assert(nested.isError, "Nested command skipped native denial");
+        assert.match(text(nested), /blocked by tool policy/);
+        console.log("NESTED_NATIVE_APPROVAL_PASS");
+      } finally {
+        patterns.override(session.settings, previousPatterns);
+      }
+      const nestedRead = await invoke("eval", { language: "js", code: `print((await tool.read({path: ${JSON.stringify(file)}})).text);`, title: "nested read roundtrip" });
+      assert(!nestedRead.isError, text(nestedRead));
+      assert(text(nestedRead).includes("second"));
+      console.log("NESTED_REMOTE_ROUNDTRIP_PASS");
+
       const frames: any[] = [];
       const gates = await invoke("bash", { command: `export OMP_SMOKE_SCOPE=foreground; mkfifo -- '${asyncGate}' '${serviceGate}'` });
       assert(!gates.isError, text(gates));
@@ -197,7 +219,8 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       manager.watchJobs([serviceJob.id]);
       record("stop-watched", { jobId: serviceJob.id });
       try {
-        await invoke("write", { path: `proc://${service}/kill`, content: "" });
+        const stopped = await invoke("eval", { language: "js", code: `print((await tool.write({path: ${JSON.stringify(`proc://${service}/kill`)}, content: ""})).text);`, title: "nested service stop" });
+        assert(!stopped.isError, text(stopped));
         console.log("SERVICE_STOP_PASS");
         await serviceJob.promise;
         assert.equal(serviceJob.status, "completed");
@@ -212,7 +235,8 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       }
       console.log("SERVICE_STOP_TRACKING_PASS");
       const shortService = `${tag}-short`;
-      await invoke("bash", { name: shortService, command: `echo SHORT_READY; IFS= read -r _ < '${serviceGate}'; exit 7`, pty: false, ready: { log: "SHORT_READY", timeout: 5 } });
+      const nestedService = await invoke("eval", { language: "js", code: `print((await tool.bash(${JSON.stringify({ name: shortService, command: `echo SHORT_READY; IFS= read -r _ < '${serviceGate}'; exit 7`, pty: false, ready: { log: "SHORT_READY", timeout: 5 } })})).text);`, title: "nested service launch" });
+      assert(!nestedService.isError, text(nestedService));
       const shortJob = manager.getAllJobs().find(j => j.label === `Remote service: ${shortService}`); assert(shortJob);
       const waitedService = await waitForGatedJob(shortJob.id, serviceGate);
       const completed = (waitedService.details as { jobs?: { id: string; status: string; resultText?: string }[] })?.jobs?.find(j => j.id === shortJob.id);

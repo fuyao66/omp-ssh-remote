@@ -1,3 +1,4 @@
+import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 
@@ -28,25 +29,34 @@ export function workspaceNotice(current: WorkspaceBindingNotice): CustomMessage<
 }
 
 /**
- * Read the active native branch on every attempt. Returning a hook result does
- * not mean OMP accepted it: only appendCustomMessageEntry commits the notice.
+ * Read the effective native context on every attempt, including reset and
+ * compaction retention. Returning a hook result does not commit the notice;
+ * only appendCustomMessageEntry does.
  */
 export function workspaceAnnouncement(
   current: WorkspaceBindingNotice,
   branch: readonly SessionEntry[],
 ): CustomMessage<WorkspaceBindingNotice> | undefined {
-  for (let index = branch.length - 1; index >= 0; index--) {
-    const entry = branch[index]!;
-    if (entry.type === "custom_message" && entry.customType === WORKSPACE_NOTICE_TYPE) {
-      const previous = entry.details as WorkspaceBindingNotice | undefined;
-      if (previous?.binding === current.binding && previous.mode === current.mode &&
-          previous.target === current.target && previous.cwd === current.cwd) return;
-      return workspaceNotice(current);
-    }
-    // Older versions persisted a private context marker instead of a native
-    // binding message. Correct that history once; do not replay its anchors.
-    if (entry.type === "custom" && entry.customType === WORKSPACE_CONTEXT_ENTRY) {
-      return workspaceNotice(current);
+  // getBranch() has already selected a leaf; replay-only activeLeafId markers
+  // on entries written off-branch must not select a different leaf here.
+  const messages = buildSessionContext([...branch], branch.at(-1)?.id ?? null).messages;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]!;
+    if (message.role !== "custom" || message.customType !== WORKSPACE_NOTICE_TYPE) continue;
+    const previous = message.details as WorkspaceBindingNotice | undefined;
+    if (previous?.binding === current.binding && previous.mode === current.mode &&
+        previous.target === current.target && previous.cwd === current.cwd) return;
+    return workspaceNotice(current);
+  }
+  // A legacy marker requests one migration notice, but never suppresses one.
+  // A native notice or a context boundary retires that migration request.
+  // Do not replay the marker's private anchors or revive it after a clear.
+  if (current.mode === "local") {
+    for (let index = branch.length - 1; index >= 0; index--) {
+      const entry = branch[index]!;
+      if (entry.type === "reset_boundary" || entry.type === "compaction") break;
+      if (entry.type === "custom_message" && entry.customType === WORKSPACE_NOTICE_TYPE) break;
+      if (entry.type === "custom" && entry.customType === WORKSPACE_CONTEXT_ENTRY) return workspaceNotice(current);
     }
   }
   if (current.mode !== "local") return workspaceNotice(current);

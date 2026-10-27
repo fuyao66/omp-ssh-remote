@@ -72,6 +72,19 @@ describe("bound remote conflict resources", () => {
     expect(() => resourceExecutionTarget("grep", { path: `${root}1` }, binding)).toThrow("only read and write");
   });
 
+  test("remote-only validation handles native process aliases without claiming host process ownership", () => {
+    for (const path of [`${root}1;PROC://%77eb:1-5`, `PROC://%77eb:1-5;${root}1`]) {
+      expect(resourceExecutionTarget("read", { path }, binding)).toBe("remote");
+      expect(resolveRemoteResourceArgs("read", { path }, binding).path).toBe(path.replace(`${root}1`, "conflict://1"));
+    }
+    // The worker cannot know whether bg_1 is host-local. Shared host ownership
+    // must classify it before this remote-only validator/decoder is called.
+    expect(resourceExecutionTarget("read", { path: `${root}1;proc://bg_1` }, binding)).toBe("remote");
+    for (const path of [`${root}1;agent://Scout`, `agent://Scout;${root}1`]) {
+      expect(() => resolveRemoteResourceArgs("read", { path }, binding)).toThrow("cannot mix");
+    }
+  });
+
   test("does not treat resource-like user literals as routing operands", () => {
     const args = { path: "file", content: `${root}1 conflict://1`, nested: { path: `${root}1` } };
     expect(resourceExecutionTarget("write", args, binding)).toBeUndefined();
