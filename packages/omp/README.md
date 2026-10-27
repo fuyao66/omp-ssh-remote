@@ -15,12 +15,12 @@ Remote native tools:
 Background execution is split by ownership rather than by tool name:
 
 - `bash async:true` creates a job in the local session's OMP job manager; native `wait` and job `proc://` reads/cancellation remain local while the command executes remotely. Independent root sessions do not share a job manager; children use their own session family's manager.
-- Named `bash` calls launch remote services. Service `proc://<name>` reads and writes (including `/kill` and `/mode`) execute remotely. Bare `read proc://` combines local and remote listings. Local jobs and agents take precedence over service names; conflicting names are rejected at launch. A local coordination job makes remote service exits visible to native `wait`; transport loss fails that job without moving execution locally.
+- Named `bash` calls launch remote services. Service `proc://<name>` reads and writes (including `/kill` and `/mode`) execute remotely. Native process-root forms `proc://` and `proc:///` combine local and remote listings. Local jobs and agents take precedence over service names; conflicting names are rejected at launch. A local coordination job makes remote service exits visible to native `wait`; transport loss fails that job without moving execution locally.
 - On `/remote-exit`, session shutdown, or transport loss the companion stops the supervised processes this session started unless they were launched with `persist` or `detached`; those survive by explicit request, like native OMP.
 
 Ordinary non-isolated subagents inherit connection configuration but receive independent companions. Admission compares the remote execution contract and native tool schemas. `task isolated:true` remains rejected. Native host approval rules are preserved; wrappers are installed at session initialization, before the first model request, not when connecting.
 
-Service coordination reserves a local job before remote startup; a full job manager cannot leave an untracked service running. Completion during startup is retained, and cancellation after successful startup stops the remote service.
+Service coordination reserves a local job before remote startup; a full job manager cannot leave an untracked service running. Completion during startup is retained. Cancellation during readiness or after startup waits for cleanup of the launched instance; an incoming steer only ends the readiness wait and does not stop the service. Worker startup chooses one effective owner for both native execution and shutdown cleanup; an omitted session ID receives a unique worker identity.
 
 OMP 18.11 compatibility: remote async Bash forwards live and terminal card updates while the local job manager still owns logs and `wait`. Named service readiness observes the owning session's steering and peer-message queues; an incoming steer ends only the readiness wait, not the service. Follow-ups and `interruptMode: wait` do not trigger it. This uses public session events rather than the native tool's private steering signal; hidden internal steering without a session queue event is not bridged. Remote `read`/`grep` and hashline `edit` share the native truncated-line protection: reread complete lines with `:raw` before editing them.
 
@@ -29,6 +29,8 @@ Successful explicit service stops also settle their local coordination jobs from
 OMP 18.12.3 approvals retain native local file/folder grants. Remote targets are hashed, exact-request grants scoped to the current binding, host/user/port/identity, directory, and tool; they never reuse local folder permissions or a different server's permissions. Reconnect or switching bindings invalidates them. A binding change while approval is pending rejects grant recording and execution. Remote folder-wide and cross-session grants are not provided.
 
 Explicit remote async commands use independent per-job native shells. Eligible foreground calls follow the host's automatic-background threshold and steering behavior: promotion keeps the same running request and capture sources, rather than restarting the command. Foreground-backed calls preserve session shell state; immediately backgrounded calls use isolated job shells. A full or unavailable local manager leaves ordinary calls foreground-only. Process listings preserve native renderer metadata, and multi-URI process searches reject mixed local/remote ownership.
+
+Remote Bash exports the owning session's `PI_SESSION_ID`, including in isolated background jobs. `PI_SESSION_FILE` is empty because the companion does not own a local transcript; local session paths are not forwarded.
 
 Remote jobs supply genuine native capture to local `proc://<local-job-id>/streams[/<n>]` and native progress widgets. Pipeline data is captured before downstream commands such as `tail`; it is not reconstructed from cumulative tool previews. The `out` source is native sanitized text, not arbitrary stdout/stderr bytes. Pipeline sources retain actual bytes. Capture is bounded: native output keeps about 256 Ki UTF-16 units, each pipe keeps 1 MiB, and only the four newest finished pipes remain. Transfer preserves offsets, missing prefixes and stream removals; data the native buffer has already discarded cannot be recovered. Final retained windows are drained before successful/error results settle; cancellation can interrupt a blocked transport write. The per-request remote manager is execution-only: public IDs, cancellation, `wait`, widget model requests and credentials remain local.
 
@@ -40,9 +42,13 @@ Remote eval follows native 18.12.3: use `print` or JavaScript `console.log`, not
 
 While connected, direct user shell (`!`/`!!`) and Python shortcuts are explicitly refused rather than silently executed locally. Use remote `bash`/`eval`, or disconnect before using local shortcuts. `find`, `security_scan`, and `ida` are not remote-adapted and remain blocked, including xdev entrypoints. Native `checkpoint` and `rewind` stay local and are allowed: they change conversation history, not remote project files or kernel state. Remote eval supports computation and remote workspace callbacks only: local agent/workpool, judge/completion, archive, browser, and todo helpers are not bridged. The fixed workspace contract explains this distinction; use top-level local orchestration tools instead.
 
+GitHub operations are limited to explicit API reads. Non-search reads require an explicit `repo` rather than inferring a repository from the local directory. Remote mode rejects `pr_create`, `pr_checkout`, `pr_push`, and unknown operations.
+
 Truncated output is stored remotely under `~/.cache/omp-ssh-remote/artifacts/<namespace>`. Use returned `remote-artifact://<namespace>/<id>` references with `read` selectors or `grep` while connected to that host. The companion deletes its own namespace on normal exit and, at startup, sweeps namespaces older than one hour whose owning worker is gone; artifacts left by a transport loss therefore expire, they are never copied locally. Local `artifact://` references remain local. The `xd://debug` entry executes remotely like direct debug.
 
-A fixed allowlist of execution-domain settings is forwarded to the companion at connection time: `tools.maxTimeout/artifactMaxBytes`, `bash.gitGuard/direnv/direnvLoadTimeoutMs`, `bashInterceptor.enabled/patterns`, `grep.context*`, `read.defaultLimit/renderMarkdown/summarize.*`, `images.autoResize`, `edit.fuzzyMatch/fuzzyThreshold/enforceSeenLines/blockAutoGenerated`, and `lsp.formatOnWrite/diagnostics*`. Values come from the host's effective settings for the local project. `tools.artifactMaxBytes` uses MiB; `0` means unbounded. A configured cap retains a head/tail artifact rather than all emitted bytes. `bash.gitGuard` enforces the native destructive-Git guard remotely. The companion initializes both tool and shell settings in memory without loading the remote project's configuration or copying local credentials. Keys that shape tool schemas (`async.enabled`, `edit.mode`, `eval.*`, `memory.backend`, `skillful`) and approval rules (`bash.patterns`, `bash.allowCompoundCommands`) are never forwarded: schemas are fixed by the compiled companion and approval is evaluated locally. `worktree.clone` is pinned off remotely so `git worktree add` runs as plain git instead of being rewritten into a companion self-invocation. The local active tool set is sent with every call so the bash interceptor can redirect to tools the model actually has.
+Remote conflict registrations return `remote-conflict://<binding>/<id>` references. Read `/ours`, `/theirs`, or `/base`, or write the bound reference to resolve the remote block; bulk writes use `*` under the same binding. Bare `conflict://` remains local. Reconnect or exit invalidates old remote references: reread the file. Edit routing inspects move destinations as well as source paths and rejects cross-domain `MV`.
+
+A fixed allowlist of execution-domain settings is forwarded at connection time: `tools.maxTimeout/artifactMaxBytes`, `bash.gitGuard/direnv/direnvLoadTimeoutMs`, `bashInterceptor.enabled/patterns`, `grep.context*`, `read.defaultLimit/renderMarkdown/summarize.*`, `images.autoResize`, `edit.fuzzyMatch/fuzzyThreshold/enforceSeenLines/blockAutoGenerated`, and `lsp.formatOnWrite/diagnostics*`. Values come from the host's effective project settings. `tools.artifactMaxBytes` uses MiB; `0` means unbounded, while a configured cap retains a head/tail artifact. `bash.gitGuard` enforces native destructive-Git protection remotely. Tool and shell settings initialize in memory without loading remote project configuration or copying credentials. Effective `edit.mode` is negotiated separately, including host model and environment overrides; remote read and edit use the same language, checked against the actual host schema and grammar. A host edit-mode change requires reconnecting before further remote reads or edits. Other structural keys (`async.enabled`, `eval.*`, `memory.backend`, `skillful`) remain companion-owned; approval rules (`bash.patterns`, `bash.allowCompoundCommands`) remain local. `worktree.clone` is pinned off so ordinary `git worktree add` is not rewritten into a companion self-invocation. Every call includes the current local active tool set for the bash interceptor.
 
 ```mermaid
 flowchart LR
@@ -56,7 +62,7 @@ flowchart LR
 
 ## Requirements
 
-- local Linux or WSL with OMP `>=18.12.3`, Bun `1.3.14+`, npm, tar, OpenSSH, and SCP;
+- local Linux or WSL with OMP `>=18.12.6`, Bun `1.3.14+`, npm, tar, OpenSSH, and SCP;
 - remote glibc Linux `x86_64` or `aarch64`;
 - public-key SSH that succeeds in batch mode;
 - an existing remote project directory;
@@ -85,11 +91,13 @@ packages/omp/dist/worker-linux-arm64
 packages/omp/dist/worker-linux-arm64.sha256
 ```
 
-Restart OMP after linking. Updating requires `git pull`, rebuilding the extension and workers, then restarting or reloading the plugin. Reloading while connected closes that session's companion; reconnect afterward.
+Restart OMP after linking. Rebuild the extension and both workers when updating. Run `/remote-exit` before disabling, suspending, or reloading the extension. OMP 18.12.6 dynamic suspension neither sends shutdown nor offers a before-suspend hook: suspending a connected extension restores native local tools but may retain its old worker. A plugin cannot guarantee interception or cleanup after its own hooks have been suspended.
 
-The companion is built against OMP 18.12.3 (runtime contract 0.11.0). Rebuild both workers when updating runtime dependencies or capture protocol behavior, even if tool schemas have not changed. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Handshake failures report version and schema drift.
+The companion is built against OMP 18.12.6 (runtime contract 0.12.0). Build identity comes from the installed source and native dependencies, never an OMP executable on PATH. Rebuild both workers when updating runtime dependencies or capture behavior, even if schemas are unchanged. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Admission reports version, edit-language, and schema drift.
 
-Connection UI reports probe/check/upload/activation stages. The `remote_connect` tool honors cancellation; `/remote-exit` cancels a pending command deployment. Same-host deployments in one extension instance are serialized and recheck the cache, avoiding duplicate uploads. Failed uploads are removed on a best-effort basis if SSH is still reachable. Host schema metadata is cached per loaded extension instance for reconnects and child sessions.
+Uploads explicitly use `scp -O` (the SCP protocol), because remote destination paths are shell-quoted; the SFTP default in OpenSSH 9+ would treat those quotes as literal filename characters. The local SCP client must support `-O`.
+
+Connection UI reports probe/check/upload/activation stages. Both `remote_connect` and `remote_reconnect` honor call cancellation; `/remote-exit` cancels pending command deployment. Same-host deployments in one instance serialize and recheck the cache. Failed uploads are removed best-effort when SSH is reachable. Each connection snapshots the current host tool contract rather than reusing another session or model's handshake.
 
 ## Connect and Operate
 
@@ -112,7 +120,7 @@ Explicit form:
 
 The model can invoke the same lifecycle through `remote_connect`, `remote_workspace_status`, `remote_reconnect`, and `remote_exit`. Status is on-demand and reports in-process state; it is not a per-turn prompt and does not actively ping SSH.
 
-Ordinary filesystem paths route remotely while connected. Internal URI resources remain local. Mixed local-URI and remote-path operations are rejected. A selected connection that becomes unavailable remains fail-closed until `/remote-reconnect` re-establishes the transport or `/remote-exit` explicitly restores local execution. Reconnect reuses the stored connection specification and remote directory, keeps the registered wrappers, drops AST proposals that lived in the dead companion, and is owner-only; `--force` replaces a transport that still looks connected. Non-persistent services stopped by the disconnect are not restarted.
+Ordinary paths route remotely; local internal resources stay local and explicit remote references route by binding. Mixed-domain operations are rejected. An unavailable selected connection remains fail-closed. Each session may reconnect its own independent transport; only the owner can exit and close the family. Reconnect uses the original canonical directory, drops that companion's AST proposals, and accepts `--force` to replace a live transport. Stopped non-persistent services are not restarted. Owner reconnect does not restart child kernels; children can reconnect independently. Forced family closure leaves active descendants unavailable rather than allowing new tasks to fall back locally.
 
 ## Deployment and Security
 
@@ -126,7 +134,7 @@ Activation prunes older worker directories, keeping the activated build, the mos
 
 ## Historical Performance Baseline
 
-October 2026, OMP 18.9.1 on trialsfinder Linux x86_64, cached worker and persistent SSH ControlMaster. Ten interleaved echo/read/bash samples (including first calls):
+October 2026, OMP 18.9.1 on a Linux x86_64 acceptance host, cached worker and persistent SSH ControlMaster. Ten interleaved echo/read/bash samples (including first calls):
 
 | Operation | Median |
 | --- | --- |
@@ -134,15 +142,13 @@ October 2026, OMP 18.9.1 on trialsfinder Linux x86_64, cached worker and persist
 | remote read | `24.63 ms` |
 | foreground Bash | `17.01 ms` |
 
-Worker initialization was `2439 ms`. A separate initial upload/deployment took `88.36 s`; that run's read/bash medians were roughly `0.8 s`. The later interleaved control returned to the values above. Do not treat these runs as a controlled speedup comparison. Host schema caching avoids repeated metadata-runtime construction but does not reduce each worker's baseline memory; no memory reduction is claimed. ARM64 received build validation, not live performance acceptance.
-
-These measurements predate native capture and widgets; they are not performance claims for the current capture implementation. ARM64 now also has functional capture acceptance, not a performance benchmark.
+Worker initialization was `2439 ms`. A separate initial upload took `88.36 s`, with read/bash medians around `0.8 s`; the later interleaved control returned to the table above. These are historical measurements, not a controlled speedup comparison or current-version memory/performance claims. ARM64 has build validation, not live performance acceptance.
 
 ## Prompt Cache Stability
 
 Connect, disconnect and reconnect change the execution binding, not the tool roster or descriptions. The fixed `remote_workspace_status` description explains routing, remote limitations and when to query status. Native approvals and renderers remain attached; other plugins' tools are not replaced. Tools not bound at startup fail closed remotely rather than being dynamically registered on reconnect.
 
-On a binding change, a short notice is appended to the next provider context without starting another model turn. Unchanged bindings emit no repeated notices. Notice anchors are saved as extension data (not transcript messages) and replayed in their original positions; if compaction removes the anchor, the current state is appended again. Resuming a transcript never restores an SSH connection just because an old notice says it was remote. Calls that overlap a binding change are not retried in the new workspace; stale results and updates are rejected or suppressed.
+Binding changes enter native message history through the next `before_agent_start`, before MC or other context transforms. They do not start an extra model turn, append after `context`, or replay private message anchors. The current native branch, including persisted `custom_message` entries, determines which binding has actually been announced; returning a hook result does not consume an announcement. Fresh local sessions add no environment message, unchanged accepted state is not repeated, and cancelled preparation can retry its announcement. Cold restore, resume and branch navigation correct remote history to the current local environment without automatically connecting SSH. After compaction the next user turn may reannounce the selected remote binding. Calls overlapping a binding change are not retried in the new workspace; stale results and updates are rejected or suppressed.
 
 `scripts/smoke-cache.ts` runs native OMP against a local HTTP endpoint returning synthetic replies. It compares the actual serialized tools, system messages and complete previous request prefix across local/remote/reconnect/local transitions, and executes real workspace commands over SSH. It measures prefix equality, **not provider cache-hit tokens or savings**. Run from the repository root (the bundle is placed beside the workers):
 
@@ -152,6 +158,20 @@ bun scripts/build-smoke.ts cache
 REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts cache
 rm packages/omp/dist/cache-smoke.js
 ```
+
+For the installed MC compatibility extension, use the separate combined mode. It keeps MC's context transform and dispatch fence enabled, loads MC before remote, and requires exactly one HTTP request for each of the seven state transitions. MC retagging is not treated as a remote prefix-equality failure. Auxiliary MC model consumers are disabled, and configuration, session, database and logs are isolated in a temporary directory:
+
+```sh
+bun scripts/build-smoke.ts cache-mc
+CACHE_SMOKE_MC_COMPAT=/path/to/omp-mc-compat/index.js \
+  REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts cache-mc
+rm packages/omp/dist/cache-smoke.js
+```
+
+The default mock uses native Chat Completions. Set `CACHE_SMOKE_API=openai-responses` for the native Responses endpoint and parser; this mode emits numbered assistant messages with opaque reasoning, then verifies replay order, phase, encrypted payload and removal of old numbers. Output IDs remain in persisted native history but may be removed from HTTP input by OMP's native replay sanitization.
+
+Set `SMOKE_KEEP_ARTIFACTS=1` to retain `mc.log`, `wire-requests.json` and the isolated session/database for inspection. Dynamic extension suspension while connected is unsupported; disconnect remote before disabling or reloading the extension.
+
 
 `scripts/smoke-lifecycle.ts` additionally checks real file/edit/compute/artifact behavior, async live frames and native `wait`, service steering, explicit-stop tracking, natural exit status, and local restoration. Build it with `bun scripts/build-smoke.ts lifecycle`, then run `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts lifecycle`. Remove the generated bundle afterward.
 
@@ -167,12 +187,14 @@ rm packages/omp/dist/capture-smoke.js
 
 The runner verifies extension command registration through RPC `get_available_commands` and submits the smoke prompt in the same session only after admission. Missing commands fail before a prompt is sent. The deadline includes the native first-upload budget; cache-hit acceptance avoids deployment timing. Successful temporary sessions are removed; failed sessions are retained for diagnosis.
 
+Set `SMOKE_ADMISSION_ONLY=1` when running a built smoke helper to check extension admission in the actual compiled OMP host without submitting a prompt, calling a provider, or connecting SSH. This checks the host's exposed module boundary; source-level imports and a successful bundle alone do not establish compiled-host compatibility.
+
 One plugin upgrade/reload can change the initial prefix. Model/configuration changes, other extensions, compaction and provider cache expiration are outside the connection-switch guarantee. The prefix-stability mechanism itself requires only a local extension rebuild; runtime dependency or protocol changes still require rebuilding and deploying companion binaries.
 
 ## Limits
 
 - Linux glibc x86_64 and ARM64 only;
-- OMP `>=18.12.3` with matching compiled companion schemas;
+- OMP `>=18.12.6` with matching compiled companion schemas;
 - remote `flock` (util-linux) is required: workers hold shared per-version leases so cache pruning cannot delete a live worker's self-reentry executable;
 - explicit async Bash and eligible automatic backgrounding are supported; interactive Bash PTY is not bridged;
 - no `task isolated:true` remote worktrees;

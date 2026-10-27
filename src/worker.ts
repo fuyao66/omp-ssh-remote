@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { startJsEvalProcess } from "@oh-my-pi/pi-coding-agent/eval/js/process-entry";
 import type { WorkerInbound, WorkerOutbound } from "@oh-my-pi/pi-coding-agent/eval/js/worker-protocol";
-import { interceptUnhandledRejections } from "@oh-my-pi/pi-utils/postmortem";
+import { interceptUnhandledRejections, register as registerCleanup } from "@oh-my-pi/pi-utils/postmortem";
 import { dapSessionManager } from "@oh-my-pi/pi-coding-agent/dap";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { disposeAllKernelSessions } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
@@ -10,6 +10,7 @@ import { DAEMON_BROKER_WORKER_ARG } from "@oh-my-pi/pi-coding-agent/launch/proto
 import { closeDaemonClients } from "@oh-my-pi/pi-coding-agent/launch/client";
 import { createNativeWorkerRuntime, type NativeWorkerRuntime } from "./runtime.ts";
 import { stopOwnedRemoteDaemons } from "./omp/hub-cleanup.ts";
+import { executeOwnedRemoteService, stopRemoteServiceInstance } from "./omp/service-lifecycle.ts";
 import {
   PROTOCOL_VERSION,
   TOOL_RUNTIME_VERSION,
@@ -22,8 +23,8 @@ import {
   type RemoteToolName,
   type Request,
 } from "./protocol.ts";
-import { resolveOmpHostVersion } from "./omp/host-identity.ts";
-import { toolParametersToWire } from "./omp/runtime-contract.ts";
+import { ompCompiledHostVersion, resolveOmpBuildVersion } from "./omp/host-identity.ts";
+import { captureOmpToolSnapshot } from "./omp/runtime-contract.ts";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { captureExecutionSettings } from "./omp/execution-settings.ts";
@@ -69,7 +70,6 @@ async function runJsEvalProcessHost(): Promise<void> {
 }
 
 let runtime: NativeWorkerRuntime | undefined;
-let launchOwner: string | undefined;
 const active = new Map<string, { controller: AbortController; steering: AbortController; done: Promise<void> }>();
 let cleanupPromise: Promise<void> | undefined;
 const pendingEvents = new Map<string, { resolve(): void; reject(reason: Error): void }>();
@@ -91,8 +91,8 @@ async function cleanupWorker(reason: Error): Promise<void> {
       await dapSessionManager.terminate(AbortSignal.timeout(remaining), remaining).catch(() => undefined);
       if (dapSessionManager.listSessions().length >= before) break;
     }
-    if (runtime && launchOwner) {
-      await stopOwnedRemoteDaemons(runtime.cwd, launchOwner);
+    if (runtime) {
+      await stopOwnedRemoteDaemons(runtime.cwd, runtime.sessionId);
     }
     await Promise.race([
       Promise.allSettled([disposeAllKernelSessions(), disposeAllVmContexts(), shutdownAllLspClients()]),
@@ -133,11 +133,17 @@ async function initialize(request: InitializeRequest): Promise<void> {
   if (request.runtimeVersion !== TOOL_RUNTIME_VERSION) {
     throw new Error(`Runtime version mismatch: client=${request.runtimeVersion}, worker=${TOOL_RUNTIME_VERSION}`);
   }
-  const hostVersion = await resolveOmpHostVersion();
-  launchOwner = request.sessionId;
+  const hostVersion = ompCompiledHostVersion() ?? await resolveOmpBuildVersion();
+  // One session per process: the negotiated edit language must override any
+  // ambient remote PI_EDIT_VARIANT before native tools resolve their mode.
+  if (request.editMode) process.env.PI_EDIT_VARIANT = request.editMode;
   runtime = await createNativeWorkerRuntime(request.cwd, hostVersion, {
     sessionId: request.sessionId,
     settings: request.settings,
+    editMode: request.editMode,
+    bashServices: request.bashServices,
+    resourceBinding: request.resourceBinding,
+    serviceLifecycle: { execute: executeOwnedRemoteService, stop: stopRemoteServiceInstance },
     onLaunchCompletion: (notification) => new Promise<void>((resolve, reject) => {
       pendingEvents.set(notification.completionId, { resolve, reject });
       send({ type: "event", event: "launch-completion", payload: notification as unknown as Record<string, unknown> });
@@ -158,7 +164,7 @@ async function initialize(request: InitializeRequest): Promise<void> {
   const requested = new Set(request.tools);
   const tools = Object.values(runtime.tools)
     .filter(tool => requested.has(tool.name))
-    .map(tool => ({ name: tool.name, description: tool.description, parameters: toolParametersToWire(tool.parameters) }));
+    .map(tool => ({ ...captureOmpToolSnapshot(tool), description: tool.description }));
   send({
     type: "ready",
     protocolVersion: PROTOCOL_VERSION,
@@ -166,7 +172,9 @@ async function initialize(request: InitializeRequest): Promise<void> {
     ompVersion: hostVersion,
     hostVersion,
     runtimeVersion: TOOL_RUNTIME_VERSION,
+    editMode: runtime.editMode,
     cwd: runtime.cwd,
+    resourceBinding: runtime.resourceBinding,
     capabilities: { jobCapture: "native-retained" },
     tools,
   });
@@ -224,6 +232,14 @@ async function dispatch(request: Request): Promise<boolean> {
     case "execute":
       startExecute(request);
       return true;
+    case "service-stop":
+      try {
+        if (!runtime) throw new Error("Worker is not initialized");
+        send({ type: "result", id: request.id, result: await runtime.stopService(request.name, request.instanceId) });
+      } catch (error) {
+        send({ type: "error", id: request.id, error: serializeError(error) });
+      }
+      return true;
     case "cancel":
       active.get(request.id)?.controller.abort(new Error("Remote tool call cancelled"));
       return true;
@@ -247,25 +263,23 @@ if (process.argv[2] === JS_EVAL_PROCESS_ARG) {
   const { startDaemonBrokerFromEnvironment } = await import("@oh-my-pi/pi-coding-agent/launch/broker");
   await startDaemonBrokerFromEnvironment();
 } else {
-  const stopForSignal = (signal: string): void => {
-    void cleanupWorker(new Error(`Remote worker received ${signal}`)).then(() => process.exit(0), (error) => {
-      console.error(error);
-      process.exit(1);
-    });
-  };
-  process.once("SIGHUP", () => stopForSignal("SIGHUP"));
-  process.once("SIGTERM", () => stopForSignal("SIGTERM"));
+  // Native postmortem owns signal exit codes (SIGTERM=143, SIGHUP=129).
+  // Join its awaited cleanup barrier instead of racing another async handler
+  // against its hard exit.
+  registerCleanup("ssh-remote-worker", reason =>
+    cleanupWorker(new Error(`Remote worker cleanup: ${reason}`)));
   try {
     for await (const line of decodeFrames(Bun.stdin.stream())) {
       if (!line.trim()) continue;
-      try {
-        if (!(await dispatch(parseRequest(line)))) break;
-      } catch (error) {
-        send({ type: "error", error: serializeError(error) });
-      }
+      if (!(await dispatch(parseRequest(line)))) break;
     }
+  } catch (error) {
+    // An error without a request id is fatal to this session. Do not wait for
+    // more stdin after initialization/protocol failure: clients may keep it open.
+    send({ type: "error", error: serializeError(error) });
+    process.exitCode = 1;
   } finally {
     await cleanupWorker(new Error("Remote worker transport closed"));
   }
-  process.exit(0);
+  process.exit(process.exitCode ?? 0);
 }

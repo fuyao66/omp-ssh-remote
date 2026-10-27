@@ -5,7 +5,13 @@ import { join } from "node:path";
 import { watch } from "node:fs";
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { daemonClientForProject } from "@oh-my-pi/pi-coding-agent/launch/client";
+import { startRemoteService } from "../src/omp/service-jobs.ts";
+import { executeOwnedRemoteService } from "../src/omp/service-lifecycle.ts";
+import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 
+const ownerSessionId = "native-worker-owner";
 let cwd: string;
 let client: RemoteRuntimeClient;
 
@@ -13,8 +19,9 @@ beforeAll(async () => {
   cwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-"));
   client = new RemoteRuntimeClient({
     command: ["bun", join(import.meta.dir, "../src/worker.ts")],
+    env: { PI_SESSION_ID: "inherited-wrong-owner", PI_SESSION_FILE: "/local-only/inherited-session.jsonl" },
   });
-  const ready = await client.initialize(cwd, OMP_RUNTIME_HANDSHAKE);
+  const ready = await client.initialize(cwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: ownerSessionId });
   expect(ready.cwd).toBe(cwd);
   expect(ready.tools.map((tool) => tool.name).sort()).toEqual([
     "ast_edit",
@@ -33,6 +40,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await client.close();
+  expect(await client.waitForExit()).toBe(0);
   await rm(cwd, { recursive: true, force: true });
 });
 
@@ -193,6 +201,42 @@ describe("native worker round trip", () => {
     expect(JSON.stringify(foreground)).toContain("FOREGROUND=foreground");
   });
 
+  for (const bashScope of [undefined, "session", "job"] as const) {
+    test(`bash session identity is preserved in ${bashScope ?? "direct"} execution`, async () => {
+      const result = await client.execute("bash", `identity-${bashScope ?? "direct"}`, {
+        command: 'printf "SESSION_ID=%s\\nSESSION_FILE=<%s>\\n" "$PI_SESSION_ID" "$PI_SESSION_FILE"',
+      }, undefined, undefined, bashScope ? { bashScope } : undefined);
+      expect(result).not.toMatchObject({ isError: true });
+      expect(JSON.stringify(result)).toContain(`SESSION_ID=${ownerSessionId}\\n`);
+      expect(JSON.stringify(result)).toContain("SESSION_FILE=<>");
+      expect(JSON.stringify(result)).not.toContain("inherited-wrong-owner");
+      expect(JSON.stringify(result)).not.toContain("inherited-session.jsonl");
+    });
+  }
+
+  test("foreground-backed capture retains the owning session shell", async () => {
+    const result = await client.execute("bash", "managed-export", {
+      command: "export OMP_MANAGED_SCOPE=managed",
+    }, undefined, undefined, { bashScope: "session" });
+    expect(result).not.toMatchObject({ isError: true });
+    const next = await client.execute("bash", "managed-reuse", { command: 'printf "MANAGED=%s" "$OMP_MANAGED_SCOPE"' });
+    expect(JSON.stringify(next)).toContain("MANAGED=managed");
+  });
+
+  test("concurrent captured job shells keep independent state under one owner", async () => {
+    const results = await Promise.all(["A", "B"].map(value => client.execute("bash", `concurrent-${value}`, {
+      command: `export OMP_CONCURRENT=${value}; printf ready > job-ready-${value}; while [ ! -f job-ready-${value === "A" ? "B" : "A"} ]; do sleep 0.01; done; printf 'VALUE=%s\\nOWNER=%s\\n' "$OMP_CONCURRENT" "$PI_SESSION_ID"`,
+      timeout: 3,
+    }, AbortSignal.timeout(5_000), undefined, { bashScope: "job" })));
+    for (const [index, result] of results.entries()) {
+      expect(result).not.toMatchObject({ isError: true });
+      expect(JSON.stringify(result)).toContain(`VALUE=${index === 0 ? "A" : "B"}`);
+      expect(JSON.stringify(result)).toContain(`OWNER=${ownerSessionId}`);
+    }
+    const foreground = await client.execute("bash", "concurrent-foreground-intact", { command: 'printf "FOREGROUND=%s" "${OMP_CONCURRENT-unset}"' });
+    expect(JSON.stringify(foreground)).toContain("FOREGROUND=unset");
+  });
+
   test("remote eval tool bridge uses the same remote workspace", async () => {
     const result = await client.execute("eval", "eval-tool-read", {
       language: "js",
@@ -260,11 +304,15 @@ describe("native worker round trip", () => {
       name,
       command: "echo booted; sleep 30",
       pty: false,
+      async: true,
+      timeout: 1,
       ready: { log: "booted", timeout: 20 },
     });
     const startedText = JSON.stringify(started);
     expect(startedText).toContain(name);
     expect(startedText).not.toContain("disabled");
+    expect(startedText).toContain("Ignored timeout: service-only");
+    expect(startedText).toContain("Ignored async: service-only");
 
     const listed = await client.execute("read", "service-list", { path: "proc://" });
     expect(JSON.stringify(listed)).toContain(name);
@@ -297,6 +345,161 @@ describe("native worker round trip", () => {
       await client.execute("write", "steer-stop", { path: `proc://${name}/kill`, content: "" }).catch(() => {});
     }
   }, 30_000);
+  test("readiness cancellation reaps the created process before the local job settles", async () => {
+    const manager = new AsyncJobManager({ maxRunningJobs: 1 });
+    const name = `abort-${process.pid}`;
+    const marker = `${name}.pid`;
+    const launch = new AbortController();
+    const watcher = watch(cwd, { persistent: false }, (_event, file) => {
+      if (file === marker) launch.abort(new Error("cancel after process creation"));
+    });
+    try {
+      const started = startRemoteService(client, name, "Main", manager, async signal =>
+        await client.execute("bash", "cancel-native-readiness", {
+          name, command: `echo $$ > '${marker}'; exec sleep 30`, pty: false,
+          ready: { log: "NEVER_READY", timeout: 20 },
+        }, signal) as AgentToolResult, launch.signal);
+      await expect(started).rejects.toThrow("cancel");
+      const job = manager.getAllJobs()[0]!;
+      await job.promise;
+      expect(["failed", "cancelled"]).toContain(job.status);
+      const pid = Number((await readFile(join(cwd, marker), "utf8")).trim());
+      expect(Number.isSafeInteger(pid) && pid > 1).toBe(true);
+      expect(() => process.kill(pid, 0)).toThrow();
+      expect(client.isClosed).toBe(false);
+      const status = await client.execute("read", "cancelled-state", { path: `proc://${name}` });
+      expect(JSON.stringify(status)).toContain("exited");
+    } finally {
+      watcher.close();
+      await client.execute("write", "cancel-test-cleanup", { path: `proc://${name}/kill`, content: "" }).catch(() => {});
+      await manager.dispose({ timeoutMs: 1000 });
+    }
+  }, 30_000);
+  test("same-name preflight failure cannot roll back the existing instance", async () => {
+    const manager = new AsyncJobManager({ maxRunningJobs: 1 });
+    const name = `guard-${process.pid}`;
+    try {
+      const original = await client.execute("bash", "guard-start", { name, command: "echo ready; sleep 30", pty: false, ready: { log: "ready" } }) as AgentToolResult<{ service: { id: string; pid: number } }>;
+      const receipt = original.details!.service;
+      await expect(startRemoteService(client, name, "Main", manager, async signal =>
+        await client.execute("bash", "guard-invalid", { name, command: "true", cwd: join(cwd, `missing-${crypto.randomUUID()}`) }, signal) as AgentToolResult)).rejects.toThrow("Working directory does not exist");
+      await manager.getAllJobs()[0]!.promise;
+      expect(process.kill(receipt.pid, 0)).toBe(true);
+      const stopped = await client.stopService(name, receipt.id);
+      expect(stopped).toHaveProperty("status", "stopped");
+    } finally {
+      await client.execute("write", "guard-cleanup", { path: `proc://${name}/kill`, content: "" }).catch(() => {});
+      await manager.dispose({ timeoutMs: 1000 });
+    }
+  }, 30_000);
+  test("instance-scoped stop refuses replacement and is repeatable for the owned instance", async () => {
+    const name = `replace-${process.pid}`;
+    try {
+      const first = await client.execute("bash", "replace-first", { name, command: "echo ready; sleep 30", pty: false, ready: { log: "ready" } }) as AgentToolResult<{ service: { id: string } }>;
+      const second = await client.execute("bash", "replace-second", { name, command: "echo ready; sleep 30", pty: false, ready: { log: "ready" } }) as AgentToolResult<{ service: { id: string; pid: number } }>;
+      expect(first.details!.service.id).not.toBe(second.details!.service.id);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        expect(await client.stopService(name, first.details!.service.id)).toHaveProperty("status", "replaced");
+        expect(process.kill(second.details!.service.pid, 0)).toBe(true);
+      }
+      for (let attempt = 0; attempt < 2; attempt++)
+        expect(await client.stopService(name, second.details!.service.id)).toHaveProperty("status", "stopped");
+    } finally {
+      await client.execute("write", "replace-cleanup", { path: `proc://${name}/kill`, content: "" }).catch(() => {});
+    }
+  }, 30_000);
+  test("another worker explicitly stopping readiness settles the terminal launch without a completion event", async () => {
+    const manager = new AsyncJobManager({ maxRunningJobs: 1 });
+    const observer = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    const name = `stop-ready-${process.pid}`;
+    const marker = `${name}.started`;
+    const created = Promise.withResolvers<void>();
+    const watcher = watch(cwd, { persistent: false }, (_event, file) => {
+      if (file === marker) created.resolve();
+    });
+    try {
+      await observer.initialize(cwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: "readiness-stop-observer" });
+      const started = startRemoteService(client, name, "Main", manager, async signal =>
+        await client.execute("bash", "externally-stopped-readiness", {
+          name, command: `touch '${marker}'; exec sleep 30`, pty: false,
+          ready: { log: "NEVER_READY", timeout: 20 },
+        }, signal) as AgentToolResult);
+      void started.catch(() => {});
+      await created.promise;
+      const before = await observer.execute("read", "before-external-stop", { path: `proc://${name}` }) as AgentToolResult<{ proc: { daemon: { id: string; pid: number; state: string } } }>;
+      expect(before.details!.proc.daemon.state).toBe("starting");
+      expect(await observer.stopService(name, before.details!.proc.daemon.id)).toHaveProperty("status", "stopped");
+      const result = await started;
+      expect(result).toHaveProperty("details.service.ownership", "terminal");
+      const job = manager.getAllJobs()[0]!;
+      await job.promise;
+      expect(job.status).toBe("completed");
+      expect(job.resultText).toContain('"operation":"launch-settled"');
+      expect(() => process.kill(before.details!.proc.daemon.pid, 0)).toThrow();
+      expect(client.isClosed).toBe(false);
+    } finally {
+      watcher.close();
+      await observer.execute("write", "stop-ready-cleanup", { path: `proc://${name}/kill`, content: "" }).catch(() => {});
+      await manager.dispose({ timeoutMs: 1000 });
+      await observer.close().catch(() => {});
+    }
+  }, 30_000);
+  test("a replaced launch lookup settles its job without observing or stopping the replacement", async () => {
+    const manager = new AsyncJobManager({ maxRunningJobs: 1 });
+    const observer = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    const name = `settled-replace-${process.pid}`;
+    let replacementPid: number | undefined;
+    try {
+      await observer.initialize(cwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: "replacement-observer" });
+      const result = await startRemoteService(client, name, "Main", manager, async signal =>
+        await executeOwnedRemoteService(cwd, ownerSessionId, name, async () => {
+          const receipt = await client.execute("bash", "settled-original", { name, command: "echo ready; sleep 30", pty: false, ready: { log: "ready" } });
+          const replacement = await observer.execute("bash", "settled-replacement", { name, command: "echo ready; sleep 30", pty: false, ready: { log: "ready" } }) as AgentToolResult<{ service: { pid: number } }>;
+          replacementPid = replacement.details!.service.pid;
+          return receipt;
+        }, signal) as AgentToolResult);
+      expect(result).toHaveProperty("details.service.ownership", "replaced");
+      const job = manager.getAllJobs()[0]!;
+      await job.promise;
+      expect(job.status).toBe("completed");
+      expect(job.resultText).toContain('"ownership":"replaced"');
+      expect(process.kill(replacementPid!, 0)).toBe(true);
+      expect(manager.cancel(job.id)).toBe(false);
+      expect(process.kill(replacementPid!, 0)).toBe(true);
+    } finally {
+      await observer.execute("write", "settled-replacement-cleanup", { path: `proc://${name}/kill`, content: "" }).catch(() => {});
+      await manager.dispose({ timeoutMs: 1000 });
+      await observer.close().catch(() => {});
+    }
+  }, 30_000);
+  test("receipt lookup rejects replacement PID/owner and unsupported receipts without killing by name", async () => {
+    const name = `lookup-${process.pid}`;
+    const abort = new AbortController();
+    let replacementPid: number | undefined;
+    try {
+      await expect(executeOwnedRemoteService(cwd, ownerSessionId, name, async () => {
+        const first = await client.execute("bash", "lookup-first", { name, command: "echo ready; sleep 30", pty: false, ready: { log: "ready" } });
+        const second = await client.execute("bash", "lookup-second", { name, command: "echo ready; sleep 30", pty: false, ready: { log: "ready" } }) as AgentToolResult<{ service: { pid: number } }>;
+        replacementPid = second.details!.service.pid;
+        abort.abort(new Error("cancel after replacement"));
+        return first;
+      }, abort.signal)).rejects.toThrow("cancel after replacement");
+      expect(process.kill(replacementPid!, 0)).toBe(true);
+      await expect(executeOwnedRemoteService(cwd, ownerSessionId, name, async () => ({
+        content: [], details: { service: { name, state: "running" } },
+      }))).rejects.toThrow("no process PID");
+      const failed = { content: [], isError: true };
+      expect(await executeOwnedRemoteService(cwd, ownerSessionId, name, async () => failed)).toBe(failed);
+      const ownerMismatch = await executeOwnedRemoteService(cwd, "different-owner", name, async () => ({
+        content: [], details: { service: { name, state: "running", pid: replacementPid } },
+      })) as AgentToolResult<{ service: { ownership: string } }>;
+      expect(ownerMismatch.details!.service.ownership).toBe("replaced");
+      expect(process.kill(replacementPid!, 0)).toBe(true);
+    } finally {
+      await client.execute("write", "lookup-cleanup", { path: `proc://${name}/kill`, content: "" }).catch(() => {});
+      (await daemonClientForProject(cwd)).close();
+    }
+  }, 30_000);
 });
 
 describe("hub launch ownership", () => {
@@ -322,6 +525,45 @@ describe("hub launch ownership", () => {
       for (const name of names) await second.execute("write", `stop-${name}`, { path: `proc://${name}/kill`, content: "" }).catch(() => {});
       await first.close().catch(() => {});
       await second.close().catch(() => {});
+      await rm(ownedCwd, { recursive: true, force: true });
+    }
+  }, 60_000);
+  test("omitted owners are unique and share native identity with shutdown and signal cleanup", async () => {
+    const ownedCwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-owner-"));
+    const first = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    const second = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    const observer = new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    const names = ["omitted-first", "omitted-second"];
+    try {
+      await first.initialize(ownedCwd, OMP_RUNTIME_HANDSHAKE);
+      await second.initialize(ownedCwd, OMP_RUNTIME_HANDSHAKE);
+      await observer.initialize(ownedCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: " explicit observer " });
+      const snapshots: Array<{ owner: string; pid: number }> = [];
+      for (const [index, worker] of [first, second].entries()) {
+        await worker.execute("bash", `omitted-${index}`, { name: names[index], command: "echo ready; sleep 30", pty: false, ready: { log: "ready" } });
+        const status = await observer.execute("read", `owner-${index}`, { path: `proc://${names[index]}` }) as AgentToolResult<{ proc: { daemon: { owner: string; pid: number } } }>;
+        snapshots.push(status.details!.proc.daemon);
+      }
+      expect(snapshots[0]!.owner).toStartWith("omp-ssh-remote:");
+      expect(snapshots[1]!.owner).toStartWith("omp-ssh-remote:");
+      expect(snapshots[0]!.owner).not.toBe(snapshots[1]!.owner);
+      await first.close();
+      expect(() => process.kill(snapshots[0]!.pid, 0)).toThrow();
+      expect(process.kill(snapshots[1]!.pid, 0)).toBe(true);
+      const explicit = await observer.execute("bash", "explicit-owner", { name: "explicit-owner", command: "echo ready; sleep 30", pty: false, ready: { log: "ready" } });
+      expect(explicit).toHaveProperty("details.service.ownership", "owned");
+      const status = await observer.execute("read", "explicit-status", { path: "proc://explicit-owner" }) as AgentToolResult<{ proc: { daemon: { owner: string; pid: number } } }>;
+      expect(status.details!.proc.daemon.owner).toBe(" explicit observer ");
+      second.kill();
+      expect(await second.waitForExit()).toBe(143);
+      expect(() => process.kill(snapshots[1]!.pid, 0)).toThrow();
+      expect(process.kill(status.details!.proc.daemon.pid, 0)).toBe(true);
+      await observer.close();
+      expect(() => process.kill(status.details!.proc.daemon.pid, 0)).toThrow();
+    } finally {
+      await first.close().catch(() => {});
+      await second.close().catch(() => {});
+      await observer.close().catch(() => {});
       await rm(ownedCwd, { recursive: true, force: true });
     }
   }, 60_000);

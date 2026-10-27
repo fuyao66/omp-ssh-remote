@@ -49,6 +49,9 @@ export class RemoteRuntimeClient {
   #resolveReady?: (message: ReadyMessage) => void;
   #rejectReady?: (error: Error) => void;
   #closed = false;
+  #exited = false;
+  #killSent = false;
+  #closePromise?: Promise<void>;
   #nextId = 1;
   readonly #exitPromise: Promise<number | null>;
   readonly #eventListeners = new Set<(event: EventMessage) => void | Promise<void>>();
@@ -86,37 +89,68 @@ export class RemoteRuntimeClient {
     // Client may be killed before initialize() attaches a consumer; keep the
     // ready rejection from becoming an unhandled fatal session error.
     void this.#ready.catch(() => {});
-    this.#exitPromise = new Promise<number | null>((resolve) => {
-      this.#process.on("close", (code) => resolve(code));
+    const exit = Promise.withResolvers<number | null>();
+    this.#exitPromise = exit.promise;
+    this.#process.once("exit", (code) => {
+      this.#exited = true;
+      exit.resolve(code);
     });
+    // Failed spawns have no process and do not emit an exit event.
+    this.#process.once("error", (error) => {
+      if (this.#process.pid === undefined) {
+        this.#exited = true;
+        exit.resolve(null);
+      }
+      this.#terminate(error);
+    });
+    this.#process.once("close", (code) => {
+      this.#close(new Error(`Remote runtime exited with code ${code}`));
+    });
+    this.#process.stdin?.on("error", (error) => this.#terminate(error));
     void this.#readStdout().catch((error) => this.#terminate(error));
     void this.#readStderr().catch((error) => this.#terminate(error));
-    void this.#watchExit();
+  }
+
+  /** Resolves on process exit, independently of protocol/stream closure. */
+  waitForExit(): Promise<number | null> {
+    return this.#exitPromise;
   }
 
   async initialize(
     cwd: string,
     handshake: RemoteRuntimeHandshake,
     timeoutMs = 15_000,
-    options: { sessionId?: string; settings?: RemoteExecutionSettings } = {},
+    options: { sessionId?: string; settings?: RemoteExecutionSettings; signal?: AbortSignal; resourceBinding?: string } = {},
   ): Promise<ReadyMessage> {
-    this.#send({
-      type: "initialize",
-      protocolVersion: PROTOCOL_VERSION,
-      host: handshake.host,
-      ...(handshake.host === "omp"
-        ? { ompVersion: handshake.hostVersion }
-        : {}),
-      hostVersion: handshake.hostVersion,
-      runtimeVersion: handshake.runtimeVersion,
-      cwd,
-      tools: [...handshake.requestedTools],
-      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
-      ...(options.settings && Object.keys(options.settings).length > 0
-        ? { settings: options.settings }
-        : {}),
-    });
+    const abort = () => {
+      const error = options.signal?.reason instanceof Error
+        ? options.signal.reason
+        : new Error("Remote runtime initialization aborted");
+      this.#terminate(error);
+      return error;
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
     try {
+      if (options.signal?.aborted) throw abort();
+      this.#send({
+        type: "initialize",
+        protocolVersion: PROTOCOL_VERSION,
+        host: handshake.host,
+        ...(handshake.host === "omp"
+          ? { ompVersion: handshake.hostVersion }
+          : {}),
+        hostVersion: handshake.hostVersion,
+        runtimeVersion: handshake.runtimeVersion,
+        ...(handshake.editMode ? { editMode: handshake.editMode } : {}),
+        ...(handshake.bashServices !== undefined ? { bashServices: handshake.bashServices } : {}),
+        cwd,
+        tools: [...handshake.requestedTools],
+        ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
+        ...(options.resourceBinding !== undefined ? { resourceBinding: options.resourceBinding } : {}),
+        ...(options.settings && Object.keys(options.settings).length > 0
+          ? { settings: options.settings }
+          : {}),
+      });
       const ready = await withTimeout(
         this.#ready,
         timeoutMs,
@@ -127,11 +161,19 @@ export class RemoteRuntimeClient {
           `Remote runtime protocol mismatch: protocol=${ready.protocolVersion}`,
         );
       }
+      if (options.resourceBinding !== undefined && ready.resourceBinding !== options.resourceBinding) {
+        throw new Error("Remote runtime resource binding mismatch");
+      }
       handshake.validateReady(ready);
       return ready;
     } catch (error) {
-      this.#terminate(error);
+      // close() intentionally rejects ready while graceful shutdown is pending.
+      // Fatal/abort paths already terminate themselves; do not turn a normal
+      // shutdown into SIGTERM merely because initialize observes its closure.
+      if (!this.#closed) this.#terminate(error);
       throw error;
+    } finally {
+      options.signal?.removeEventListener("abort", abort);
     }
   }
 
@@ -186,18 +228,38 @@ export class RemoteRuntimeClient {
     }
   }
 
-  async close(timeoutMs = 10_000): Promise<void> {
-    if (this.#closed) return;
+  /** Stop only the acknowledged broker instance, never a later same-name service. */
+  async stopService(name: string, instanceId: string): Promise<unknown> {
+    if (this.#closed) throw new Error("Remote runtime is disconnected");
+    const id = `req_${this.#nextId++}`;
+    const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+    this.#pending.set(id, { resolve, reject });
     try {
-      this.#send({ type: "shutdown" });
-      this.#process.stdin?.end();
+      this.#send({ type: "service-stop", id, name, instanceId });
+      return await withTimeout(promise, 15_000, `Remote service ${name} cleanup timed out`);
+    } finally {
+      this.#pending.delete(id);
+    }
+  }
+
+  close(timeoutMs = 10_000): Promise<void> {
+    return this.#closePromise ??= this.#shutdown(timeoutMs);
+  }
+
+  async #shutdown(timeoutMs: number): Promise<void> {
+    const graceful = !this.#closed;
+    try {
+      if (graceful) {
+        this.#send({ type: "shutdown" });
+        this.#process.stdin?.end();
+        this.#close(new Error("Remote runtime closed"));
+      }
       const code = await withTimeout(
         this.#exitPromise,
         timeoutMs,
         `Remote runtime shutdown timed out after ${timeoutMs}ms`,
       );
-      this.#close(new Error("Remote runtime closed"));
-      if (code !== 0) throw new Error(`Remote runtime cleanup failed (exit ${code})`);
+      if (graceful && code !== 0) throw new Error(`Remote runtime cleanup failed (exit ${code})`);
     } catch (error) {
       this.#terminate(error);
       throw error;
@@ -236,10 +298,6 @@ export class RemoteRuntimeClient {
     if (text.trim()) process.stderr.write(`[omp-remote-worker] ${text}`);
   }
 
-  async #watchExit(): Promise<void> {
-    const code = await this.#exitPromise;
-    this.#close(new Error(`Remote runtime exited with code ${code}`));
-  }
 
   #handle(message: Message): void {
     if (message.type === "ready") {
@@ -279,14 +337,16 @@ export class RemoteRuntimeClient {
       this.#pending.delete(message.id);
       pending.reject(error);
     } else {
-      this.#rejectReady?.(error);
-      this.#close(error);
+      this.#terminate(error);
     }
   }
 
   #terminate(error: unknown): void {
     const failure = error instanceof Error ? error : new Error(String(error));
-    if (!this.#closed) this.#process.kill();
+    if (!this.#exited && !this.#killSent) {
+      this.#killSent = true;
+      this.#process.kill();
+    }
     this.#close(failure);
   }
 

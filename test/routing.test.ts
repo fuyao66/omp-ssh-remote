@@ -85,7 +85,7 @@ describe("workspace path routing", () => {
   test("routes hashline filesystem edits remotely", () => {
     expect(
       pathShouldStayLocal("edit", {
-        input: "[/root/project/a.ts#AB12]\nPUT 1.=1:\n+x",
+        input: "*** Begin Patch\n[/root/project/a.ts#AB12]\nPUT 1.=1:\n+x\n*** End Patch",
       }),
     ).toBe(false);
   });
@@ -93,13 +93,13 @@ describe("workspace path routing", () => {
   test("keeps internal URI edits local and rejects mixed domains", () => {
     expect(
       pathShouldStayLocal("edit", {
-        input: "[local://plan.md#AB12]\nPUT 1.=1:\n+x",
+        input: "*** Begin Patch\n[local://plan.md#AB12]\nPUT 1.=1:\n+x\n*** End Patch",
       }),
     ).toBe(true);
     expect(() =>
       pathShouldStayLocal("edit", {
         input:
-          "[local://plan.md#AB12]\nPUT 1.=1:\n+x\n[/root/project/a.ts#CD34]\nPUT 1.=1:\n+y",
+          "*** Begin Patch\n[local://plan.md#AB12]\nPUT 1.=1:\n+x\n[/root/project/a.ts#CD34]\nPUT 1.=1:\n+y\n*** End Patch",
       }),
     ).toThrow("cannot mix local internal URIs with remote filesystem paths");
   });

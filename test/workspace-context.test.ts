@@ -1,46 +1,74 @@
 import { expect, test } from "bun:test";
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { workspaceNotice, projectWorkspaceContext, type WorkspaceBindingNotice } from "../src/omp/workspace-context.ts";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { workspaceNotice, workspaceAnnouncement, type WorkspaceBindingNotice } from "../src/omp/workspace-context.ts";
 
 const local: WorkspaceBindingNotice = { binding: "local-1", mode: "local", target: null, cwd: "/project" };
 const remote: WorkspaceBindingNotice = { binding: "remote-1", mode: "remote", target: "server", cwd: "/project" };
 
-test("unchanged state emits no repeated notices; switches append without modifying prior messages", () => {
-  const messages: AgentMessage[] = [{ role: "user", content: "Work on this project", timestamp: 1 }];
-  for (const binding of [local, remote, { ...remote, mode: "unavailable" as const }, { ...remote, binding: "remote-2" }, { ...local, binding: "local-2" }]) {
-    const before = JSON.stringify(messages);
-    const notice = workspaceNotice(messages, binding)!;
-    expect(notice.details).toEqual(binding);
-    expect(JSON.stringify(messages)).toBe(before);
-    messages.push(notice);
-    expect(workspaceNotice(messages, binding)).toBeUndefined();
+function accept(manager: SessionManager, current: WorkspaceBindingNotice): string {
+  const notice = workspaceAnnouncement(current, manager.getBranch())!;
+  expect(notice).toBeDefined();
+  expect(notice.role).toBe("custom");
+  expect(notice.customType).toBe("remote-workspace-binding");
+  expect(notice.details).toEqual(current);
+  return manager.appendCustomMessageEntry(notice.customType, notice.content, notice.display, notice.details);
+}
+
+test("a new local session needs no extra model-visible message", () => {
+  const manager = SessionManager.inMemory("/project");
+  expect(workspaceAnnouncement(local, manager.getBranch())).toBeUndefined();
+  expect(workspaceAnnouncement(local, manager.getBranch())).toBeUndefined();
+});
+
+test("binding transitions are native accepted messages prepared before context transforms", () => {
+  const manager = SessionManager.inMemory("/project");
+  for (const current of [remote, { ...remote, mode: "unavailable" as const }, { ...remote, binding: "remote-2" }, { ...local, binding: "local-2" }]) {
+    accept(manager, current);
+    expect(manager.getBranch().at(-1)).toMatchObject({
+      type: "custom_message", customType: "remote-workspace-binding", details: current,
+    });
+    expect(workspaceAnnouncement(current, manager.getBranch())).toBeUndefined();
   }
 });
 
-test("compaction and resumed sessions recover current binding rather than trusting old state", () => {
-  const oldNotice = workspaceNotice([], remote)!;
-  const compacted: AgentMessage[] = [{ role: "user", content: "Compacted summary", timestamp: 2 }];
-  expect(workspaceNotice(compacted, remote)?.details).toEqual(remote);
-  // A restored transcript must not re-select its former SSH connection.
-  expect(workspaceNotice([oldNotice], local)?.details).toEqual(local);
-  // Reconnect to the same hostname/cwd still has fresh runtime state.
-  expect(workspaceNotice([oldNotice], { ...remote, binding: "new-runtime" })?.details?.binding).toBe("new-runtime");
+test("restored native remote entries and legacy markers get one explicit local correction", () => {
+  for (const legacy of [false, true]) {
+    const manager = SessionManager.inMemory("/project");
+    if (legacy) manager.appendCustomEntry("remote-workspace-context-v1", { mode: "remote", target: "old-host" });
+    else accept(manager, remote);
+    const notice = workspaceAnnouncement(local, manager.getBranch())!;
+    expect(notice.details).toEqual(local);
+    expect(notice.content).toContain("Workspace binding: local");
+    accept(manager, local);
+    expect(workspaceAnnouncement(local, manager.getBranch())).toBeUndefined();
+  }
 });
 
-test("provider context replay retains exactly the observed prefix including multiple same-anchor switches", () => {
-  const raw: AgentMessage[] = [{ role: "user", content: "first", timestamp: 10 }];
-  const first = projectWorkspaceContext(raw, [], local);
-  expect(raw).toHaveLength(1);
-  const second = projectWorkspaceContext(raw, first.records, remote);
-  expect(second.messages.slice(0, first.messages.length)).toEqual(first.messages);
-  expect(second.records).toHaveLength(2);
-  raw.push({ role: "user", content: "second", timestamp: 20 });
-  const replay = projectWorkspaceContext(raw, JSON.parse(JSON.stringify(second.records)), remote);
-  expect(replay.messages.slice(0, second.messages.length)).toEqual(second.messages);
-  expect(replay.messages.at(-1)).toEqual(raw[1]);
-  expect(replay.changed).toBe(false);
-  const compacted = projectWorkspaceContext([{ role: "user", content: "summary", timestamp: 30 }], replay.records, remote);
-  expect(compacted.records).toHaveLength(1);
-  expect(compacted.records[0].message.details).toEqual(remote);
-  expect(compacted.messages).toHaveLength(2);
+test("a cancelled hook result is retried until the native manager accepts it", () => {
+  const manager = SessionManager.inMemory("/project");
+  const first = workspaceAnnouncement(remote, manager.getBranch())!;
+  expect(workspaceAnnouncement(remote, manager.getBranch())?.details).toEqual(first.details);
+  expect(manager.getBranch()).toHaveLength(0);
+  accept(manager, remote);
+  expect(workspaceAnnouncement(remote, manager.getBranch())).toBeUndefined();
+  expect(manager.getBranch().filter(entry => entry.type === "custom_message")).toHaveLength(1);
+});
+
+test("native branch navigation uses only the active branch, including returning to an accepted notice", () => {
+  const manager = SessionManager.inMemory("/project");
+  const remoteId = accept(manager, remote);
+  const localId = accept(manager, local);
+  expect(workspaceAnnouncement(local, manager.getBranch())).toBeUndefined();
+  manager.branch(remoteId);
+  expect(workspaceAnnouncement(local, manager.getBranch())?.details).toEqual(local);
+  manager.branch(localId);
+  expect(workspaceAnnouncement(local, manager.getBranch())).toBeUndefined();
+});
+
+test("a missing remote notice is reannounced without altering native history", () => {
+  const manager = SessionManager.inMemory("/project");
+  expect(workspaceAnnouncement(remote, manager.getBranch())?.details).toEqual(remote);
+  expect(manager.getBranch()).toHaveLength(0);
+  const unavailable = workspaceNotice({ ...remote, mode: "unavailable" });
+  expect(unavailable.content).toContain("no local fallback");
 });

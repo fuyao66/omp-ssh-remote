@@ -14,7 +14,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.11.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.13.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
@@ -33,6 +33,21 @@ export const REMOTE_TOOL_NAMES = [
 export type RemoteToolName = (typeof REMOTE_TOOL_NAMES)[number];
 export type AnyRemoteToolName = string;
 
+export const OMP_EDIT_MODES = ["replace", "patch", "apply_patch", "hashline", "sloppy"] as const;
+export type OmpEditMode = (typeof OMP_EDIT_MODES)[number];
+
+export function parseOmpEditMode(value: unknown): OmpEditMode {
+  if (typeof value !== "string" || !OMP_EDIT_MODES.includes(value as OmpEditMode))
+    throw new Error("Protocol field editMode must be a supported OMP edit mode");
+  return value as OmpEditMode;
+}
+
+export function parseResourceBinding(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0)
+    throw new Error("Protocol field resourceBinding must be a non-empty string");
+  return value;
+}
+
 
 export type InitializeRequest = {
   type: "initialize";
@@ -47,6 +62,12 @@ export type InitializeRequest = {
   sessionId?: string;
   /** Forwarded execution-domain settings (see omp/execution-settings.ts). */
   settings?: RemoteExecutionSettings;
+  /** Effective host edit language, after model/env overrides. */
+  editMode?: OmpEditMode;
+  /** Whether the actual host bash schema exposes remote service operations. */
+  bashServices?: boolean;
+  /** Workspace-owned resource namespace echoed by the worker. */
+  resourceBinding?: string;
 };
 
 export type ExecuteRequest = {
@@ -69,6 +90,7 @@ export type Request =
   | InitializeRequest
   | ExecuteRequest
   | CancelRequest
+  | { type: "service-stop"; id: string; name: string; instanceId: string }
   | { type: "steer"; id: string }
   | { type: "event-ack"; id: string }
   | ShutdownRequest;
@@ -77,6 +99,8 @@ export type ToolManifest = {
   name: string;
   description: string;
   parameters?: unknown;
+  customFormat?: { syntax: "lark" | "regex"; definition: string };
+  customWireName?: string;
 };
 
 export type ReadyMessage = {
@@ -88,6 +112,8 @@ export type ReadyMessage = {
   toolRuntimeVersion?: string;
   runtimeVersion?: string;
   cwd?: string;
+  editMode?: OmpEditMode;
+  resourceBinding?: string;
   tools: ToolManifest[];
   capabilities?: Record<string, unknown>;
 };
@@ -141,6 +167,11 @@ export function parseRequest(raw: unknown): Request {
     ) {
       throw new Error("Protocol field tools must be a string array");
     }
+    const bashServices = value.bashServices;
+    if (value.sessionId !== undefined && (typeof value.sessionId !== "string" || value.sessionId.trim().length === 0))
+      throw new Error("Protocol field sessionId must be a non-empty string");
+    if (bashServices !== undefined && typeof bashServices !== "boolean")
+      throw new Error("Protocol field bashServices must be a boolean");
     return {
       type,
       protocolVersion: numberField(value, "protocolVersion"),
@@ -156,9 +187,10 @@ export function parseRequest(raw: unknown): Request {
       runtimeVersion: stringField(value, "runtimeVersion"),
       cwd: stringField(value, "cwd"),
       tools,
-      ...(typeof value.sessionId === "string"
-        ? { sessionId: value.sessionId }
-        : {}),
+      ...(value.editMode === undefined ? {} : { editMode: parseOmpEditMode(value.editMode) }),
+      ...(bashServices === undefined ? {} : { bashServices }),
+      ...(value.resourceBinding === undefined ? {} : { resourceBinding: parseResourceBinding(value.resourceBinding) }),
+      ...(value.sessionId === undefined ? {} : { sessionId: value.sessionId as string }),
       ...(value.settings === undefined
         ? {}
         : { settings: parseExecutionSettings(value.settings) }),
@@ -193,11 +225,38 @@ export function parseRequest(raw: unknown): Request {
       ...(value.bashScope === "job" || value.bashScope === "session" ? { bashScope: value.bashScope } : {}),
     };
   }
+  if (type === "service-stop") {
+    const name = stringField(value, "name");
+    const instanceId = stringField(value, "instanceId");
+    const id = stringField(value, "id");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/.test(name) || !instanceId.trim() || !id.trim())
+      throw new Error("Protocol service-stop requires a service name and non-empty instanceId/id");
+    return { type, id, name, instanceId };
+  }
   if (type === "cancel") return { type, id: stringField(value, "id") };
   if (type === "steer") return { type, id: stringField(value, "id") };
   if (type === "event-ack") return { type, id: stringField(value, "id") };
   if (type === "shutdown") return { type };
   throw new Error(`Unknown protocol request type: ${type}`);
+}
+
+function parseToolLanguage(tool: Record<string, unknown>): Pick<ToolManifest, "customFormat" | "customWireName"> {
+  const { customFormat, customWireName } = tool;
+  if (customWireName !== undefined && typeof customWireName !== "string")
+    throw new Error("Protocol tool customWireName must be a string");
+  let language: ToolManifest["customFormat"];
+  if (customFormat !== undefined) {
+    if (!isRecord(customFormat))
+      throw new Error("Protocol tool customFormat must be a Lark or regex grammar");
+    const { syntax, definition } = customFormat;
+    if ((syntax !== "lark" && syntax !== "regex") || typeof definition !== "string")
+      throw new Error("Protocol tool customFormat must be a Lark or regex grammar");
+    language = { syntax, definition };
+  }
+  return {
+    ...(customWireName === undefined ? {} : { customWireName }),
+    ...(language === undefined ? {} : { customFormat: language }),
+  };
 }
 
 export function parseMessage(line: string): Message {
@@ -212,6 +271,7 @@ export function parseMessage(line: string): Message {
         name: stringField(tool, "name"),
         description: stringField(tool, "description"),
         ...("parameters" in tool ? { parameters: tool.parameters } : {}),
+        ...parseToolLanguage(tool),
       };
     });
     return {
@@ -233,6 +293,8 @@ export function parseMessage(line: string): Message {
         ? { toolRuntimeVersion: value.toolRuntimeVersion }
         : {}),
       ...(typeof value.cwd === "string" ? { cwd: value.cwd } : {}),
+      ...(value.editMode === undefined ? {} : { editMode: parseOmpEditMode(value.editMode) }),
+      ...(value.resourceBinding === undefined ? {} : { resourceBinding: parseResourceBinding(value.resourceBinding) }),
       tools,
       ...(isRecord(value.capabilities)
         ? { capabilities: value.capabilities }

@@ -1,30 +1,15 @@
-import { createRequire } from "node:module";
-import { readFile, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { isRecord } from "../protocol.ts";
 
 const OMP_HOST_PACKAGE = "@oh-my-pi/pi-coding-agent";
 
-async function readPackageVersion(packageDir: string): Promise<string | undefined> {
-  try {
-    const manifest = JSON.parse(
-      await readFile(join(packageDir, "package.json"), "utf8"),
-    ) as unknown;
-    if (!isRecord(manifest)) return undefined;
-    return typeof manifest.version === "string" && manifest.version
-      ? manifest.version
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 async function sourceDirectory(path: string): Promise<string | undefined> {
-  if (!path || path.startsWith("<")) return undefined;
+  if (!path || path.startsWith("<") || path.includes("$bunfs")) return undefined;
   try {
-    return (await stat(path)).isDirectory() ? path : dirname(path);
+    const canonical = await realpath(path);
+    return (await stat(canonical)).isDirectory() ? canonical : dirname(canonical);
   } catch {
     return dirname(path);
   }
@@ -32,6 +17,7 @@ async function sourceDirectory(path: string): Promise<string | undefined> {
 
 async function packageVersionFromEntry(
   entry: string,
+  packageName = OMP_HOST_PACKAGE,
 ): Promise<string | undefined> {
   let current = await sourceDirectory(entry);
   while (current) {
@@ -41,7 +27,7 @@ async function packageVersionFromEntry(
       ) as unknown;
       if (
         isRecord(manifest) &&
-        manifest.name === OMP_HOST_PACKAGE &&
+        manifest.name === packageName &&
         typeof manifest.version === "string" &&
         manifest.version
       ) {
@@ -55,30 +41,35 @@ async function packageVersionFromEntry(
   return undefined;
 }
 
-function packageVersionFromRequire(from: string): string | undefined {
-  try {
-    const req = createRequire(from);
-    const manifest = req(`${OMP_HOST_PACKAGE}/package.json`) as {
-      version?: unknown;
-    };
-    return typeof manifest.version === "string" && manifest.version
-      ? manifest.version
-      : undefined;
-  } catch {
-    return undefined;
-  }
+/** Resolve the same source package that Bun's build will import, never a PATH CLI. */
+export async function resolveOmpBuildVersion(
+  fromDirectory = resolve(import.meta.dir, "../.."),
+): Promise<string> {
+  const entry = Bun.resolveSync(OMP_HOST_PACKAGE, fromDirectory);
+  const version = await packageVersionFromEntry(entry);
+  if (!version) throw new Error(`Could not resolve build dependency ${OMP_HOST_PACKAGE} from ${entry}`);
+  return version;
 }
 
-function versionFromOmpCli(): string | undefined {
-  try {
-    const result = Bun.spawnSync(["omp", "--version"], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const text = `${result.stdout.toString()}${result.stderr.toString()}`;
-    return /omp\/(\d+\.\d+\.\d+)/.exec(text)?.[1];
-  } catch {
-    return undefined;
+/** The native wrapper and downloaded platform addon must use the source runtime's release. */
+export async function resolveOmpNativeBuildVersion(
+  fromDirectory = resolve(import.meta.dir, "../.."),
+): Promise<string> {
+  const agentEntry = Bun.resolveSync(OMP_HOST_PACKAGE, fromDirectory);
+  const nativeEntry = Bun.resolveSync("@oh-my-pi/pi-natives", dirname(agentEntry));
+  const hostVersion = await resolveOmpBuildVersion(fromDirectory);
+  const nativeVersion = await packageVersionFromEntry(nativeEntry, "@oh-my-pi/pi-natives");
+  if (nativeVersion !== hostVersion) {
+    throw new Error(`OMP native dependency version mismatch: source=${hostVersion}, pi-natives=${nativeVersion ?? "unknown"}; install matching OMP dependencies before compiling workers`);
+  }
+  return nativeVersion;
+}
+
+/** Validate both freshly downloaded and cached platform addon manifests. */
+export function validateOmpNativeAddonPackage(manifest: unknown, archTag: string, version: string): void {
+  const name = `@oh-my-pi/pi-natives-${archTag}`;
+  if (!isRecord(manifest) || manifest.name !== name || manifest.version !== version) {
+    throw new Error(`Native addon package must be ${name}@${version}; got ${isRecord(manifest) ? `${manifest.name}@${manifest.version}` : "invalid manifest"}`);
   }
 }
 
@@ -88,7 +79,7 @@ export function ompCompiledHostVersion(): string | undefined {
 }
 
 export type OmpHostCompatibility = {
-  /** Version of the OMP host currently running this extension (live import). */
+  /** Version of the actual running OMP entry/executable, not a bundled utility. */
   installedHostVersion: string | undefined;
   /** OMP version the plugin bundle and companion workers were compiled against. */
   compiledHostVersion: string | undefined;
@@ -126,44 +117,33 @@ export function ompHostCompatibility(
   return { installedHostVersion, compiledHostVersion, compatible, advice };
 }
 
-export async function resolveOmpHostVersion(): Promise<string> {
-  const compiled = ompCompiledHostVersion();
-  if (compiled) return compiled;
+export interface OmpHostVersionOptions {
+  /** Actual host launch paths; injectable for source/compiled host regression tests. */
+  entrypoints?: readonly string[];
+  executable?: string;
+}
 
-  const cliVersion = versionFromOmpCli();
-  if (cliVersion) return cliVersion;
-
-  const requireCandidates = [
+/**
+ * Resolve the running process, not `omp` on PATH or this extension's dependencies.
+ * A compiled host has no on-disk source package: query that exact executable.
+ */
+export async function resolveOmpHostVersion(options: OmpHostVersionOptions = {}): Promise<string> {
+  const entrypoints = options.entrypoints ?? [
+    typeof Bun !== "undefined" && typeof Bun.main === "string" ? Bun.main : "",
+    process.argv[1] ?? "",
     process.execPath,
-    typeof Bun !== "undefined" && typeof Bun.main === "string" ? Bun.main : undefined,
-    process.argv[1],
-    join(homedir(), ".bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/package.json"),
-    join(process.cwd(), "package.json"),
-  ].filter((value): value is string => typeof value === "string" && value.length > 0);
-
-  for (const candidate of requireCandidates) {
-    const version = packageVersionFromRequire(candidate);
-    if (version) return version;
-  }
-
-  try {
-    const resolved = import.meta.resolve(OMP_HOST_PACKAGE);
-    const entry = resolved.startsWith("file:")
-      ? fileURLToPath(resolved)
-      : resolved;
+  ];
+  for (const entry of entrypoints) {
     const version = await packageVersionFromEntry(entry);
     if (version) return version;
-  } catch {}
-
-  const fallbackDirs = [
-    join(process.cwd(), "node_modules", OMP_HOST_PACKAGE),
-    join(homedir(), ".bun/install/global/node_modules", OMP_HOST_PACKAGE),
-  ];
-  for (const dir of fallbackDirs) {
-    const fallback = await readPackageVersion(dir);
-    if (fallback) return fallback;
   }
-  throw new Error(
-    `Could not resolve the installed version of ${OMP_HOST_PACKAGE}`,
-  );
+  const executable = options.executable ?? process.execPath;
+  try {
+    const result = Bun.spawnSync([executable, "--version"], { stdout: "pipe", stderr: "pipe" });
+    if (result.exitCode === 0) {
+      const version = /(?:^|\n)omp\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\s|$)/.exec(result.stdout.toString().trim())?.[1];
+      if (version) return version;
+    }
+  } catch {}
+  throw new Error(`Could not resolve the running OMP version from its entrypoints or executable ${executable}`);
 }

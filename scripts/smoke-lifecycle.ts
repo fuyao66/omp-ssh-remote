@@ -24,17 +24,88 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
     session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
     const originalInterruptMode = session.interruptMode;
     session.agent.setInterruptMode("immediate");
+    const manager = session.asyncJobManager; assert(manager);
+    const diagnosticStart = performance.now();
+    const diagnostics: object[] = [];
+    let phase = "setup";
+    const record = (event: string, details: object = {}) => {
+      diagnostics.push({
+        event, phase, elapsedMs: performance.now() - diagnosticStart, ...details,
+        jobs: manager.getAllJobs().map(job => ({
+          id: job.id, type: job.type, label: job.label, ownerId: job.ownerId,
+          status: job.status, consumed: manager.isJobResultConsumed(job.id),
+          deliverySuppressed: manager.isDeliverySuppressed(job.id),
+          resultText: job.resultText, errorText: job.errorText,
+        })),
+        queuedAsyncResult: session.yieldQueue.has("async-result"),
+        deliverableAsyncResult: session.yieldQueue.hasDeliverable("async-result"),
+      });
+    };
     let unexpectedModelTurns = 0;
     // The native yield queue can call raw prompt even when bridge turns are deferred.
     // This one-off acceptance process must never contact a provider.
-    session.agent.prompt = async () => { unexpectedModelTurns++; throw new Error("Unexpected model turn in lifecycle acceptance"); };
+    session.agent.prompt = async (...promptArgs) => {
+      unexpectedModelTurns++;
+      const error = new Error("Unexpected model turn in lifecycle acceptance");
+      record("unexpected-prompt", { promptArgs, stack: error.stack });
+      console.error("LIFECYCLE_PROMPT_DIAGNOSTICS", JSON.stringify(diagnostics));
+      throw error;
+    };
     const text = (r: any): string => r.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n") ?? "";
-    const invoke = async (name: string, params: object, onUpdate?: (result: any) => void) => {
-      const tool = session.getToolByName(name); assert(tool, `Missing tool ${name}`);
-      return tool.execute(crypto.randomUUID(), params, AbortSignal.timeout(40000), onUpdate, { hasUI: false, settings: session.settings, sessionManager: session.sessionManager, toolNames: pi.getActiveTools() } as never);
+    const invoke = async (name: string, params: object, onUpdate?: (result: any) => void, signal?: AbortSignal) => {
+      phase = `tool:${name}`;
+      record("invoke", { name, params });
+      try {
+        const tool = session.getToolByName(name); assert(tool, `Missing tool ${name}`);
+        const timeout = AbortSignal.timeout(40000);
+        const result = await tool.execute(crypto.randomUUID(), params, signal ? AbortSignal.any([signal, timeout]) : timeout, onUpdate, { hasUI: false, settings: session.settings, sessionManager: session.sessionManager, toolNames: pi.getActiveTools() } as never);
+        record("returned", { name, details: result.details });
+        return result;
+      } catch (error) {
+        record("invoke-error", { name, error: error instanceof Error ? error.stack : String(error) });
+        throw error;
+      } finally {
+        phase = `after:${name}`;
+      }
+    };
+    const waitForGatedJob = async (jobId: string, gate: string) => {
+      const release = Promise.withResolvers<void>();
+      const stopWait = new AbortController();
+      let releasing = false;
+      // Native wait emits its initial progress only after watchJobs. Keep the
+      // producer blocked until that actual claim, even during a cold refresh.
+      const waiting = invoke("wait", {}, update => {
+        if (releasing) return;
+        releasing = true;
+        void (async () => {
+          assert(update.details?.jobs?.some((job: { id: string }) => job.id === jobId), `Wait did not claim ${jobId}`);
+          assert(manager.isDeliverySuppressed(jobId), `Wait did not watch ${jobId}`);
+          record("native-wait-watched", { jobId, gate });
+          const result = await invoke("bash", { command: `printf 'release\\n' > '${gate}'` }, undefined, stopWait.signal);
+          assert(!result.isError, text(result));
+        })().then(release.resolve, release.reject);
+      }, stopWait.signal);
+      void waiting.then(() => {
+        if (!releasing) release.reject(new Error(`Wait returned without claiming ${jobId}`));
+      }, error => {
+        if (!releasing) release.reject(error);
+      });
+      try {
+        const [result] = await Promise.all([waiting, release.promise]);
+        assert(manager.isJobResultConsumed(jobId), `Wait did not consume ${jobId}`);
+        return result;
+      } catch (error) {
+        manager.cancel(jobId);
+        throw error;
+      } finally {
+        stopWait.abort();
+        await Promise.allSettled([waiting, release.promise]);
+      }
     };
     const tag = `omp-upgrade-${process.pid}`;
     const file = `/tmp/${tag}.txt`;
+    const asyncGate = `/tmp/${tag}-async.fifo`;
+    const serviceGate = `/tmp/${tag}-service.fifo`;
     const service = `${tag}-service`;
     let connected = false;
     try {
@@ -43,6 +114,8 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       const beforeArgs = { path: file };
       assert(readTool.approvalCacheTargets(beforeArgs)?.some(target => target.startsWith("/")));
       const began = performance.now();
+      phase = "command:remote-connect";
+      record("connect");
       await commands.get("remote-connect")!.handler(args, ctx); connected = true;
       console.log("LIFECYCLE_CONNECT_MS", performance.now() - began);
       const remote = text(await invoke("bash", { command: "hostname" })).trim();
@@ -52,6 +125,10 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       const scoped = readTool.approvalCacheTargets(remoteArgs); assert(scoped?.[0]?.startsWith("remote-request\0"));
       assert.throws(() => readTool.approvalCacheTargets!(beforeArgs), /binding changed/);
       console.log("APPROVAL_SCOPE_PASS");
+      const expectedIdentity = `SESSION_ID=${ctx.sessionManager.getSessionId()}\nSESSION_FILE=<>\n`;
+      const identityCommand = 'printf "SESSION_ID=%s\\nSESSION_FILE=<%s>\\n" "$PI_SESSION_ID" "$PI_SESSION_FILE"';
+      assert(text(await invoke("bash", { command: identityCommand })).includes(expectedIdentity));
+      console.log("SESSION_ENV_DIRECT_PASS");
       await invoke("write", { path: file, content: "first\n" });
       const read = text(await invoke("read", { path: file }));
       const header = read.match(/\[[^\]\n]+#[A-F0-9]+\]/)?.[0]; assert(header);
@@ -65,15 +142,33 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       console.log("CORE_EVAL_ARTIFACT_PASS");
 
       const frames: any[] = [];
-      await invoke("bash", { command: "export OMP_SMOKE_SCOPE=foreground" });
-      const jobResult = await invoke("bash", { name: "  ", command: 'printf "ASYNC_SCOPE=%s\\n" "${OMP_SMOKE_SCOPE-unset}"; export OMP_SMOKE_SCOPE=background; printf LIVE_OUTPUT; sleep 0.3; printf DONE_OUTPUT', async: true }, update => frames.push(update));
+      const gates = await invoke("bash", { command: `export OMP_SMOKE_SCOPE=foreground; mkfifo -- '${asyncGate}' '${serviceGate}'` });
+      assert(!gates.isError, text(gates));
+      const liveOutput = Promise.withResolvers<void>();
+      const jobResult = await invoke("bash", { name: "  ", command: `${identityCommand}; printf "ASYNC_SCOPE=%s\\n" "\${OMP_SMOKE_SCOPE-unset}"; export OMP_SMOKE_SCOPE=background; printf LIVE_OUTPUT; IFS= read -r _ < '${asyncGate}'; printf DONE_OUTPUT`, async: true }, update => {
+        frames.push(update);
+        if (update.details?.async?.state === "running" && text(update).includes("LIVE_OUTPUT")) liveOutput.resolve();
+      });
       const jobId = (jobResult.details as any)?.async?.jobId; assert(jobId);
-      const waited = text(await invoke("wait", {}));
+      // Observe the running frame before releasing the producer, rather than
+      // assuming output callbacks beat a short sleep or the wait callback.
+      const liveTimeout = setTimeout(() => liveOutput.reject(new Error(`No live output from ${jobId}`)), 40000);
+      try {
+        await liveOutput.promise;
+      } catch (error) {
+        manager.cancel(jobId);
+        throw error;
+      } finally {
+        clearTimeout(liveTimeout);
+      }
+      const waited = text(await waitForGatedJob(jobId, asyncGate));
       assert(waited.includes(jobId));
-      const manager = session.asyncJobManager; assert(manager);
+      record("async-wait-returned", { jobId });
       const job = manager.getJob(jobId); assert(job); await job.promise;
       assert.equal(job.status, "completed");
       assert(job.resultText?.includes("ASYNC_SCOPE=unset"));
+      assert(job.resultText?.includes(expectedIdentity));
+      console.log("SESSION_ENV_ASYNC_PASS");
       assert(text(await invoke("bash", { command: 'printf "%s" "$OMP_SMOKE_SCOPE"' })).includes("foreground"));
       assert(frames.some(f => f.details?.async?.state === "running" && text(f).includes("LIVE_OUTPUT")));
       assert.equal(frames.at(-1)?.details?.async?.state, "completed");
@@ -95,33 +190,58 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       await assert.rejects(() => invoke("grep", { path: `proc://${jobId};proc://${service}`, pattern: "SERVICE" }), /Mixed local and remote/);
       console.log("PROCESS_ROUTING_PASS");
       console.log("SERVICE_PROC_READ_PASS");
-      await invoke("write", { path: `proc://${service}/kill`, content: "" });
-      console.log("SERVICE_STOP_PASS");
       const serviceJob = manager.getAllJobs().find(j => j.label === `Remote service: ${service}`); assert(serviceJob);
-      await serviceJob.promise;
-      assert.equal(serviceJob.status, "completed");
-      assert(serviceJob.resultText?.includes('"operation":"stop"'));
-      manager.consumeJobResults([serviceJob.id]);
-      assert(manager.isJobResultConsumed(serviceJob.id));
+      // This slash command is outside the native streaming loop. Claim the
+      // result before stopping it, as native wait does: watch, recover, consume,
+      // then unwatch. Consuming only after kill returns leaves an idle-yield gap.
+      manager.watchJobs([serviceJob.id]);
+      record("stop-watched", { jobId: serviceJob.id });
+      try {
+        await invoke("write", { path: `proc://${service}/kill`, content: "" });
+        console.log("SERVICE_STOP_PASS");
+        await serviceJob.promise;
+        assert.equal(serviceJob.status, "completed");
+        assert(serviceJob.resultText?.includes('"operation":"stop"'));
+        record("before-stop-consume", { jobId: serviceJob.id });
+        manager.consumeJobResults([serviceJob.id]);
+        assert(manager.isJobResultConsumed(serviceJob.id));
+        record("after-stop-consume", { jobId: serviceJob.id });
+      } finally {
+        manager.unwatchJobs([serviceJob.id]);
+        record("stop-unwatched", { jobId: serviceJob.id });
+      }
       console.log("SERVICE_STOP_TRACKING_PASS");
       const shortService = `${tag}-short`;
-      await invoke("bash", { name: shortService, command: "echo SHORT_READY; sleep 1; exit 7", pty: false, ready: { log: "SHORT_READY", timeout: 5 } });
+      await invoke("bash", { name: shortService, command: `echo SHORT_READY; IFS= read -r _ < '${serviceGate}'; exit 7`, pty: false, ready: { log: "SHORT_READY", timeout: 5 } });
       const shortJob = manager.getAllJobs().find(j => j.label === `Remote service: ${shortService}`); assert(shortJob);
-      const waitedService = await invoke("wait", {});
+      const waitedService = await waitForGatedJob(shortJob.id, serviceGate);
       const completed = (waitedService.details as { jobs?: { id: string; status: string; resultText?: string }[] })?.jobs?.find(j => j.id === shortJob.id);
       assert(completed, JSON.stringify(waitedService.details));
       assert.equal(completed.status, "completed", JSON.stringify(waitedService.details));
       assert(completed.resultText?.includes('"exitCode":7'));
+      record("natural-wait-returned", { jobId: shortJob.id });
       console.log("SERVICE_NATURAL_EXIT_PASS");
-      await invoke("bash", { command: `rm -- '${file}'` });
+      const removed = await invoke("bash", { command: `rm -- '${file}' '${asyncGate}' '${serviceGate}'` });
+      assert(!removed.isError, text(removed));
+      phase = "command:remote-exit";
+      record("disconnect");
       await commands.get("remote-exit")!.handler("", ctx); connected = false;
       assert.equal(text(await invoke("bash", { command: "hostname" })).trim(), local);
       assert.throws(() => readTool.approvalCacheTargets!(remoteArgs), /binding changed/);
       assert(readTool.approvalCacheTargets({ path: file })?.some(target => target.startsWith("/")));
+      for (const language of ["js", "py"]) {
+        const marker = `${tag}-local-${language}`;
+        const result = await invoke("eval", { language, code: `print(${JSON.stringify(marker)})`, title: `local ${language} restored` });
+        assert(!result.isError, text(result));
+        assert(text(result).includes(marker), `Local ${language} eval did not return its marker`);
+      }
+      console.log("LOCAL_EVAL_RESTORED_PASS");
       assert.equal(unexpectedModelTurns, 0, "An unconsumed completion tried to start a model turn");
       console.log("LIFECYCLE_SMOKE_PASS");
       process.exitCode = 0;
     } catch (error) {
+      record("smoke-error");
+      console.error("LIFECYCLE_JOB_DIAGNOSTICS", JSON.stringify(diagnostics));
       await Bun.write(Bun.stderr, `LIFECYCLE_SMOKE_ERROR ${error instanceof Error ? error.stack : String(error)}\n`);
       process.exitCode = 1;
     }
@@ -129,7 +249,7 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       session.clearQueue();
       if (connected) {
         await invoke("write", { path: `proc://${service}/kill`, content: "" }).catch(() => {});
-        await invoke("bash", { command: `rm -f -- '${file}'` }).catch(() => {});
+        await invoke("bash", { command: `rm -f -- '${file}' '${asyncGate}' '${serviceGate}'` }).catch(() => {});
         await commands.get("remote-exit")!.handler("--force", ctx).catch(console.error);
       }
       session.setClientBridge(originalBridge);

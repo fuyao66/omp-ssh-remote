@@ -24,11 +24,17 @@ export default async function captureSmoke(pi: ExtensionAPI) {
     assert(session, "Native session is required");
     const manager = session.asyncJobManager;
     assert(manager, "Native session job manager is required");
-    // Completion delivery must not trigger an unrelated paid model turn in this probe.
-    session.agent.continue = async () => {};
+    // This command consumes its own results; it must never start a model turn.
+    const originalBridge = session.clientBridge;
+    session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
+    let unexpectedModelTurns = 0;
+    const rejectModelTurn = async () => { unexpectedModelTurns++; throw new Error("Unexpected model turn in capture acceptance"); };
+    session.agent.prompt = rejectModelTurn;
+    session.agent.continue = rejectModelTurn;
     const jobs = new Set<string>();
     let connected = false;
     const previousWidgets = manager.widgets;
+    manager.widgets = undefined;
     let testWidgets: JobWidgets | undefined;
     let unsubscribe = () => {};
     const invoke = async (name: string, input: object, onUpdate?: (result: any) => void) => {
@@ -41,6 +47,7 @@ export default async function captureSmoke(pi: ExtensionAPI) {
       const id = r.details?.async?.jobId;
       assert.equal(typeof id, "string", "Expected background promotion, not a restarted/foreground command");
       jobs.add(id);
+      manager.watchJobs([id]);
       const job = manager.getJob(id);
       assert(job, `Local job ${id} missing`);
       return job;
@@ -49,6 +56,7 @@ export default async function captureSmoke(pi: ExtensionAPI) {
       if (!r.details?.async?.jobId) return text(r);
       const job = jobFor(r); await job.promise;
       assert.equal(job.status, "completed", job.errorText ?? "Remote job failed");
+      manager.consumeJobResults([job.id]);
       return job.resultText ?? "";
     };
     const pipeline = '{ for n in 1 2 3; do printf "step=%s\\n" "$n"; sleep 0.2; done; sleep 1.5; } | tail -1';
@@ -90,17 +98,20 @@ export default async function captureSmoke(pi: ExtensionAPI) {
       assert.deepEqual(pipelineJob.process?.streams?.read(1)?.data, Buffer.from("step=1\nstep=2\nstep=3\n"));
       assert.deepEqual(pipelineJob.process?.pids(), []);
       console.log("PIPE_CAPTURE_EXACT_PASS", pipelineJob.id);
-      unsubscribe(); testWidgets.dispose(); testWidgets = undefined; manager.widgets = previousWidgets;
+      manager.consumeJobResults([pipelineJob.id]);
+      unsubscribe(); testWidgets.dispose(); testWidgets = undefined; manager.widgets = undefined;
 
       // Threshold comes from the probe's CLI config; no user settings are written.
       const auto = jobFor(await invoke("bash", { command: `${sourceVariable}=kept; printf 'AUTO_START\\n'; sleep 1.5; printf 'AUTO_DONE\\n'`, timeout: 0 }));
       await auto.promise; assert.equal(auto.status, "completed", auto.errorText ?? "Automatic background job failed");
       assert.equal(auto.resultText?.match(/AUTO_START/g)?.length, 1, "Command output was replayed or restarted");
       assert(auto.resultText?.includes("AUTO_DONE"));
+      manager.consumeJobResults([auto.id]);
       assert((await resultText(await invoke("bash", { command: `printf 'state=%s\\n' "$${sourceVariable}"`, timeout: 0 }))).includes("state=kept"));
       const isolated = jobFor(await invoke("bash", { command: `printf 'state=%s\\n' "\${${sourceVariable}:-unset}"`, async: true, timeout: 0 }));
       await isolated.promise; assert.equal(isolated.status, "completed", isolated.errorText ?? "Isolated job failed");
       assert(isolated.resultText?.includes("state=unset"));
+      manager.consumeJobResults([isolated.id]);
       console.log("AUTO_BACKGROUND_PERSISTENCE_PASS");
       const cancel = jobFor(await invoke("bash", { command: "printf 'CANCEL_READY\\n'; sleep 30; printf 'NEVER_AFTER_CANCEL'", timeout: 0 }));
       await invoke("write", { path: `proc://${cancel.id}/kill`, content: "" }); await cancel.promise;
@@ -111,6 +122,7 @@ export default async function captureSmoke(pi: ExtensionAPI) {
       await commands.get("remote-exit")!.handler("", ctx); connected = false;
       assert.equal((await resultText(await invoke("bash", { command: "hostname" }))).split("\n")[0], localHost);
       assert.deepEqual(pipelineJob.process?.streams?.read(1)?.data, Buffer.from("step=1\nstep=2\nstep=3\n"));
+      assert.equal(unexpectedModelTurns, 0, "A completion tried to start a model turn");
       console.log("CAPTURE_SMOKE_PASS: exact pre-tail bytes, native widget numbers/rendering, automatic promotion, shell isolation, cancellation and retained local streams verified. Widget authoring used a deterministic model boundary, not a provider call.");
       process.exitCode = 0;
     } catch (error) { console.error(error); process.exitCode = 1; }
@@ -119,6 +131,10 @@ export default async function captureSmoke(pi: ExtensionAPI) {
       for (const id of jobs) manager.cancel(id);
       if (connected) await commands.get("remote-exit")!.handler("--force", ctx).catch(console.error);
       await Promise.all([...jobs].map(id => manager.getJob(id)?.promise));
+      manager.consumeJobResults([...jobs]);
+      manager.unwatchJobs([...jobs]);
+      session.clearQueue();
+      session.setClientBridge(originalBridge);
       process.exit(process.exitCode ?? 0);
     }
   } });

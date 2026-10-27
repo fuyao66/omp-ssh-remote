@@ -1,6 +1,10 @@
 import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { resolveOmpHostVersion } from "../src/omp/host-identity.ts";
+import {
+  resolveOmpBuildVersion,
+  resolveOmpNativeBuildVersion,
+  validateOmpNativeAddonPackage,
+} from "../src/omp/host-identity.ts";
 
 type Target = "arm64" | "x64";
 
@@ -12,7 +16,9 @@ if (targetArg !== "arm64" && targetArg !== "x64") {
 }
 const target: Target = targetArg;
 
-const hostVersion = await resolveOmpHostVersion();
+const root = resolve(import.meta.dir, "..");
+const hostVersion = await resolveOmpBuildVersion(root);
+const nativeVersion = await resolveOmpNativeBuildVersion(root);
 const archTag = target === "arm64" ? "linux-arm64" : "linux-x64";
 const bunTarget = target === "arm64" ? "bun-linux-arm64" : "bun-linux-x64";
 const addonFiles =
@@ -29,24 +35,29 @@ const addonFiles =
       ]
     : [{ variant: "default" as const, filename: `pi_natives.${archTag}.node` }];
 
-const root = resolve(import.meta.dir, "..");
-const cache = resolve(root, `.cache/native-${archTag}`, hostVersion);
+const cache = resolve(root, `.cache/native-${archTag}`, nativeVersion);
 const packageDir = resolve(cache, "package");
 const embeddedModule = resolve(cache, "embedded-addon.ts");
 const dist = resolve(root, "packages/omp/dist");
 const outfile = resolve(dist, `worker-linux-${target}`);
 await mkdir(dist, { recursive: true });
 await mkdir(cache, { recursive: true });
+async function verifyAddonPackage(): Promise<void> {
+  const manifest = JSON.parse(await readFile(resolve(packageDir, "package.json"), "utf8"));
+  validateOmpNativeAddonPackage(manifest, archTag, nativeVersion);
+}
+
 for (const file of addonFiles) {
   const addonPath = resolve(packageDir, file.filename);
   try {
+    await verifyAddonPackage();
     await stat(addonPath);
   } catch {
     const packed = Bun.spawnSync(
       [
         "npm",
         "pack",
-        `@oh-my-pi/pi-natives-${archTag}@${hostVersion}`,
+        `@oh-my-pi/pi-natives-${archTag}@${nativeVersion}`,
         "--pack-destination",
         cache,
         "--silent",
@@ -65,6 +76,7 @@ for (const file of addonFiles) {
         `Failed to extract ${archTag} native addon: ${extracted.stderr.toString()}`,
       );
     // Re-check after extraction
+    await verifyAddonPackage();
     await stat(addonPath);
   }
 }
@@ -85,7 +97,7 @@ await writeFile(
   `${imports.join("\n")}\n` +
     `export const embeddedAddon = {\n` +
     `  platformTag: ${JSON.stringify(archTag)},\n` +
-    `  version: ${JSON.stringify(hostVersion)},\n` +
+    `  version: ${JSON.stringify(nativeVersion)},\n` +
     `  files: [${fileSpecs.join(", ")}],\n` +
     `};\n`,
 );

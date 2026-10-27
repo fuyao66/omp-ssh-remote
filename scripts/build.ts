@@ -1,6 +1,6 @@
 import { mkdir, readdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
-import { resolveOmpHostVersion } from "../src/omp/host-identity.ts";
+import { resolveOmpBuildVersion } from "../src/omp/host-identity.ts";
 const root = resolve(import.meta.dir, "..");
 const ompOutdir = resolve(root, "packages/omp/dist");
 await mkdir(ompOutdir, { recursive: true });
@@ -17,7 +17,7 @@ await mkdir(ompOutdir, { recursive: true });
   }
 }
 {
-  const hostVersion = await resolveOmpHostVersion();
+  const hostVersion = await resolveOmpBuildVersion(root);
   const extension = await Bun.build({
     entrypoints: [resolve(root, "src/extension.ts")],
     outdir: ompOutdir,

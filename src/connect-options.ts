@@ -19,6 +19,15 @@ export type RemoteConnectRequest = {
   workerPath?: string;
 };
 
+export type RemoteConnectInput = {
+  target: unknown;
+  cwd?: unknown;
+  identity?: unknown;
+  port?: unknown;
+  knownHosts?: unknown;
+  worker?: unknown;
+};
+
 export type ConfiguredSshHost = {
   name: string;
   host: string;
@@ -48,6 +57,10 @@ function tokenize(args: string): string[] {
 
 function parsePort(value: unknown): number | undefined {
   if (value === undefined) return undefined;
+  if (
+    typeof value !== "number" &&
+    (typeof value !== "string" || !/^\d+$/.test(value))
+  ) return undefined;
   const port = typeof value === "number" ? value : Number(value);
   return Number.isInteger(port) && port >= 1 && port <= 65535
     ? port
@@ -185,6 +198,77 @@ export async function loadConfiguredSshHosts(
   return mergeConfiguredSshHosts(projectHosts, userHosts, sshConfigHosts);
 }
 
+function validateTarget(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    /[\s\x00-\x1f\x7f]/.test(value) ||
+    value.startsWith("-")
+  ) {
+    throw new Error(`Invalid SSH target: ${String(value)}`);
+  }
+  const parts = value.split("@");
+  const host = parts.at(-1)!;
+  const username = parts.length === 2 ? parts[0] : undefined;
+  const address = host.startsWith("[") && host.endsWith("]")
+    ? host.slice(1, -1)
+    : host;
+  if (
+    parts.length > 2 ||
+    (username !== undefined && !/^[A-Za-z0-9_.+-]+$/.test(username)) ||
+    (!isIP(address) && !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(host))
+  ) {
+    throw new Error(`Invalid SSH target: ${value}`);
+  }
+  return value;
+}
+
+function inputString(value: unknown, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") {
+    throw new Error(`Invalid ${name}: expected a string`);
+  }
+  return value;
+}
+
+export function parseConnectOptions(
+  options: RemoteConnectInput,
+  configuredHosts: readonly ConfiguredSshHost[] = [],
+): RemoteConnectRequest {
+  const requestedTarget = validateTarget(options.target);
+  const cwd = inputString(options.cwd, "remote cwd");
+  const identityFile = inputString(options.identity, "SSH identity");
+  const knownHostsFile = inputString(options.knownHosts, "SSH known-hosts file");
+  const workerPath = inputString(options.worker, "remote worker path");
+  const port = parsePort(options.port);
+  if (options.port !== undefined && port === undefined) {
+    throw new Error(`Invalid SSH port: ${String(options.port)}`);
+  }
+  const configured = requestedTarget.includes("@") || isIP(requestedTarget)
+    ? undefined
+    : configuredHosts.find((host) => host.name === requestedTarget);
+  const target = validateTarget(configured
+    ? `${configured.username ? `${configured.username}@` : ""}${configured.host}`
+    : requestedTarget);
+  const effectivePort = port ?? configured?.port;
+  if (effectivePort !== undefined && parsePort(effectivePort) === undefined) {
+    throw new Error(`Invalid SSH port: ${String(effectivePort)}`);
+  }
+
+  return {
+    target,
+    displayTarget: configured?.name ?? requestedTarget,
+    ...(configured ? { sshAlias: configured.name } : {}),
+    ...(cwd ? { cwd } : {}),
+    ...(effectivePort ? { port: effectivePort } : {}),
+    ...(identityFile ?? configured?.keyPath
+      ? { identityFile: identityFile ?? configured?.keyPath }
+      : {}),
+    ...(knownHostsFile ? { knownHostsFile } : {}),
+    ...(workerPath ? { workerPath } : {}),
+  };
+}
+
 export function parseConnectArgs(
   args: string,
   configuredHosts: readonly ConfiguredSshHost[] = [],
@@ -218,27 +302,12 @@ export function parseConnectArgs(
   if (positionals.length < 1 || positionals.length > 2) {
     throw new Error(USAGE);
   }
-  const requestedTarget = positionals[0]!;
-  const cwd = positionals[1];
-  const configured = requestedTarget.includes("@") || isIP(requestedTarget)
-    ? undefined
-    : configuredHosts.find((host) => host.name === requestedTarget);
-  const target = configured
-    ? `${configured.username ? `${configured.username}@` : ""}${configured.host}`
-    : requestedTarget;
-
-  return {
-    target,
-    displayTarget: configured?.name ?? requestedTarget,
-    ...(configured ? { sshAlias: configured.name } : {}),
-    ...(cwd ? { cwd } : {}),
-    ...(port ?? configured?.port
-      ? { port: port ?? configured?.port }
-      : {}),
-    ...(identityFile ?? configured?.keyPath
-      ? { identityFile: identityFile ?? configured?.keyPath }
-      : {}),
-    ...(knownHostsFile ? { knownHostsFile } : {}),
-    ...(workerPath ? { workerPath } : {}),
-  };
+  return parseConnectOptions({
+    target: positionals[0],
+    cwd: positionals[1],
+    port,
+    identity: identityFile,
+    knownHosts: knownHostsFile,
+    worker: workerPath,
+  }, configuredHosts);
 }

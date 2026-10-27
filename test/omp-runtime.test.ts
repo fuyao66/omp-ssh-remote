@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  captureOmpToolSnapshot,
   createOmpRuntimeHandshake,
   describeSchemaDrift,
   validateOmpReadyMessage,
@@ -93,6 +94,47 @@ describe("OMP capability admission", () => {
         }),
       ),
     ).toThrow(/schema is incompatible/);
+  });
+
+  test("negotiates the effective edit mode independently of matching schemas", () => {
+    for (const editMode of ["replace", "hashline"] as const) {
+      const handshake = createOmpRuntimeHandshake({ hostVersion: "18.12.6", localTools: toolsWith(), editMode });
+      expect(handshake.editMode).toBe(editMode);
+      expect(() => handshake.validateReady(ready({ editMode }))).not.toThrow();
+      expect(() => handshake.validateReady(ready({ editMode: editMode === "replace" ? "hashline" : "replace" }))).toThrow(/edit mode is incompatible/);
+      expect(() => handshake.validateReady(ready())).toThrow(/companion=unreported/);
+    }
+  });
+
+  test("rejects a changed edit grammar or wire name even when the JSON schema is identical", () => {
+    const local = toolsWith();
+    const edit = local.find(tool => tool.name === "edit")!;
+    edit.customFormat = { syntax: "lark", definition: "start: HASHLINE" };
+    edit.customWireName = "edit";
+    const handshake = createOmpRuntimeHandshake({ hostVersion: "18.12.6", localTools: local, editMode: "hashline" });
+    expect(() => handshake.validateReady(ready({ tools: local, editMode: "hashline" }))).not.toThrow();
+    for (const customFormat of [
+      undefined,
+      { syntax: "lark" as const, definition: "start: APPLY_PATCH" },
+      { syntax: "regex" as const, definition: "start: HASHLINE" },
+    ]) {
+      const tools = local.map(tool => tool.name === "edit" ? { ...tool, customFormat } : tool);
+      expect(() => handshake.validateReady(ready({ tools, editMode: "hashline" }))).toThrow(/edit language is incompatible/);
+    }
+    const renamed = local.map(tool => tool.name === "edit" ? { ...tool, customWireName: "apply_patch" } : tool);
+    expect(() => handshake.validateReady(ready({ tools: renamed, editMode: "hashline" }))).toThrow(/edit language is incompatible/);
+  });
+
+  test("captures live schema and language getters without keeping mutable grammar metadata", () => {
+    const format = { syntax: "lark" as const, definition: "start: original" };
+    const snapshot = captureOmpToolSnapshot({
+      name: "edit", parameters: { toJsonSchema: () => ({ type: "object", properties: { input: { type: "string" } } }) },
+      customFormat: format, customWireName: "edit",
+    });
+    format.definition = "start: changed";
+    expect(snapshot.parameters).toEqual({ type: "object", properties: { input: { type: "string" } } });
+    expect(snapshot.customFormat).toEqual({ syntax: "lark", definition: "start: original" });
+    expect(snapshot.customWireName).toBe("edit");
   });
 });
 

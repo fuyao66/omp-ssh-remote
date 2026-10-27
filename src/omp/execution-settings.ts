@@ -1,3 +1,6 @@
+import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
+import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+
 /**
  * Declarative forwarding of execution-domain OMP settings to the companion.
  *
@@ -8,8 +11,8 @@
  * deliberately not forwarded:
  *
  * - schema-affecting keys (`async.enabled`, `memory.backend`, `skillful`,
- *   `eval.*`, `edit.mode`) are pinned by the worker so the admission handshake
- *   stays deterministic;
+ *   `eval.*`) are pinned by the worker; effective `edit.mode` is negotiated
+ *   separately, after host model and environment overrides;
  * - approval keys (`bash.patterns`, `bash.allowCompoundCommands`) are evaluated
  *   locally by the native approval callback the wrapper preserves;
  * - `worktree.clone` would rewrite `git worktree add` into a call to the worker
@@ -105,13 +108,23 @@ export function isValidForwardedSetting(key: ForwardedSettingKey, value: unknown
  * defaults for everything the user never set and the handshake payload stays
  * small.
  */
-export function captureExecutionSettings(settings: SettingsReader): RemoteExecutionSettings {
+export function captureExecutionSettings(settings: SettingsReader): RemoteExecutionSettings;
+export function captureExecutionSettings(settings: Settings): RemoteExecutionSettings;
+export function captureExecutionSettings(settings: SettingsReader | Settings): RemoteExecutionSettings {
   const captured: RemoteExecutionSettings = {};
+  const nativeSettings = "rawValue" in settings ? settings as Settings : undefined;
   for (const key of FORWARDED_SETTING_KEYS) {
-    if (settings.isConfigured && !settings.isConfigured(key)) continue;
     let value: unknown;
     try {
-      value = settings.get(key);
+      if (nativeSettings) {
+        const setting = lookup(key);
+        if (!setting || setting.provenance(nativeSettings) === "default") continue;
+        value = setting.get(nativeSettings);
+      } else {
+        const reader = settings as SettingsReader;
+        if (reader.isConfigured && !reader.isConfigured(key)) continue;
+        value = reader.get(key);
+      }
     } catch {
       continue;
     }

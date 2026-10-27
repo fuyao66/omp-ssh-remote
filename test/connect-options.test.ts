@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   mergeConfiguredSshHosts,
   parseConnectArgs,
+  parseConnectOptions,
   type ConfiguredSshHost,
 } from "../src/connect-options.ts";
 
@@ -99,5 +100,152 @@ describe("remote connection aliases", () => {
     expect(() => parseConnectArgs("host /a /b")).toThrow("Usage:");
     expect(() => parseConnectArgs("host --port 0")).toThrow("Invalid SSH port");
     expect(() => parseConnectArgs("host --identity")).toThrow("Missing value");
+  });
+
+  test("keeps slash-command parsing for quoted paths and explicit flags", () => {
+    expect(parseConnectArgs(
+      `gpu-box "/srv/my project" --identity '/keys/my key' --port 2200`,
+      [gpuBox],
+    )).toMatchObject({
+      target: "developer@remote.example.com",
+      cwd: "/srv/my project",
+      identityFile: "/keys/my key",
+      port: 2200,
+    });
+  });
+});
+
+describe("structured remote connection options", () => {
+  test("uses configured target, identity, and port defaults", () => {
+    expect(parseConnectOptions({ target: "gpu-box" }, [gpuBox])).toEqual({
+      target: "developer@remote.example.com",
+      displayTarget: "gpu-box",
+      sshAlias: "gpu-box",
+      port: 2222,
+      identityFile: "~/.ssh/gpu-box.pem",
+    });
+  });
+
+  test("preserves spaces and literal quotes in each path field", () => {
+    const options = {
+      target: "gpu-box",
+      cwd: `/srv/a "quoted" project/it's here`,
+      identity: `/keys/my "private" key's file`,
+      knownHosts: `/keys/known "hosts" file`,
+      worker: `/srv/worker's "entry" file`,
+    };
+    expect(parseConnectOptions(options, [gpuBox])).toEqual({
+      target: "developer@remote.example.com",
+      displayTarget: "gpu-box",
+      sshAlias: "gpu-box",
+      cwd: options.cwd,
+      port: 2222,
+      identityFile: options.identity,
+      knownHostsFile: options.knownHosts,
+      workerPath: options.worker,
+    });
+  });
+
+  test("does not interpret CLI-looking path values as options", () => {
+    expect(parseConnectOptions({
+      target: "gpu-box",
+      cwd: "--port 1 --identity /injected/key",
+      identity: "--port 2 --worker /injected/worker",
+      knownHosts: "--identity",
+      worker: "--known-hosts",
+    }, [gpuBox])).toEqual({
+      target: "developer@remote.example.com",
+      displayTarget: "gpu-box",
+      sshAlias: "gpu-box",
+      cwd: "--port 1 --identity /injected/key",
+      port: 2222,
+      identityFile: "--port 2 --worker /injected/worker",
+      knownHostsFile: "--identity",
+      workerPath: "--known-hosts",
+    });
+  });
+
+  test("retains configured defaults when cwd resembles flags", () => {
+    const configured = {
+      ...gpuBox,
+      keyPath: `/keys/default "key" --port 1`,
+    };
+    expect(parseConnectOptions({
+      target: "gpu-box",
+      cwd: "--identity /replacement --port 1",
+    }, [configured])).toMatchObject({
+      cwd: "--identity /replacement --port 1",
+      identityFile: configured.keyPath,
+      port: 2222,
+    });
+  });
+
+  test("overrides configured defaults only with explicit fields", () => {
+    expect(parseConnectOptions({
+      target: "gpu-box",
+      port: 65535,
+      identity: "/keys/my key",
+    }, [gpuBox])).toMatchObject({
+      target: "developer@remote.example.com",
+      port: 65535,
+      identityFile: "/keys/my key",
+    });
+    expect(parseConnectOptions({ target: "host", port: 1 }).port).toBe(1);
+  });
+
+  test("does not resolve explicit user and IP targets through aliases", () => {
+    for (const target of ["developer@remote.example.com", "192.0.2.10", "::1"]) {
+      expect(parseConnectOptions({ target }, [{ ...gpuBox, name: target }]))
+        .toEqual({ target, displayTarget: target });
+    }
+    for (const target of ["user@[2001:db8::1]", "user@2001:db8::1"]) {
+      expect(parseConnectOptions({ target })).toEqual({
+        target,
+        displayTarget: target,
+      });
+    }
+  });
+
+  test("rejects invalid targets rather than parsing embedded flags", () => {
+    for (const target of [
+      undefined, null, 42, "", " ", "--port", "-host", "host --port 22",
+      '"host"', "user@", "@host", "user@@host", "user@-host",
+      "host:22", "host/path", "host\nother", "host\0other", "host;command",
+    ]) {
+      expect(() => parseConnectOptions({ target }, [gpuBox]))
+        .toThrow("Invalid SSH target");
+    }
+    expect(() => parseConnectArgs('"host --port 22"'))
+      .toThrow("Invalid SSH target");
+  });
+
+  test("rejects invalid ports without falling back to configured defaults", () => {
+    for (const port of [
+      0, -1, 65536, 1.5, NaN, Infinity, null, true, [], {},
+      "", " ", "22junk", "1.5", "--identity",
+    ]) {
+      expect(() => parseConnectOptions({ target: "gpu-box", port }, [gpuBox]))
+        .toThrow("Invalid SSH port");
+    }
+    expect(() => parseConnectArgs("gpu-box --port 65536", [gpuBox]))
+      .toThrow("Invalid SSH port");
+  });
+
+  test("validates resolved configured destinations and ports", () => {
+    expect(() => parseConnectOptions(
+      { target: "gpu-box" },
+      [{ ...gpuBox, host: "-bad-host" }],
+    )).toThrow("Invalid SSH target");
+    expect(() => parseConnectOptions(
+      { target: "gpu-box" },
+      [{ ...gpuBox, port: 65536 }],
+    )).toThrow("Invalid SSH port");
+  });
+
+  test("rejects non-string path fields", () => {
+    for (const field of ["cwd", "identity", "knownHosts", "worker"]) {
+      expect(() => parseConnectOptions({ target: "host", [field]: 123 }))
+        .toThrow("expected a string");
+    }
   });
 });

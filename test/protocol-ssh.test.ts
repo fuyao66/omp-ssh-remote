@@ -9,6 +9,7 @@ import {
   decodeFrames,
   parseMessage,
   parseRequest,
+  type Request,
 } from "../src/protocol.ts";
 import {
   buildSshBaseCommand,
@@ -61,6 +62,19 @@ describe("protocol boundaries", () => {
     expect(parseRequest(execute)).toEqual(execute);
     expect(() => parseRequest({ ...execute, steering: "true" })).toThrow("steering must be a boolean");
     expect(() => parseRequest({ type: "steer", id: 1 })).toThrow();
+  });
+  test("instance-scoped service stops require explicit identities", () => {
+    const request = { type: "service-stop", id: "stop-1", name: "service-1", instanceId: "generation-1" } satisfies Request;
+    expect(parseRequest(request)).toEqual(request);
+    for (const patch of [{ name: "" }, { name: "../wrong" }, { instanceId: "" }, { instanceId: " " }, { instanceId: 1 }, { id: "" }, { id: undefined }])
+      expect(() => parseRequest({ ...request, ...patch })).toThrow();
+  });
+  test("session owner is optional, nonblank when explicit, and preserved verbatim", () => {
+    const request = { type: "initialize", protocolVersion: PROTOCOL_VERSION, runtimeVersion: "test", cwd: "/tmp", tools: [] };
+    expect(parseRequest(request)).not.toHaveProperty("sessionId");
+    expect(parseRequest({ ...request, sessionId: " owner " })).toHaveProperty("sessionId", " owner ");
+    for (const sessionId of ["", " ", 7, null])
+      expect(() => parseRequest({ ...request, sessionId })).toThrow("sessionId");
   });
 });
 

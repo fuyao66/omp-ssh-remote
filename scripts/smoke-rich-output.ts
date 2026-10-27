@@ -13,6 +13,8 @@ export default async function(pi: ExtensionAPI) {
   } });
   await extension(proxy);
   pi.registerCommand("remote-rich-output-smoke", { description: "Compare native print views and literal data across SSH", async handler(_, ctx) {
+    const connectArgs = Bun.env.REMOTE_CONNECT_ARGS;
+    assert(typeof connectArgs === "string" && connectArgs.trim().length > 0, "Set REMOTE_CONNECT_ARGS to an SSH target and remote scratch directory");
     const session = AgentRegistry.global().list().find(ref => ref.sessionFile === ctx.sessionManager.getSessionFile())?.session;
     assert(session, "Native session missing");
     session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
@@ -56,7 +58,7 @@ export default async function(pi: ExtensionAPI) {
         if (sample.image) assert(result.content.some((block: any) => block.type === "image"), `${sample.name}: native control image missing`);
         local.set(sample.name, result);
       }
-      await commands.get("remote-connect")!.handler(Bun.env.REMOTE_CONNECT_ARGS ?? "trialsfinder /tmp", ctx); connected = true;
+      await commands.get("remote-connect")!.handler(connectArgs, ctx); connected = true;
       for (const sample of cases) {
         const result = await invoke("eval", { language: sample.language, code: sample.code, title: sample.name });
         const control = local.get(sample.name);

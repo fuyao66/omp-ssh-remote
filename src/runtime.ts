@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { resolveEditMode } from "@oh-my-pi/pi-coding-agent/utils/edit-mode";
 import { DebugTool } from "@oh-my-pi/pi-coding-agent/tools/debug";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
@@ -16,7 +19,11 @@ import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import {
   REMOTE_TOOL_NAMES,
+  parseResourceBinding,
+  isRecord,
   type RemoteToolName,
+  type OmpEditMode,
+  type ToolManifest,
 } from "./protocol.ts";
 import { pathShouldStayLocal } from "./path-domain.ts";
 import { createRemoteArtifacts } from "./omp/artifacts.ts";
@@ -24,10 +31,16 @@ import { resolveRemoteArtifactArgs } from "./omp/artifact-input.ts";
 import type { RemoteExecutionSettings } from "./omp/execution-settings.ts";
 import { createCapturedBashTool } from "./omp/captured-bash.ts";
 import type { JobCaptureSender } from "./omp/job-capture.ts";
+import { RemoteConflictHistory } from "./omp/conflict-resources.ts";
+import { bindRemoteResourceResult, resolveRemoteResourceArgs, resourceExecutionTarget } from "./resource-routing.ts";
+import type { executeOwnedRemoteService, stopRemoteServiceInstance, ServiceStopReceipt } from "./omp/service-lifecycle.ts";
 export interface RemoteNativeTool {
   readonly name: string;
   readonly description: string;
   readonly parameters: unknown;
+  readonly mode?: OmpEditMode;
+  readonly customFormat?: ToolManifest["customFormat"];
+  readonly customWireName?: string;
   execute(
     toolCallId: string,
     params: Record<string, unknown>,
@@ -92,7 +105,6 @@ class PendingInvokerQueueAdapter {
 const WORKER_OVERRIDES = {
   "async.enabled": false,
   "bash.autoBackground.enabled": false,
-  "launch.enabled": true,
   "lsp.enabled": true,
   "lsp.lazy": true,
   "lsp.shared": false,
@@ -108,9 +120,14 @@ const WORKER_OVERRIDES = {
 
 export type NativeWorkerRuntime = {
   cwd: string;
+  /** Effective native process owner, resolved once for this runtime. */
+  sessionId: string;
   tools: Readonly<Record<RemoteToolName, RemoteNativeTool>>;
+  editMode: OmpEditMode;
+  resourceBinding: string;
   session: ToolSession;
   createJobBash: (onCapture: JobCaptureSender, foreground?: boolean) => RemoteNativeTool;
+  stopService: (name: string, id: string) => Promise<ServiceStopReceipt>;
   /** Release runtime-owned host resources (the output artifact namespace). Idempotent. */
   dispose: () => Promise<void>;
 };
@@ -122,6 +139,17 @@ export type NativeWorkerRuntimeOptions = {
   onLaunchCompletion?: (notification: DaemonCompletionNotification) => void | Promise<void>;
   /** Execution-domain settings forwarded by the local host; structural pins win. */
   settings?: RemoteExecutionSettings;
+  /** Negotiated effective edit mode; shared by read's anchors and edit's parser. */
+  editMode?: OmpEditMode;
+  /** Service capability negotiated from the real host bash schema. */
+  bashServices?: boolean;
+  /** Shared workspace resource namespace; independent runtimes get a fresh id. */
+  resourceBinding?: string;
+  /** Worker-only broker adapter; frontend schema snapshots do not need it. */
+  serviceLifecycle?: {
+    execute: typeof executeOwnedRemoteService;
+    stop: typeof stopRemoteServiceInstance;
+  };
 };
 
 export async function createNativeWorkerRuntime(
@@ -129,6 +157,10 @@ export async function createNativeWorkerRuntime(
   hostVersion: string,
   options: NativeWorkerRuntimeOptions = {},
 ): Promise<NativeWorkerRuntime> {
+  const resourceBinding = parseResourceBinding(options.resourceBinding ?? randomUUID());
+  const sessionId = options.sessionId ?? `omp-ssh-remote:${randomUUID()}`;
+  if (typeof sessionId !== "string" || sessionId.trim().length === 0)
+    throw new Error("Remote sessionId must be a non-empty string");
   const resolvedCwd = resolve(cwd);
   const cwdStat = await stat(resolvedCwd);
   if (!cwdStat.isDirectory())
@@ -138,14 +170,16 @@ export async function createNativeWorkerRuntime(
   const settings = Settings.isolated({
     ...(options.settings ?? {}),
     ...WORKER_OVERRIDES,
+    "launch.enabled": options.bashServices ?? true,
+    ...(options.editMode === undefined ? {} : { "edit.mode": options.editMode }),
   });
   const mutationVersions = new Map<string, number>();
   const pendingInvokers = new PendingInvokerQueueAdapter();
   const xdevTools = new Map<string, RemoteNativeTool>();
   const xdevMountedNames = new Set<string>(["lsp", "ast_grep", "ast_edit", "debug"]);
   const callableTools = new Map<string, RemoteNativeTool>();
-  const sessionId = options.sessionId ?? `omp-ssh-remote:${hostVersion}`;
   const disposeCallbacks = new Set<() => void>();
+  const conflictHistory = new RemoteConflictHistory();
   const session: ToolSession = {
     cwd: absoluteCwd,
     hasUI: false,
@@ -155,6 +189,7 @@ export async function createNativeWorkerRuntime(
     hasEditTool: true,
     restrictToolNames: true,
     settings,
+    conflictHistory,
     getSessionFile: () => null,
     getSessionSpawns: () => "",
     getSessionId: () => sessionId,
@@ -198,11 +233,16 @@ export async function createNativeWorkerRuntime(
     peekPendingInvoker: () => pendingInvokers.peekPendingInvoker(),
     clearPendingInvokers: () => pendingInvokers.clearPendingInvokers(),
   };
+  const editMode = resolveEditMode(session);
+  if (options.editMode !== undefined && editMode !== options.editMode) {
+    await artifacts.dispose();
+    throw new Error(`Remote edit mode ${editMode} conflicts with negotiated ${options.editMode}; pin PI_EDIT_VARIANT before creating the worker runtime`);
+  }
 
   const tools: Record<RemoteToolName, RemoteNativeTool> = {
     read: asRemoteNativeTool(new ReadTool(session)),
     write: asRemoteNativeTool(new WriteTool(session)),
-    edit: asRemoteNativeTool(new EditTool(session)),
+    edit: asRemoteNativeTool(new EditTool(session, editMode)),
     bash: asRemoteNativeTool(new BashTool(session)),
     grep: asRemoteNativeTool(new GrepTool(session)),
     glob: asRemoteNativeTool(new GlobTool(session, { rootPathAlias: true })),
@@ -212,13 +252,30 @@ export async function createNativeWorkerRuntime(
     eval: asRemoteNativeTool(new EvalTool(session)),
     debug: asRemoteNativeTool(new DebugTool(session)),
   };
+  const read = tools.read.execute.bind(tools.read);
+  tools.read.execute = (...args) => conflictHistory.captureRead(() => read(...args));
   const publishTool = (tool: RemoteNativeTool): RemoteNativeTool => {
     const execute = tool.execute.bind(tool);
-    tool.execute = async (id, params, signal, onUpdate, context) => artifacts.publish(
-      await execute(id, await resolveRemoteArtifactArgs(tool.name, params), signal,
-        onUpdate ? (value) => onUpdate(artifacts.publish(value, tool.name)) : undefined, context),
-      tool.name,
-    );
+    tool.execute = async (id, params, signal, onUpdate, context) => {
+      const resolved = await resolveRemoteArtifactArgs(tool.name, params);
+      const update = onUpdate ? (value: unknown) => onUpdate(artifacts.publish(value, tool.name)) : undefined;
+      const serviceName = tool.name === "bash" && typeof resolved.name === "string" ? resolved.name.trim() : "";
+      const callContext = isRecord(context) ? context : {};
+      const toolCall = isRecord(callContext.toolCall) ? callContext.toolCall : {};
+      const result = artifacts.publish(
+        serviceName && options.serviceLifecycle
+          ? await options.serviceLifecycle.execute(absoluteCwd, sessionId, serviceName, (steeringSignal) =>
+            execute(id, resolved, undefined, update, { ...callContext, toolCall: { ...toolCall, steeringSignal } }),
+            signal, toolCall.steeringSignal instanceof AbortSignal ? toolCall.steeringSignal : undefined)
+          : await execute(id, resolved, signal, update, context),
+        tool.name,
+      );
+      // Bind only after native artifact footers have been published. Eval's
+      // tool.read(...).text then carries owned references without metadata.
+      return tool.name === "read"
+        ? bindRemoteResourceResult("read", params, result as AgentToolResult, resourceBinding)
+        : result;
+    };
     return tool;
   };
   Object.values(tools).forEach(publishTool);
@@ -232,12 +289,13 @@ export async function createNativeWorkerRuntime(
       description: tool.description,
       parameters: tool.parameters,
       async execute(toolCallId, params, signal, onUpdate, context) {
-        if (pathShouldStayLocal(name, params)) {
+        const resourceTarget = resourceExecutionTarget(name, params, resourceBinding);
+        if (!resourceTarget && pathShouldStayLocal(name, params, editMode)) {
           throw new Error(
             `Eval tool.${name} cannot access local internal URIs from the remote runtime`,
           );
         }
-        return tool.execute(toolCallId, params, signal, onUpdate, context);
+        return tool.execute(toolCallId, resolveRemoteResourceArgs(name, params, resourceBinding), signal, onUpdate, context);
       },
     });
   }
@@ -246,11 +304,18 @@ export async function createNativeWorkerRuntime(
   let disposed: Promise<void> | undefined;
   const dispose = () => (disposed ??= artifacts.dispose());
   return {
-    cwd: absoluteCwd, tools, session, dispose,
+    cwd: absoluteCwd, sessionId, tools, session, editMode, resourceBinding, dispose,
+    stopService: async (name, id) => {
+      if (!options.serviceLifecycle) throw new Error("Remote service lifecycle is unavailable in this runtime");
+      return options.serviceLifecycle.stop(absoluteCwd, name, id);
+    },
     createJobBash: (onCapture, foreground = false) => {
-      const jobSessionId = foreground ? sessionId : `${sessionId}:async:${crypto.randomUUID()}`;
-      const jobSettings = Settings.isolated({ ...(options.settings ?? {}), ...WORKER_OVERRIDES, "async.enabled": true });
-      return publishTool(createCapturedBashTool({ ...session, settings: jobSettings, getSessionId: () => jobSessionId }, onCapture, foreground));
+      const jobSettings = Settings.isolated({
+        ...(options.settings ?? {}), ...WORKER_OVERRIDES, "edit.mode": editMode, "async.enabled": true,
+        "launch.enabled": options.bashServices ?? true,
+      });
+      // Native managed bash isolates shells by the capture job's UUID, not owner identity.
+      return publishTool(createCapturedBashTool({ ...session, settings: jobSettings }, onCapture, foreground));
     },
   };
 }

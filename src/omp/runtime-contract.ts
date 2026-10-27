@@ -4,6 +4,8 @@ import {
   TOOL_RUNTIME_VERSION,
   isRecord,
   type ReadyMessage,
+  type OmpEditMode,
+  type ToolManifest,
 } from "../protocol.ts";
 import type {
   RemoteRuntimeHandshake,
@@ -13,11 +15,15 @@ import type {
 export interface OmpLocalToolSnapshot {
   name: string;
   parameters?: unknown;
+  customFormat?: ToolManifest["customFormat"];
+  customWireName?: string;
 }
 
 export interface OmpRuntimeHandshakeOptions {
   hostVersion: string;
   localTools?: readonly OmpLocalToolSnapshot[];
+  /** Effective native edit mode resolved against the real host session/model. */
+  editMode?: OmpEditMode;
 }
 
 /**
@@ -73,6 +79,18 @@ export function toolParametersToWire(parameters: unknown): unknown {
   return parameters;
 }
 
+/** Capture getters now: live native tool metadata may change with the active model. */
+export function captureOmpToolSnapshot(tool: OmpLocalToolSnapshot): OmpLocalToolSnapshot {
+  const customFormat = tool.customFormat;
+  const customWireName = tool.customWireName;
+  return {
+    name: tool.name,
+    parameters: toolParametersToWire(tool.parameters),
+    ...(customFormat === undefined ? {} : { customFormat: { ...customFormat } }),
+    ...(customWireName === undefined ? {} : { customWireName }),
+  };
+}
+
 
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
@@ -86,6 +104,33 @@ function canonicalize(value: unknown): unknown {
 
 export function stableJson(value: unknown): string {
   return JSON.stringify(canonicalize(value));
+}
+
+/**
+ * Only `async` is owned by the local job adapter (which removes it before
+ * transport). Service name/readiness and every execution field stay exact.
+ * Apply to host metadata only: companions must advertise the execution schema.
+ */
+export function projectOmpBashExecutionSchema(parameters: unknown): unknown {
+  if (!isRecord(parameters) || !isRecord(parameters.properties) || !("async" in parameters.properties))
+    return parameters;
+  if (stableJson(parameters.properties.async) !== stableJson({ type: "boolean" }) ||
+      (Array.isArray(parameters.required) && parameters.required.includes("async"))) {
+    throw new Error("Local OMP bash async schema is incompatible with the adapter: expected an optional boolean");
+  }
+  return {
+    ...parameters,
+    properties: Object.fromEntries(Object.entries(parameters.properties).filter(([key]) => key !== "async")),
+  };
+}
+
+function bashServicesFromSchema(parameters: unknown): boolean {
+  const properties = isRecord(parameters) && isRecord(parameters.properties) ? parameters.properties : {};
+  const name = "name" in properties;
+  const ready = "ready" in properties;
+  if (name !== ready)
+    throw new Error("Local OMP bash service schema is incompatible: name and ready must be exposed together");
+  return name;
 }
 
 function isObjectSchema(value: unknown): boolean {
@@ -104,6 +149,7 @@ export function validateOmpReadyMessage(
   ready: ReadyMessage,
   localTools?: readonly OmpLocalToolSnapshot[],
   localHostVersion?: string,
+  localEditMode?: OmpEditMode,
 ): void {
   if (ready.host !== undefined && ready.host !== "omp") {
     throw new Error(
@@ -118,6 +164,11 @@ export function validateOmpReadyMessage(
   }
   if (!hostVersion) {
     throw new Error("Remote OMP runtime did not report a host version");
+  }
+  if (localEditMode !== undefined && ready.editMode !== localEditMode) {
+    throw new Error(
+      `Remote OMP edit mode is incompatible: host=${localEditMode}, companion=${ready.editMode ?? "unreported"}`,
+    );
   }
 
   const available = new Map(
@@ -153,13 +204,21 @@ export function validateOmpReadyMessage(
         `Remote OMP tool ${name} has an invalid parameter schema`,
       );
     }
-    if (stableJson(remote.parameters) !== stableJson(local.parameters)) {
+    const localParameters = name === "bash" ? projectOmpBashExecutionSchema(local.parameters) : local.parameters;
+    if (stableJson(remote.parameters) !== stableJson(localParameters)) {
       const drift = describeSchemaDrift(
-        local.parameters,
+        localParameters,
         remote.parameters,
       );
       throw new Error(
         `Remote OMP tool ${name} schema is incompatible with the local tool${drift ? ` (${drift})` : ""}; ${versionDriftHint(localHostVersion, hostVersion)}`,
+      );
+    }
+    if (name === "edit" &&
+        (stableJson(local.customFormat) !== stableJson(remote.customFormat) ||
+         local.customWireName !== remote.customWireName)) {
+      throw new Error(
+        `Remote OMP edit language is incompatible with the local tool (custom grammar or wire name changed); ${versionDriftHint(localHostVersion, hostVersion)}`,
       );
     }
   }
@@ -168,13 +227,18 @@ export function validateOmpReadyMessage(
 export function createOmpRuntimeHandshake(
   options: OmpRuntimeHandshakeOptions,
 ): RemoteRuntimeHandshake {
+  const localTools = options.localTools?.map(captureOmpToolSnapshot);
+  const bash = localTools?.find(tool => tool.name === "bash");
+  const bashServices = bash === undefined ? undefined : bashServicesFromSchema(bash.parameters);
   return {
     host: "omp",
     hostVersion: options.hostVersion,
     runtimeVersion: TOOL_RUNTIME_VERSION,
+    ...(options.editMode === undefined ? {} : { editMode: options.editMode }),
+    ...(bashServices === undefined ? {} : { bashServices }),
     requestedTools: REMOTE_TOOL_NAMES,
     validateReady: (ready) =>
-      validateOmpReadyMessage(ready, options.localTools, options.hostVersion),
+      validateOmpReadyMessage(ready, localTools, options.hostVersion, options.editMode),
   };
 }
 

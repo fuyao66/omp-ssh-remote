@@ -156,4 +156,39 @@ describe("workspace approval targets", () => {
       }
     }
   });
+  test("classifies bound conflicts identically for approval and execution", () => {
+    const state: ApprovalTargetState = { selected: true, binding: "remote-one", proposalSources: [] };
+    const metadata = remoteWrapperApproval("write", "write", () => ["native-local"], () => state);
+    expect(metadata.approvalCacheTargets({ path: "conflict://1", content: "@ours" })).toEqual(["native-local"]);
+    expect(metadata.approvalCacheTargets({ path: "remote-conflict://remote-one/1", content: "@ours" })?.[0]).toStartWith("remote-request\0");
+    expect(() => metadata.approvalCacheTargets({ path: "remote-conflict://remote-old/1", content: "@ours" })).toThrow("stale workspace binding");
+    state.selected = false;
+    expect(() => metadata.approvalCacheTargets({ path: "remote-conflict://remote-one/1", content: "@ours" })).toThrow("stale workspace binding");
+  });
+
+  test("native conflict aliases cannot acquire remote approval targets after reconnect", () => {
+    const state: ApprovalTargetState = { selected: true, binding: "remote-current", proposalSources: [] };
+    for (const name of ["read", "write"] as const) {
+      const metadata = remoteWrapperApproval(name, "write", () => ["native-local"], () => state);
+      for (const path of ["file:conflict://1", "[conflict://1#ABCD]", "[file:conflict://1#ABCD]", "remote-conflict://old-binding/1:conflict://1"]) {
+        expect(metadata.approvalCacheTargets({ path, content: "@ours" })).toEqual(["native-local"]);
+      }
+      expect(() => metadata.approvalCacheTargets({ path: "[remote-conflict://old-binding/1#ABCD]", content: "@ours" })).toThrow("stale workspace binding");
+      expect(metadata.approvalCacheTargets({ path: "[remote-conflict://remote-current/1#ABCD]", content: "@ours" })?.[0]).toStartWith("remote-request\0");
+    }
+  });
+
+  test("uses native effective edit mode and rejects cross-domain move grants", () => {
+    const state: ApprovalTargetState = { selected: true, binding: "remote", proposalSources: [], editMode: "replace" };
+    const metadata = remoteWrapperApproval("edit", "write", () => ["native-local"], () => state);
+    expect(metadata.approvalCacheTargets({ path: "local://a", old_string: "a", new_string: "b" })).toEqual(["native-local"]);
+    expect(metadata.approvalCacheTargets({ path: "file", old_string: "a", new_string: "b" })?.[0]).toStartWith("remote-request\0");
+    state.editMode = "hashline";
+    for (const [from, to] of [["file", "local://a"], ["local://a", "file"]]) {
+      const args = { input: `*** Begin Patch\n[${from}#AB12]\nMV ${to}\n*** End Patch` };
+      expect(() => resolveApproval({ name: "edit", ...metadata }, args, "yolo")).toThrow("cannot mix");
+      expect(() => metadata.approvalCacheTargets(args)).toThrow("cannot mix");
+      expect(() => metadata.assertBinding(args)).toThrow("cannot mix");
+    }
+  });
 });

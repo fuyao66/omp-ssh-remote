@@ -3,7 +3,8 @@ import type { ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { RemoteConnectRequest } from "../connect-options.ts";
 import { normalizePathArgument, pathShouldStayLocal } from "../path-domain.ts";
-import type { RemoteToolName } from "../protocol.ts";
+import type { OmpEditMode, RemoteToolName } from "../protocol.ts";
+import { resourceExecutionTarget } from "../resource-routing.ts";
 import { resolveLocalAsyncJobManager } from "./async-bash.ts";
 import { processExecutionTarget } from "./process-routing.ts";
 
@@ -12,6 +13,7 @@ export type ApprovalTargetState = {
   binding: string;
   remoteCwd?: string;
   sessionFile?: string;
+  editMode?: OmpEditMode;
   proposalSources: readonly ("local" | "remote")[];
   family?: { connection: RemoteConnectRequest };
 };
@@ -19,6 +21,8 @@ export type ApprovalTargetState = {
 type CacheTargets = (args: unknown) => readonly string[] | undefined;
 
 function localTargets(name: RemoteToolName, args: Record<string, unknown>, state: ApprovalTargetState): boolean {
+  const resourceTarget = resourceExecutionTarget(name, args, state.selected ? state.binding : undefined);
+  if (resourceTarget) return false;
   if (!state.selected) return true;
   const processTarget = processExecutionTarget(name, args, id =>
     AgentRegistry.global().list().some(agent => agent.id === id)
@@ -33,11 +37,11 @@ function localTargets(name: RemoteToolName, args: Record<string, unknown>, state
       // Actual dispatch also checks device availability asynchronously. A possible
       // remote dispatch must not reuse a local grant, even if it later stays local.
       return inner === null || typeof inner !== "object" || Array.isArray(inner)
-        || pathShouldStayLocal(device as RemoteToolName, inner as Record<string, unknown>);
+        || pathShouldStayLocal(device as RemoteToolName, inner as Record<string, unknown>, state.editMode);
     }
     if (device) return true;
   }
-  return pathShouldStayLocal(name, args);
+  return pathShouldStayLocal(name, args, state.editMode);
 }
 
 function stableValue(value: unknown): unknown {

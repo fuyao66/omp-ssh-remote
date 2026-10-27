@@ -1,6 +1,26 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
 import { pathShouldStayLocal } from "../path-domain.ts";
 import type { RemoteToolName } from "../protocol.ts";
+
+/** Use the same selector peeling and authority decoding as the native tools. */
+function processResource(path: string) {
+  const router = InternalUrlRouter.instance();
+  const bare = router.split(path).path;
+  if (!/^proc:\/\//i.test(bare)) return;
+  const url = parseInternalUrl(bare);
+  return url.protocol.toLowerCase() === "proc:" ? url : undefined;
+}
+
+/** Empty authority + root pathname lists both domains, never a concrete id. */
+export function isProcessListingPath(path: unknown): boolean {
+  if (typeof path !== "string" || path.includes(";")) return false;
+  const url = processResource(path);
+  const pathname = url?.rawPathname ?? url?.pathname;
+  return !!url && !url.rawHost && (pathname === "" || pathname === "/") &&
+    !url.search && !url.hash;
+}
 
 /** A multi-resource read/grep cannot send a local job to a remote broker. */
 export function processExecutionTarget(
@@ -10,10 +30,11 @@ export function processExecutionTarget(
 ): "local" | "remote" | undefined {
   if (typeof params.path !== "string") return undefined;
   const paths = params.path.split(";");
-  const ids = paths.map(path => /^proc:\/\/([^/:;?#]+)(?:\/|:|\?|#|$)/.exec(path)?.[1]);
-  if (!ids.some(Boolean)) return undefined;
+  const ids = paths.map(path => processResource(path)?.rawHost);
+  if (!ids.some(Boolean) && !paths.some(isProcessListingPath)) return undefined;
   const targets = paths.map((path, index) => ids[index]
     ? isLocalId(ids[index]!) ? "local" : "remote"
+    : isProcessListingPath(path) ? "remote"
     : pathShouldStayLocal(tool, { ...params, path }) ? "local" : "remote");
   if (new Set(targets).size > 1) throw new Error("Mixed local and remote process resources are not supported; read or search each execution domain separately");
   return targets[0];

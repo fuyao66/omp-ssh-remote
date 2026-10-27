@@ -93,7 +93,8 @@ export function buildSshBaseCommand(options: SshConnectionOptions): string[] {
 }
 
 export function buildScpBaseCommand(options: SshConnectionOptions): string[] {
-  const command = ["scp"];
+  // Destinations are shell-quoted: pin SCP rather than the SFTP default in OpenSSH 9+.
+  const command = ["scp", "-O"];
   appendCommonOptions(command, options);
   command.push(
     "-o",

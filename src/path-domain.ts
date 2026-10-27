@@ -1,4 +1,7 @@
-import type { RemoteToolName } from "./protocol.ts";
+import { editInspect, type EditInspection } from "@oh-my-pi/pi-natives";
+import { recoverConflictUriPrefix } from "@oh-my-pi/pi-coding-agent/tools/conflict-detect";
+import { unwrapHashlineHeaderPath } from "@oh-my-pi/pi-coding-agent/tools/plan-mode-guard";
+import type { OmpEditMode, RemoteToolName } from "./protocol.ts";
 
 const URI_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 
@@ -8,14 +11,12 @@ export function isInternalUri(path: string): boolean {
 
 export function normalizePathArgument(value: unknown): string {
   if (typeof value !== "string") return "";
-  const trimmed = value.trim();
-  const hashline = /^\[([^\]]+)#[A-F0-9]{4,}\]$/.exec(trimmed);
-  return hashline?.[1] ?? trimmed;
+  return recoverConflictUriPrefix(unwrapHashlineHeaderPath(value.trim())).path;
 }
 
 function classifyPathDomains(paths: string[]): boolean {
-  const concrete = paths.map((path) => path.trim()).filter(Boolean);
-  const isRemote = (path: string) => !isInternalUri(path) || path.startsWith("remote-artifact://") || path.startsWith("proc://");
+  const concrete = paths.map(normalizePathArgument).filter(Boolean);
+  const isRemote = (path: string) => !isInternalUri(path) || path.startsWith("remote-artifact://") || path.startsWith("proc://") || path.startsWith("remote-conflict://");
   const hasLocal = concrete.some((path) => !isRemote(path));
   const hasRemote = concrete.some(isRemote);
   if (hasLocal && hasRemote) {
@@ -29,6 +30,7 @@ function classifyPathDomains(paths: string[]): boolean {
 export function pathShouldStayLocal(
   tool: RemoteToolName,
   params: Record<string, unknown>,
+  editMode: OmpEditMode = "hashline",
 ): boolean {
   if (tool === "bash" || tool === "eval") return false;
   if (tool === "debug") {
@@ -38,16 +40,22 @@ export function pathShouldStayLocal(
     return classifyPathDomains(paths);
   }
   if (tool === "edit") {
-    const input = typeof params.input === "string" ? params.input : "";
-    const paths = input
-      .split("\n")
-      .filter((line) => line.startsWith("[") && line.endsWith("]"))
-      .map((line) =>
-        line
-          .slice(1, -1)
-          .replace(/^\*\*\* Update File:\s*/, "")
-          .replace(/#[A-F0-9]{4,}$/, ""),
-      );
+    if (!["replace", "patch", "apply_patch", "hashline", "sloppy"].includes(editMode)) {
+      throw new Error(`Cannot classify edit paths for unsupported mode: ${editMode}`);
+    }
+    let inspection: EditInspection;
+    try {
+      inspection = editInspect(editMode, JSON.stringify(params));
+    } catch {
+      throw new Error(`Cannot classify edit paths: native ${editMode} patch inspection failed`);
+    }
+    const paths = [...inspection.paths];
+    for (const op of inspection.fileOps) {
+      if (op.kind === "move" && op.to !== undefined) paths.push(op.to);
+    }
+    if (paths.length === 0) {
+      throw new Error(`Cannot classify edit paths: native ${editMode} patch inspection found no targets`);
+    }
     return classifyPathDomains(paths);
   }
   const paths: string[] = [];

@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
   FORWARDED_SETTING_KEYS,
   captureExecutionSettings,
   isValidForwardedSetting,
   parseExecutionSettings,
 } from "../src/omp/execution-settings.ts";
-import { parseRequest } from "../src/protocol.ts";
+import { parseMessage, parseRequest } from "../src/protocol.ts";
 
 describe("execution settings whitelist", () => {
   test("captures only configured, valid, whitelisted keys", () => {
@@ -22,6 +23,21 @@ describe("execution settings whitelist", () => {
       isConfigured: (path) => configured.has(path),
     });
     expect(captured).toEqual({ "tools.maxTimeout": 120, "edit.fuzzyMatch": false });
+  });
+
+  test("captures actual OMP registry settings without a legacy Settings.get(string) API", () => {
+    const settings = Settings.isolated({
+      "tools.maxTimeout": 123,
+      "edit.enforceSeenLines": false,
+      "read.defaultLimit": 321,
+      "edit.mode": "replace",
+    });
+    expect(captureExecutionSettings(settings)).toMatchObject({
+      "tools.maxTimeout": 123,
+      "edit.enforceSeenLines": false,
+      "read.defaultLimit": 321,
+    });
+    expect(captureExecutionSettings(settings)).not.toHaveProperty("edit.mode");
   });
 
   test("schema-affecting and approval keys are not in the whitelist", () => {
@@ -85,6 +101,28 @@ describe("protocol carries settings and tool names", () => {
     );
     expect(message).toMatchObject({ type: "initialize", settings: { "tools.maxTimeout": 30 } });
     expect((message as { settings?: Record<string, unknown> }).settings).not.toHaveProperty("edit.mode");
+  });
+
+  test("initialize and ready validate effective edit mode and preserve the edit grammar", () => {
+    const initialize = {
+      type: "initialize", protocolVersion: 1, host: "omp", runtimeVersion: "test",
+      cwd: "/tmp", tools: ["edit"], editMode: "replace",
+    };
+    expect(parseRequest(initialize)).toMatchObject({ editMode: "replace" });
+    for (const editMode of ["unsupported", 42, null])
+      expect(() => parseRequest({ ...initialize, editMode })).toThrow(/editMode/);
+    const tool = {
+      name: "edit", description: "edit", parameters: { type: "object" },
+      customFormat: { syntax: "lark", definition: "start: PATCH" }, customWireName: "apply_patch",
+    };
+    const ready = { type: "ready", protocolVersion: 1, tools: [tool], editMode: "hashline" };
+    expect(parseMessage(JSON.stringify(ready))).toMatchObject({ editMode: "hashline", tools: [tool] });
+    const regexTool = { ...tool, customFormat: { syntax: "regex", definition: ".*" } };
+    expect(parseMessage(JSON.stringify({ ...ready, tools: [regexTool] }))).toMatchObject({ tools: [regexTool] });
+    expect(() => parseMessage(JSON.stringify({ ...ready, editMode: false }))).toThrow(/editMode/);
+    for (const customFormat of [{ syntax: "json", definition: ".*" }, { syntax: "regex", definition: 1 }, { syntax: "lark", definition: 1 }, null])
+      expect(() => parseMessage(JSON.stringify({ ...ready, tools: [{ ...tool, customFormat }] }))).toThrow(/customFormat/);
+    expect(() => parseMessage(JSON.stringify({ ...ready, tools: [{ ...tool, customWireName: 1 }] }))).toThrow(/customWireName/);
   });
 
   test("execute accepts toolNames and rejects non-string entries", () => {

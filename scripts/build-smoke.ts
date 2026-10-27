@@ -1,10 +1,11 @@
 import { resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "..");
-const requested = process.argv[2] ?? "all";
+// cache-mc uses the same helper, with installed MC selected explicitly at runtime.
+const requested = process.argv[2] === "cache-mc" ? "cache" : (process.argv[2] ?? "all");
 const names = ["cache", "lifecycle", "capture", "rich-output"] as const;
 if (requested !== "all" && !names.some(name => name === requested)) {
-  throw new Error("Usage: bun scripts/build-smoke.ts [all|cache|lifecycle|capture|rich-output]");
+  throw new Error("Usage: bun scripts/build-smoke.ts [all|cache|cache-mc|lifecycle|capture|rich-output]");
 }
 for (const name of names.filter(name => requested === "all" || name === requested)) {
   const result = await Bun.build({

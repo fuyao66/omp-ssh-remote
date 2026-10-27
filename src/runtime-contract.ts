@@ -1,4 +1,4 @@
-import type { ReadyMessage } from "./protocol.ts";
+import type { OmpEditMode, ReadyMessage } from "./protocol.ts";
 
 export type RemoteWorkerHost = "omp";
 
@@ -7,6 +7,8 @@ export interface RemoteRuntimeHandshake {
   hostVersion: string;
   runtimeVersion: string;
   requestedTools: readonly string[];
+  editMode?: OmpEditMode;
+  bashServices?: boolean;
   validateReady(ready: ReadyMessage): void;
 }
 

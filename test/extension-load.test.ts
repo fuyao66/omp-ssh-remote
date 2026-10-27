@@ -62,10 +62,10 @@ describe("OMP extension loading", () => {
         remoteWorkspaceTools: [],
         pendingRemoteAstProposals: 0,
         hostCompatibility: {
-          installedHostVersion: expect.any(String),
+          installedHostVersion: null,
           compiledHostVersion: null,
           compatible: false,
-          advice: expect.stringContaining("not built with a pinned OMP version"),
+          advice: expect.stringContaining("Could not determine the running OMP version"),
         },
         routing: {
           ordinaryFilesystemPaths: "local native tools",

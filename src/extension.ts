@@ -11,12 +11,13 @@ import { toolRenderers } from "@oh-my-pi/pi-tui/tools";
 import {
   loadConfiguredSshHosts,
   parseConnectArgs,
+  parseConnectOptions,
   type RemoteConnectRequest,
 } from "./connect-options.ts";
 import { RemoteRuntimeClient } from "./client.ts";
 import { prepareRemoteWorker, resolveRemoteHome } from "./deploy.ts";
-import { REMOTE_TOOL_NAMES, type RemoteToolName } from "./protocol.ts";
-import { createOmpRuntimeHandshake, toolParametersToWire } from "./omp/runtime-contract.ts";
+import { REMOTE_TOOL_NAMES, type RemoteToolName, type ReadyMessage } from "./protocol.ts";
+import { createOmpRuntimeHandshake, captureOmpToolSnapshot } from "./omp/runtime-contract.ts";
 import { ompHostCompatibility, resolveOmpHostVersion, type OmpHostCompatibility } from "./omp/host-identity.ts";
 import { createNativeWorkerRuntime } from "./runtime.ts";
 import {
@@ -36,14 +37,16 @@ import {
 import { startRemoteService, completeService, completeStoppedService } from "./omp/service-jobs.ts";
 import { withReadinessSteering } from "./omp/readiness-steering.ts";
 import { remoteWrapperApproval } from "./omp/approval-targets.ts";
-import { processExecutionTarget, mergeProcessListings } from "./omp/process-routing.ts";
+import { isProcessListingPath, processExecutionTarget, mergeProcessListings } from "./omp/process-routing.ts";
 import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { VERSION as INSTALLED_OMP_VERSION } from "@oh-my-pi/pi-utils";
 import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { captureExecutionSettings, type RemoteExecutionSettings } from "./omp/execution-settings.ts";
-import { WORKSPACE_RULES, WORKSPACE_CONTEXT_ENTRY, projectWorkspaceContext, type WorkspaceNoticeAnchor } from "./omp/workspace-context.ts";
+import { WORKSPACE_RULES, workspaceAnnouncement, type WorkspaceBindingNotice } from "./omp/workspace-context.ts";
+import { resourceExecutionTarget, resolveRemoteResourceArgs } from "./resource-routing.ts";
+import { resolveEditMode } from "@oh-my-pi/pi-coding-agent/utils/edit-mode";
+import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 
 /**
@@ -55,7 +58,7 @@ import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 export function captureLocalExecutionSettings(): RemoteExecutionSettings {
   try {
     const scoped = findScopedSettings();
-    return scoped ? captureExecutionSettings({ get: (key) => lookup(key)?.get(scoped), isConfigured: (key) => { const setting = lookup(key); return !!setting && scoped.isConfigured(setting); } }) : {};
+    return scoped ? captureExecutionSettings(scoped) : {};
   } catch {
     return {};
   }
@@ -247,6 +250,7 @@ type RemoteExtensionState = {
   owner: boolean;
   family?: RemoteFamily;
   connectionError?: string;
+  editMode?: EditMode;
   /** Active tool names of the local session; forwarded so the remote bash interceptor sees the real tool set. */
   activeToolNames: () => string[] | undefined;
 };
@@ -268,8 +272,23 @@ const remoteFamilyGlobal = globalThis as RemoteFamilyBrokerGlobal;
 
 const REMOTE_FAMILIES = (remoteFamilyGlobal[REMOTE_FAMILY_BROKER_KEY] ??=
   new Map<string, RemoteFamily>());
+const REVOKED_FAMILIES = new Map<string, RemoteFamily>();
 
 const SESSION_SHUTDOWN_REMOTE_CLOSE_TIMEOUT_MS = 1_000;
+
+function hostSessionFor(state: RemoteExtensionState, ctx?: ExtensionContext) {
+  const file = ctx?.sessionManager?.getSessionFile?.() ?? state.sessionFile;
+  return AgentRegistry.global().list().find((ref) =>
+    file && ref.sessionFile && resolvePath(ref.sessionFile) === resolvePath(file))?.session;
+}
+
+function effectiveHostEditMode(state: RemoteExtensionState, ctx?: ExtensionContext): EditMode {
+  const host = hostSessionFor(state, ctx);
+  const settings = host?.settings ?? findScopedSettings();
+  if (!settings) return state.editMode ?? "hashline";
+  const model = ctx?.model ?? host?.model;
+  return resolveEditMode({ settings, getActiveModelString: () => model ? `${model.provider}/${model.id}` : undefined });
+}
 
 function sessionFamilyRoot(sessionFile: string): string {
   const normalized = resolvePath(sessionFile);
@@ -288,13 +307,11 @@ export function sessionBelongsToFamily(
 
 function findRemoteFamily(sessionFile: string): RemoteFamily | undefined {
   let best: RemoteFamily | undefined;
-  for (const family of REMOTE_FAMILIES.values()) {
-    if (
-      family.closing ||
-      !sessionBelongsToFamily(family.ownerSessionFile, sessionFile)
-    )
-      continue;
-    if (!best || family.root.length > best.root.length) best = family;
+  let bestRootLength = -1;
+  for (const [root, family] of [...REMOTE_FAMILIES, ...REVOKED_FAMILIES]) {
+    if (!sessionBelongsToFamily(root, sessionFile) || root.length <= bestRootLength) continue;
+    best = family;
+    bestRootLength = root.length;
   }
   return best;
 }
@@ -323,6 +340,18 @@ export function remoteControlPlaneBlockReason(
     const device = xdevDevice(asRecord(input).path as string);
     if (device && ["find", "security_scan", "ida"].includes(device)) {
       return `${device} is not remote-adapted; local workspace execution is blocked while connected.`;
+    }
+  }
+  if (toolName === "github" || (toolName === "write" &&
+      xdevDevice(String(asRecord(input).path ?? "")) === "github")) {
+    const params = toolName === "github" ? asRecord(input) : parseDeviceArgs(asRecord(input).content);
+    const op = params?.op;
+    const apiReads: Readonly<Record<string, true>> = { repo_view: true, file_read: true, search_issues: true, search_prs: true, search_code: true, search_commits: true, search_repos: true, run_watch: true };
+    if (typeof op !== "string" || apiReads[op] !== true) {
+      return "GitHub workspace operations are not remote-adapted. Use remote bash with an explicitly selected repository, or disconnect first.";
+    }
+    if (!op.startsWith("search_") && (typeof params?.repo !== "string" || !params.repo.trim())) {
+      return "GitHub API reads require an explicit repo while remote is selected; inferring the local repository is disabled.";
     }
   }
   const params = asRecord(input);
@@ -445,12 +474,15 @@ export function stagedProposal(result: AgentToolResult): boolean {
   );
 }
 
-function successfulResolution(result: AgentToolResult): boolean {
+export function consumedResolution(result: AgentToolResult): boolean {
   const dispatch = xdevDispatch(result);
-  return (
-    (dispatch?.tool === "resolve" || dispatch?.tool === "reject") &&
-    result.isError !== true
-  );
+  const inner = asRecord(dispatch?.inner);
+  // Native queueResolveHandler consumes a normally returned invocation even
+  // when its business result isError (e.g. stale AST). A thrown apply has no
+  // completed ResolveDetails and retains its pending entry.
+  return (dispatch?.tool === "resolve" || dispatch?.tool === "reject") &&
+    (inner.action === "apply" || inner.action === "discard") &&
+    typeof inner.sourceToolName === "string";
 }
 
 async function localXdevAvailable(
@@ -478,7 +510,9 @@ async function executionTarget(
   ctx: ExtensionContext,
   signal?: AbortSignal,
 ): Promise<ExecutionTarget> {
+  const resourceTarget = resourceExecutionTarget(name, params, state.selected ? state.binding : undefined);
   if (!state.selected) return "local";
+  if (resourceTarget) return resourceTarget;
   const processTarget = processExecutionTarget(name, params, id => {
     const manager = resolveLocalAsyncJobManager(state.sessionFile);
     return manager?.getAllJobs().some(job => job.id === id) === true || AgentRegistry.global().list().some(agent => agent.id === id);
@@ -486,12 +520,12 @@ async function executionTarget(
   if (processTarget) return processTarget;
   let target: ExecutionTarget;
   if (name !== "write") {
-    target = pathShouldStayLocal(name, params) ? "local" : "remote";
+    target = pathShouldStayLocal(name, params, effectiveHostEditMode(state, ctx)) ? "local" : "remote";
   } else {
     const path = normalizePathArgument(params.path);
     const device = xdevDevice(path);
     if (!device) {
-      target = pathShouldStayLocal(name, params) ? "local" : "remote";
+      target = pathShouldStayLocal(name, params, effectiveHostEditMode(state, ctx)) ? "local" : "remote";
     } else if (RESOLUTION_DEVICES.has(device)) {
       target = state.proposalSources.at(-1) ?? "local";
     } else if (
@@ -504,10 +538,14 @@ async function executionTarget(
       target =
         !inner || !(await localXdevAvailable(device, ctx, signal))
           ? "local"
-          : pathShouldStayLocal(device as RemoteToolName, inner)
+          : pathShouldStayLocal(device as RemoteToolName, inner, effectiveHostEditMode(state, ctx))
             ? "local"
             : "remote";
     }
+  }
+  if (target === "remote" && (name === "read" || name === "edit") &&
+      state.editMode !== effectiveHostEditMode(state, ctx)) {
+    throw new Error("The host edit mode changed after connection. Reconnect before reading or editing the remote workspace.");
   }
 
   if (target === "remote" && !state.client) {
@@ -539,8 +577,9 @@ async function executeWithTarget(
   }
   const client = state.client;
   if (!client) throw new Error("Remote runtime is disconnected");
+  const remoteParams = resolveRemoteResourceArgs(name, params, state.binding);
   const execute = async (steeringSignal?: AbortSignal) =>
-    await client.execute(name, toolCallId, params, signal, onUpdate,
+    await client.execute(name, toolCallId, remoteParams, signal, onUpdate,
       { toolNames: state.activeToolNames(), steeringSignal }) as AgentToolResult;
   try {
     if (name === "bash" && typeof params.name === "string" && params.ready !== undefined) {
@@ -631,19 +670,20 @@ function registerWrapper(
     name,
     typeof original?.approval === "function" ? original.approval.bind(original) : original?.approval ?? approvalFor(name),
     original?.approvalCacheTargets?.bind(original),
-    () => state,
+    () => ({ ...state, editMode: effectiveHostEditMode(state) }),
   );
   pi.registerTool({
     name,
     label: original?.label ?? TOOL_LABELS[name],
-    description: native.description,
-    parameters: native.parameters,
+    get description() { return original?.description ?? native.description; },
+    get parameters() { return original?.parameters ?? native.parameters; },
     ...remoteWrapperRenderer(name),
     loadMode: original?.loadMode ?? "essential",
     readsSkillUris: original?.readsSkillUris,
     deferrable: original?.deferrable,
     strict: original?.strict,
-    ...{ customWireName: original?.customWireName },
+    get customWireName() { return original?.customWireName; },
+    get customFormat() { return original?.customFormat; },
     approval: approval.approval,
     approvalCacheTargets: approval.approvalCacheTargets,
     async execute(toolCallId, rawParams, signal, rawOnUpdate, ctx) {
@@ -672,7 +712,7 @@ function registerWrapper(
           return result;
         }
       }
-      if (name === "read" && params.path === "proc://" && target === "remote") {
+      if (name === "read" && isProcessListingPath(params.path) && target === "remote") {
         const remote = await executeWithTarget(target, name, toolCallId, params, state, ctx, signal);
         ensureCurrent();
         const local = await executeWithTarget("local", name, `${toolCallId}:local`, params, state, ctx, signal);
@@ -711,43 +751,39 @@ function registerWrapper(
       ) {
         state.proposalSources.push(target);
       }
-      if (name === "write" && successfulResolution(result))
+      if (name === "write" && consumedResolution(result))
         state.proposalSources.pop();
       return result;
     },
   });
   state.wrappedTools.add(name);
 }
-let handshakeSnapshot: ReturnType<typeof captureOmpHandshake> | undefined;
-function ompHandshake(pi: ExtensionAPI) {
-  return handshakeSnapshot ??= captureOmpHandshake(pi).catch((error) => {
-    handshakeSnapshot = undefined;
-    throw error;
-  });
-}
-async function captureOmpHandshake(_pi: ExtensionAPI) {
-  // Top-level getAllTools() omits setting-gated/xdev tools such as ast_grep.
-  // Admission must still compare the companion's full remote surface, so take
-  // wire schemas from the same native ToolSession the worker instantiates.
+async function captureOmpHandshake(pi: ExtensionAPI, state: RemoteExtensionState, ctx?: ExtensionContext) {
   const hostVersion = await resolveOmpHostVersion();
-  const nativeRuntime = await createNativeWorkerRuntime(
-    process.cwd(),
-    hostVersion,
-  );
+  const editMode = effectiveHostEditMode(state, ctx);
+  const host = hostSessionFor(state, ctx);
+  const metadata = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
+  const missing = REMOTE_TOOL_NAMES.filter((name) => !metadata.has(name));
+  // Only setting-gated tools absent from the actual registry need a fallback.
+  // Never substitute a default editor for the editor advertised by the host.
+  const fallback = missing.length ? await createNativeWorkerRuntime(
+    ctx?.cwd ?? state.localCwd ?? process.cwd(), hostVersion,
+    { settings: host ? captureExecutionSettings(host.settings) : captureLocalExecutionSettings() },
+  ) : undefined;
   try {
-    return createOmpRuntimeHandshake({
-      hostVersion,
-      localTools: REMOTE_TOOL_NAMES.map((name) => {
-        const native = nativeRuntime.tools[name];
-        if (!native)
-          throw new Error(`OMP native tool metadata is unavailable: ${name}`);
-        return { name, parameters: toolParametersToWire(native.parameters) };
-      }),
+    const localTools = REMOTE_TOOL_NAMES.map((name) => {
+      const live = host?.getToolByName(name);
+      const info = metadata.get(name);
+      const native = info ? {
+        name, parameters: live?.parameters ?? info.parameters,
+        customFormat: live?.customFormat, customWireName: live?.customWireName,
+      } : fallback?.tools[name];
+      if (!native) throw new Error(`Local OMP tool metadata is unavailable: ${name}`);
+      return captureOmpToolSnapshot(native);
     });
+    return createOmpRuntimeHandshake({ hostVersion, localTools, editMode });
   } finally {
-    // This runtime exists only to capture schemas; it never executes tools,
-    // so its artifact namespace would otherwise be an orphan on every connect.
-    await nativeRuntime.dispose().catch(() => undefined);
+    await fallback?.dispose();
   }
 }
 
@@ -787,8 +823,16 @@ function detachRemoteState(
   state.proposalSources = state.proposalSources.filter(
     (source) => source === "local",
   );
-  state.family?.members.delete(state);
-  state.family = undefined;
+  const family = state.family;
+  if (restoreLocal) {
+    family?.members.delete(state);
+    state.family = undefined;
+    if (family?.closing && family.members.size === 0) {
+      for (const [root, revoked] of REVOKED_FAMILIES) {
+        if (revoked === family) REVOKED_FAMILIES.delete(root);
+      }
+    }
+  }
   return current;
 }
 
@@ -800,16 +844,18 @@ async function closeRemoteState(
   if (current) await current.close(timeoutMs);
 }
 
-async function closeRemoteFamily(
+export async function closeRemoteFamily(
   family: RemoteFamily,
   timeoutMs?: number,
 ): Promise<void> {
   family.closing = true;
   REMOTE_FAMILIES.delete(family.ownerSessionFile);
+  for (const member of family.members) {
+    if (!member.owner && member.sessionFile) REVOKED_FAMILIES.set(member.sessionFile, family);
+  }
   const clients = [...family.members]
     .map((member) => detachRemoteState(member, member.owner))
     .filter((client): client is RemoteRuntimeClient => client !== undefined);
-  family.members.clear();
   const settled = await Promise.allSettled(
     clients.map((client) => client.close(timeoutMs)),
   );
@@ -864,19 +910,24 @@ async function openRemoteTransport(
   pi: ExtensionAPI,
   connection: RemoteConnectOptions & { workerPath: string },
   cwd: string,
-  sessionId: string | undefined,
-): Promise<{ client: RemoteRuntimeClient; ready: Awaited<ReturnType<RemoteRuntimeClient["initialize"]>> }> {
-  const handshake = await ompHandshake(pi);
+  state: RemoteExtensionState,
+  ctx?: ExtensionContext,
+  signal?: AbortSignal,
+): Promise<{ client: RemoteRuntimeClient; ready: ReadyMessage; binding: string }> {
+  const handshake = await captureOmpHandshake(pi, state, ctx);
+  const binding = crypto.randomUUID();
   const client = new RemoteRuntimeClient({
     command: buildSshWorkerCommand(connection),
   });
   try {
     const ready = await client.initialize(cwd, handshake, undefined, {
-      sessionId,
-      settings: captureLocalExecutionSettings(),
+      sessionId: launchOwnerId(ctx),
+      settings: hostSessionFor(state, ctx) ? captureExecutionSettings(hostSessionFor(state, ctx)!.settings) : captureLocalExecutionSettings(),
+      signal,
+      resourceBinding: binding,
     });
     bindLaunchCompletionDelivery(pi, client);
-    return { client, ready };
+    return { client, ready, binding };
   } catch (error) {
     client.kill();
     throw error;
@@ -903,17 +954,15 @@ async function reconnectRemoteRuntime(
   pi: ExtensionAPI,
   state: RemoteExtensionState,
   ctx: ExtensionContext | undefined,
-  options: { force: boolean },
+  options: { force: boolean; signal?: AbortSignal },
 ): Promise<RemoteReconnectOutcome> {
   if (state.deployment) throw new Error("Remote connection is already in progress");
   if (!state.selected) {
     throw new Error("No remote runtime is selected; use /remote-connect <target> [cwd]");
   }
-  if (!state.owner) {
-    throw new Error("Only the owning OMP session can reconnect the remote runtime family");
-  }
   const family = state.family;
   if (!family || family.closing) throw new Error("Remote runtime family state is missing");
+  options.signal?.throwIfAborted();
   const live = state.client !== undefined && !state.client.isClosed;
   if (live && !options.force) {
     throw new Error("Remote runtime transport is still connected; pass --force to replace it");
@@ -928,24 +977,33 @@ async function reconnectRemoteRuntime(
   const deployment = new AbortController();
   state.deployment = deployment;
   try {
-    const prepared = await prepareRemoteWorker({ ...family.connection, signal: deployment.signal, onProgress: (stage) => ctx?.ui?.setWorkingMessage(stage) });
-    const connection = { ...family.connection, workerPath: prepared.workerPath };
-    const { client, ready } = await openRemoteTransport(
+    const signal = options.signal ? AbortSignal.any([options.signal, deployment.signal]) : deployment.signal;
+    const prepared = await prepareRemoteWorker({ ...family.connection, signal, onProgress: (stage) => ctx?.ui?.setWorkingMessage(stage) });
+    const connection = { ...family.connection, cwd: family.remoteCwd, workerPath: prepared.workerPath };
+    const { client, ready, binding } = await openRemoteTransport(
       pi,
       connection,
-      family.connection.cwd,
-      launchOwnerId(ctx),
+      family.remoteCwd,
+      state,
+      ctx,
+      signal,
     );
-    if (family.closing || deployment.signal.aborted) {
+    if (family.closing || signal.aborted) {
       client.kill();
+      signal.throwIfAborted();
       throw new Error("Remote session family was closed during reconnect");
     }
-    family.connection = connection;
-    const remoteCwd: string = ready.cwd ?? family.connection.cwd;
-    family.remoteCwd = remoteCwd;
+    const remoteCwd: string = ready.cwd ?? family.remoteCwd;
+    if (remoteCwd !== family.remoteCwd) {
+      client.kill();
+      throw new Error("Remote workspace canonical directory changed during reconnect");
+    }
+    if (state.owner) family.connection = connection;
     state.client = client;
+    state.binding = binding;
     state.remoteCwd = remoteCwd;
     state.connectionError = undefined;
+    state.editMode = ready.editMode;
     return {
       target: family.connection.displayTarget,
       remoteCwd,
@@ -983,6 +1041,10 @@ async function attachFamilyMember(
   state.family = family;
   state.remoteCwd = family.remoteCwd;
   family.members.add(state);
+  if (family.closing) {
+    state.connectionError = "Remote runtime family was revoked; descendants cannot fall back locally";
+    return;
+  }
 
   if (
     !state.localCwd ||
@@ -994,15 +1056,17 @@ async function attachFamilyMember(
 
   let next: RemoteRuntimeClient | undefined;
   try {
-    const opened = await openRemoteTransport(pi, family.connection, family.remoteCwd, launchOwnerId(ctx));
+    const opened = await openRemoteTransport(pi, family.connection, family.remoteCwd, state, ctx);
     next = opened.client;
     if (family.closing)
       throw new Error(
         "Remote session family disconnected during subagent initialization",
       );
     state.client = next;
+    state.binding = opened.binding;
     state.remoteCwd = opened.ready.cwd;
     state.connectionError = undefined;
+    state.editMode = opened.ready.editMode;
   } catch (error) {
     next?.kill();
     state.connectionError = `Remote subagent runtime failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -1028,11 +1092,10 @@ export default async function remoteRuntimeExtension(
       }
     },
   };
-  let workspaceNotices: WorkspaceNoticeAnchor[] = [];
   // Compare the running host against the version this bundle (and its
   // companion workers) were compiled for. A mismatch is the usual root cause of
   // "schema is incompatible" handshake rejections after `omp update`.
-  const hostCompatibility = ompHostCompatibility(INSTALLED_OMP_VERSION || undefined);
+  const hostCompatibility = ompHostCompatibility(await resolveOmpHostVersion().catch(() => undefined));
   let hostCompatibilityNotified = false;
 
   pi.registerTool({
@@ -1108,17 +1171,14 @@ export default async function remoteRuntimeExtension(
       const localCwd = ctx?.cwd ?? process.cwd();
       const configuredHosts = await loadConfiguredSshHosts(localCwd);
 
-      const rawArgs = [target];
-      if (typeof p.cwd === "string") rawArgs.push(p.cwd);
-      if (typeof p.identity === "string")
-        rawArgs.push("--identity", p.identity);
-      if (typeof p.port === "number") rawArgs.push("--port", String(p.port));
-
-      const request = parseConnectArgs(rawArgs.join(" "), configuredHosts);
+      const request = parseConnectOptions({
+        target, cwd: p.cwd, identity: p.identity, port: p.port,
+      }, configuredHosts);
       let next: RemoteRuntimeClient | undefined;
       state.deployment = new AbortController();
       try {
-        const prepared = await prepareRemoteWorker({ ...request, signal: _signal ? AbortSignal.any([_signal, state.deployment.signal]) : state.deployment.signal, onProgress: (stage) => _onUpdate?.({ content: [{ type: "text", text: stage }] }) });
+        const signal = _signal ? AbortSignal.any([_signal, state.deployment.signal]) : state.deployment.signal;
+        const prepared = await prepareRemoteWorker({ ...request, signal, onProgress: (stage) => _onUpdate?.({ content: [{ type: "text", text: stage }] }) });
         const remoteCwd: string =
           request.cwd ?? prepared.home ?? (await resolveRemoteHome(request));
         const options: RemoteConnectOptions = { ...request, cwd: remoteCwd };
@@ -1126,7 +1186,7 @@ export default async function remoteRuntimeExtension(
           ...options,
           workerPath: prepared.workerPath,
         };
-        const opened = await openRemoteTransport(pi, connection, options.cwd, launchOwnerId(ctx));
+        const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, signal);
         next = opened.client;
         state.deployment.signal.throwIfAborted();
         _signal?.throwIfAborted();
@@ -1137,12 +1197,12 @@ export default async function remoteRuntimeExtension(
           root: sessionFamilyRoot(normalizedSessionFile),
           localCwd,
           remoteCwd: resolvedRemoteCwd,
-          connection,
+          connection: { ...connection, cwd: resolvedRemoteCwd },
           members: new Set([state]),
           closing: false,
         };
         state.client = next;
-        state.binding = crypto.randomUUID();
+        state.binding = opened.binding;
         state.remoteCwd = resolvedRemoteCwd;
         state.localCwd = localCwd;
         state.sessionFile = normalizedSessionFile;
@@ -1150,6 +1210,7 @@ export default async function remoteRuntimeExtension(
         state.owner = true;
         state.family = family;
         state.connectionError = undefined;
+        state.editMode = ready.editMode;
         REMOTE_FAMILIES.set(normalizedSessionFile, family);
         ctx?.ui?.setStatus?.(
           "remote-runtime",
@@ -1268,7 +1329,7 @@ export default async function remoteRuntimeExtension(
     approval: "exec",
     async execute(_id, params: unknown, _signal, _onUpdate, ctx) {
       const p = asRecord(params);
-      const outcome = await reconnectRemoteRuntime(pi, state, ctx, { force: p.force === true });
+      const outcome = await reconnectRemoteRuntime(pi, state, ctx, { force: p.force === true, signal: _signal });
       ctx?.ui?.setStatus?.("remote-runtime", `ssh ${outcome.target}:${outcome.remoteCwd}`);
       ctx?.ui?.notify?.(describeReconnect(outcome), "info");
       const details = { success: true, mode: "remote", ...outcome, wrappedTools: [...state.wrappedTools] };
@@ -1310,7 +1371,7 @@ export default async function remoteRuntimeExtension(
           ...options,
           workerPath: prepared.workerPath,
         };
-        const opened = await openRemoteTransport(pi, connection, options.cwd, launchOwnerId(ctx));
+        const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, state.deployment.signal);
         next = opened.client;
         state.deployment.signal.throwIfAborted();
         const ready = opened.ready;
@@ -1320,12 +1381,12 @@ export default async function remoteRuntimeExtension(
           root: sessionFamilyRoot(normalizedSessionFile),
           localCwd: ctx.cwd,
           remoteCwd: resolvedRemoteCwd,
-          connection,
+          connection: { ...connection, cwd: resolvedRemoteCwd },
           members: new Set([state]),
           closing: false,
         };
         state.client = next;
-        state.binding = crypto.randomUUID();
+        state.binding = opened.binding;
         state.remoteCwd = resolvedRemoteCwd;
         state.localCwd = ctx.cwd;
         state.sessionFile = normalizedSessionFile;
@@ -1333,6 +1394,7 @@ export default async function remoteRuntimeExtension(
         state.owner = true;
         state.family = family;
         state.connectionError = undefined;
+        state.editMode = ready.editMode;
         REMOTE_FAMILIES.set(normalizedSessionFile, family);
         ctx.ui.setStatus(
           "remote-runtime",
@@ -1440,15 +1502,7 @@ export default async function remoteRuntimeExtension(
     if (!sessionFile) return;
     const normalized = resolvePath(sessionFile);
     state.sessionFile = normalized;
-    workspaceNotices = [];
-    const branch = ctx.sessionManager.getBranch?.() ?? [];
-    for (let index = branch.length - 1; index >= 0; index--) {
-      const entry = branch[index];
-      if (entry.type === "custom" && entry.customType === WORKSPACE_CONTEXT_ENTRY && Array.isArray(entry.data)) {
-        workspaceNotices = entry.data;
-        break;
-      }
-    }
+    state.editMode = effectiveHostEditMode(state, ctx);
     await registerActiveWrappers(pi, state);
     const family = findRemoteFamily(normalized);
     if (!family) return;
@@ -1514,20 +1568,22 @@ export default async function remoteRuntimeExtension(
   };
   pi.on("user_bash", () => state.selected ? { result: blockedUserExecution() } : undefined);
   pi.on("user_python", () => state.selected ? { result: { ...blockedUserExecution(), displayOutputs: [], stdinRequested: false } } : undefined);
-  pi.on("context", (event) => {
-    const projected = projectWorkspaceContext(event.messages, workspaceNotices, {
+  pi.on("before_agent_start", (_event, ctx) => {
+    const current: WorkspaceBindingNotice = {
       binding: state.binding,
       mode: !state.selected ? "local" : (!state.client || state.client.isClosed || state.connectionError) ? "unavailable" : "remote",
       target: state.selected ? state.family?.connection.displayTarget ?? null : null,
       cwd: (state.selected ? state.remoteCwd : state.localCwd) ?? null,
-    });
-    workspaceNotices = projected.records;
-    if (projected.changed) pi.appendEntry(WORKSPACE_CONTEXT_ENTRY, workspaceNotices);
-    return { messages: projected.messages };
+    };
+    const message = workspaceAnnouncement(current, ctx.sessionManager.getBranch());
+    return message ? { message } : undefined;
   });
 
   pi.on("tool_call", (event) => {
     if (!state.selected) return;
+    if (event.toolName === "task" && (!state.client || state.client.isClosed || state.connectionError)) {
+      return { block: true, reason: "Remote runtime is unavailable; spawning a new task cannot fall back locally. Reconnect first." };
+    }
     const controlPlaneBlock = remoteControlPlaneBlockReason(
       event.toolName,
       event.input,
