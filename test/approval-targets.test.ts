@@ -169,7 +169,7 @@ describe("workspace approval targets", () => {
   test("approval and cache selection reject mixed bound conflicts and local processes in either order", () => {
     const state: ApprovalTargetState = { selected: true, binding: "current", sessionFile: "/tmp/approval-resource-session.jsonl", proposalSources: [] };
     const registry = spyOn(AgentRegistry, "global").mockReturnValue({ list: () => [
-      { id: "Main", sessionFile: state.sessionFile, session: { asyncJobManager: { getAllJobs: () => [{ id: "bg_1" }] } } },
+      { id: "Main", sessionFile: state.sessionFile, session: { sessionManager: { getSessionFile: () => state.sessionFile }, asyncJobManager: { getAllJobs: () => [{ id: "bg_1" }] } } },
       { id: "Scout" },
     ] } as never);
     let nativeCalls = 0;

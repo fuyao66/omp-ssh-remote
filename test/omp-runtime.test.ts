@@ -123,6 +123,8 @@ describe("OMP capability admission", () => {
     }
     const renamed = local.map(tool => tool.name === "edit" ? { ...tool, customWireName: "apply_patch" } : tool);
     expect(() => handshake.validateReady(ready({ tools: renamed, editMode: "hashline" }))).toThrow(/edit language is incompatible/);
+    expect(() => handshake.validateReady(ready({ tools: renamed, editMode: "hashline" }))).toThrow('host grammar=present, companion grammar=present, host wire="edit", companion wire="apply_patch"');
+    expect(() => handshake.validateReady(ready({ tools: renamed, editMode: "hashline" }))).toThrow("inspect live host tool metadata and edit settings");
   });
 
   test("captures live schema and language getters without keeping mutable grammar metadata", () => {

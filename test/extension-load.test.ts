@@ -134,6 +134,7 @@ describe("OMP extension loading", () => {
       },
     };
     const sessionFile = `/tmp/approval-metadata-${crypto.randomUUID()}.jsonl`;
+    const sessionManager = { getSessionFile: () => sessionFile };
     const registry = AgentRegistry.global();
     const ref = registry.register({
       id: `ApprovalMetadata-${crypto.randomUUID()}`,
@@ -141,6 +142,7 @@ describe("OMP extension loading", () => {
       kind: "main",
       sessionFile,
       session: {
+        sessionManager,
         getToolByName: () => native,
         async runToolRegistryMutation(mutate: () => Promise<void>) { await mutate(); },
       } as unknown as Parameters<AgentRegistry["register"]>[0]["session"],
@@ -156,7 +158,7 @@ describe("OMP extension loading", () => {
       await remoteRuntimeExtension(api as unknown as ExtensionAPI);
       await handlers.get("session_start")!({}, {
         cwd: "/native/workspace",
-        sessionManager: { getSessionFile: () => sessionFile },
+        sessionManager,
         ui: { notify() {} },
       });
       const wrapper = tools.get("read")!;

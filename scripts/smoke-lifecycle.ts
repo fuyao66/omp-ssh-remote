@@ -1,7 +1,7 @@
 // Bundle and run inside native OMP; no model requests are made.
 import assert from "node:assert/strict";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { resolveHostSessionRef } from "../src/omp/host-session.ts";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 // @ts-expect-error Generated release bundle has no declaration file.
 import extension from "../packages/omp/dist/extension.js";
@@ -17,7 +17,7 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
   }});
   await extension(api);
   pi.registerCommand("remote-lifecycle-smoke", { description: "Verify upgrade lifecycle in native OMP", async handler(_, ctx) {
-    const session = AgentRegistry.global().list().find(ref => ref.sessionFile === ctx.sessionManager.getSessionFile())?.session;
+    const session = resolveHostSessionRef(ctx.sessionManager.getSessionFile(), ctx)?.session;
     if (!session) throw new Error("Native session not registered");
     // Exercise real jobs without allowing their completion callbacks to start
     // an unrelated model turn while this model-free command owns the session.

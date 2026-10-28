@@ -41,6 +41,7 @@ import { isProcessListingPath, mergeProcessListings } from "./omp/process-routin
 import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { resolveHostSessionRef } from "./omp/host-session.ts";
 import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { captureExecutionSettings, type RemoteExecutionSettings } from "./omp/execution-settings.ts";
 import { WORKSPACE_RULES, workspaceAnnouncement, type WorkspaceBindingNotice } from "./omp/workspace-context.ts";
@@ -255,6 +256,7 @@ type RemoteExtensionState = {
   remoteCwd?: string;
   localCwd?: string;
   sessionFile?: string;
+  hostContext?: Pick<ExtensionContext, "agent" | "sessionManager">;
   wrappedTools: Set<RemoteToolName>;
   proposalSources: ExecutionTarget[];
   selected: boolean;
@@ -281,9 +283,7 @@ const remoteFamilyBroker = getRemoteFamilyBroker<RemoteFamily>();
 const SESSION_SHUTDOWN_REMOTE_CLOSE_TIMEOUT_MS = 1_000;
 
 function hostSessionFor(state: RemoteExtensionState, ctx?: ExtensionContext) {
-  const file = ctx?.sessionManager?.getSessionFile?.() ?? state.sessionFile;
-  return AgentRegistry.global().list().find((ref) =>
-    file && ref.sessionFile && resolvePath(ref.sessionFile) === resolvePath(file))?.session;
+  return resolveHostSessionRef(state.sessionFile, ctx ?? state.hostContext)?.session;
 }
 
 function effectiveHostEditMode(state: RemoteExtensionState, ctx?: ExtensionContext): EditMode {
@@ -596,11 +596,7 @@ async function executeWithTarget(
       { toolNames: state.activeToolNames(), steeringSignal, ...(name === "eval" ? { onInvoke: hostEvalInvoker(state, client, ctx) } : {}) }) as AgentToolResult;
   try {
     if (name === "bash" && typeof params.name === "string" && params.ready !== undefined) {
-      const sessionFile = ctx.sessionManager.getSessionFile() ?? state.sessionFile;
-      const session = AgentRegistry.global().list().find((ref) =>
-        sessionFile && ref.sessionFile && resolvePath(ref.sessionFile) === resolvePath(sessionFile),
-      )?.session;
-      return await withReadinessSteering(session ?? undefined, execute);
+      return await withReadinessSteering(hostSessionFor(state, ctx) ?? undefined, execute);
     }
     return await execute();
   } catch (error) {
@@ -675,10 +671,7 @@ function registerWrapper(
   name: RemoteToolName,
   native: ToolInfo,
 ): void {
-  const hostSession = AgentRegistry.global().list().find(
-    (ref) => ref.sessionFile === state.sessionFile,
-  )?.session;
-  const original = hostSession?.getToolByName(name);
+  const original = hostSessionFor(state)?.getToolByName(name);
   const approval = remoteWrapperApproval(
     name,
     typeof original?.approval === "function" ? original.approval.bind(original) : original?.approval ?? approvalFor(name),
@@ -719,7 +712,7 @@ function registerWrapper(
       }
       if (name === "bash" && target === "remote" && !serviceName && !params.pty) {
         const file = ctx.sessionManager?.getSessionFile?.() ?? state.sessionFile;
-        const liveSession = AgentRegistry.global().list().find(ref => ref.sessionFile === file)?.session;
+        const liveSession = hostSessionFor(state, ctx);
         const autoManager = resolveLocalAsyncJobManager(file);
         if (liveSession && lookup("bash.autoBackground.enabled")?.get(liveSession.settings) === true && autoManager && !autoManager.atCapacity) {
           const result = await withReadinessSteering(liveSession, steeringSignal => runRemoteForegroundBashJob({
@@ -821,8 +814,7 @@ async function registerActiveWrappers(
     if (native.sourceInfo.source !== "builtin") continue;
     registerWrapper(pi, state, name, native);
   }
-  const hostSession = AgentRegistry.global().list().find((ref) => ref.sessionFile === state.sessionFile)?.session;
-  await hostSession?.runToolRegistryMutation(async () => {});
+  await hostSessionFor(state)?.runToolRegistryMutation(async () => {});
 }
 
 function detachRemoteState(
@@ -1525,6 +1517,7 @@ export default async function remoteRuntimeExtension(
 
   pi.on("session_start", async (_event, ctx) => {
     state.localCwd = ctx.cwd;
+    state.hostContext = { agent: ctx.agent, sessionManager: ctx.sessionManager };
     if (!hostCompatibility.compatible && !hostCompatibilityNotified && hostCompatibility.advice) {
       hostCompatibilityNotified = true;
       ctx.ui.notify(`omp-ssh-remote: ${hostCompatibility.advice}`, "warning");
@@ -1635,6 +1628,7 @@ export default async function remoteRuntimeExtension(
   pi.on("session_shutdown", async () => {
     state.deployment?.abort(new Error("Session shutdown"));
     state.sessionFile = undefined;
+    state.hostContext = undefined;
     if (state.owner && state.family) {
       await closeRemoteFamily(
         state.family,

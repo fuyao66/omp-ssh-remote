@@ -1,6 +1,6 @@
 {
   "name": "omp-ssh-remote-workspace",
-  "version": "0.10.2",
+  "version": "0.10.3",
   "private": true,
   "type": "module",
   "description": "Oh My Pi SSH remote workspace plugin",

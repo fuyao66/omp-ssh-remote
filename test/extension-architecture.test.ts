@@ -48,6 +48,7 @@ async function extensionHarness(
   };
   await remoteRuntimeExtension(api as unknown as ExtensionAPI);
   return {
+    ctx,
     handlers,
     useSession(next: SessionManager) { manager = next; },
     accept(result: unknown) {
@@ -235,6 +236,7 @@ describe("extension workspace architecture", () => {
     broker.set(ownerFile, family);
     const registry = spyOn(AgentRegistry, "global").mockReturnValue({ list: () => [
       { id: "Main", sessionFile: childFile, session: {
+        sessionManager: harness.ctx.sessionManager,
         getToolByName: () => undefined,
         runToolRegistryMutation: async <T>(mutation: () => Promise<T>): Promise<T> => await mutation(),
         asyncJobManager: { getAllJobs: () => [{ id: "bg_1" }] },

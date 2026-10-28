@@ -218,7 +218,7 @@ export function validateOmpReadyMessage(
         (stableJson(local.customFormat) !== stableJson(remote.customFormat) ||
          local.customWireName !== remote.customWireName)) {
       throw new Error(
-        `Remote OMP edit language is incompatible with the local tool (custom grammar or wire name changed); ${versionDriftHint(localHostVersion, hostVersion)}`,
+        `Remote OMP edit language is incompatible with the local tool (custom grammar or wire name changed; host grammar=${local.customFormat === undefined ? "absent" : "present"}, companion grammar=${remote.customFormat === undefined ? "absent" : "present"}, host wire=${JSON.stringify(local.customWireName ?? null)}, companion wire=${JSON.stringify(remote.customWireName ?? null)}); local OMP ${localHostVersion ?? "unknown"}, companion built for ${hostVersion}; inspect live host tool metadata and edit settings before deciding whether companion workers need rebuilding`,
       );
     }
   }

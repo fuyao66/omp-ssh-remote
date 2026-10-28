@@ -1,13 +1,13 @@
 import { raceJobSettlement, resolveAutoBackgroundWaitMs } from "@oh-my-pi/pi-coding-agent/async";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
-import { resolve } from "node:path";
 import { clampTimeout } from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import { formatBackgroundNotice } from "@oh-my-pi/pi-tui/tools/bash";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { RemoteJobCapture } from "./remote-capture.ts";
 import type { JobCapturePayload } from "./job-capture.ts";
+import { resolveHostSessionRef } from "./host-session.ts";
 
 /**
  * Bridge OMP `bash async:true` onto the remote companion.
@@ -59,22 +59,18 @@ function textOf(result: unknown): string {
 }
 
 /**
- * Resolve the OMP agent id that owns jobs for the given session file. Both the
- * main session and task children register in AgentRegistry with their session
- * file, so the match is exact. A single-agent process resolves to Main even if
- * the registry has no session file yet (e.g. very early startup).
+ * Resolve the owner against its live session manager: the registry's cached
+ * sessionFile does not follow in-process session transitions.
  */
 export function resolveJobOwnerId(
   sessionFile: string | undefined,
   registry: AgentRegistry = AgentRegistry.global(),
 ): string | undefined {
   const refs = registry.list();
-  if (sessionFile) {
-    const match = refs.find((ref) => ref.sessionFile === sessionFile);
-    if (match) return match.id;
-  }
+  const match = resolveHostSessionRef(sessionFile, undefined, registry);
+  if (match) return match.id;
   if (refs.length === 0) return MAIN_AGENT_ID;
-  if (refs.length === 1) return refs[0]?.id;
+  if (!sessionFile && refs.length === 1) return refs[0]?.id;
   return undefined;
 }
 
@@ -82,11 +78,7 @@ export function resolveLocalAsyncJobManager(
   sessionFile: string | undefined,
   registry: AgentRegistry = AgentRegistry.global(),
 ): AsyncJobManager | undefined {
-  if (!sessionFile) return undefined;
-  const normalized = resolve(sessionFile);
-  return registry.list().find(
-    (ref) => ref.sessionFile && resolve(ref.sessionFile) === normalized,
-  )?.session?.asyncJobManager;
+  return resolveHostSessionRef(sessionFile, undefined, registry)?.session?.asyncJobManager;
 }
 
 type RemoteJobCompletion =
