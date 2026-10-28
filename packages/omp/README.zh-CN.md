@@ -130,9 +130,11 @@ adapter 探测远端平台和 home，选择 package 自带的对应 worker，校
 ~/.cache/omp-ssh-remote/omp-1/<sha256>/worker-linux-<arch>
 ```
 
-启用时清理更旧的 worker，保留当前版本、最近一个旧版本及仍在使用的版本。worker 持有版本目录的共享 `flock` 租约；清理须取得独占租约，并通过 `/proc` 检查未使用租约的旧 worker。不能删除活跃可执行文件，否则后续 JS 内核和 broker 自调用会失败。协议 frame 上限为 16 MiB，部署 stdout/stderr 上限为 1 MiB。SSH 使用 batch mode、严格 host checking、`ForwardAgent=no` 和 `ClearAllForwardings=yes`。断连时 pending call 报错，不在本机重试；主动通过 `nohup` 或 `setsid` 脱离监管的进程可能继续存活。
+连接／重连在原生握手通过后，记录单调递增的最近使用序号，并跨 namespace 清理已托管 worker。默认保留 **两个不同 worker 哈希**：刚使用的构建及最近使用的另一个构建。重复使用不新增一代，回滚会更新使用顺序。同哈希的多份目录按副本单独计数。仍有租约的构建和副本额外保留，因此长期运行时可能超过两个；下次成功连接继续清理。
 
-每次连接／重连复用清理的 SSH 往返，尽力审计缓存，总预算 10 秒。通知和生命周期结果报告当前 namespace 的 worker 版本数、保留旧版本及数字版本号或 `omp-*` 旧 namespace；不会删除旧 namespace。大小是普通、非符号链接 worker 二进制文件（`worker`、`worker-linux-x64`、`worker-linux-arm64`）的**已分配磁盘字节数之和**，不是逻辑文件大小，也不是整个缓存占用。版本目录与二进制文件分别计数；共享 companion 资源、校验文件、锁、artifact 和其他内容均不纳入。保留的旧版本仍可能被使用。审计失败或超时只显示不可用警告，不阻止连接。status 只展示带时间戳的上次部署快照，不访问 SSH；重连先清空旧快照再重新采集。
+部署从上传前到握手结束持有共享版本租约，再交接给 worker 生命周期租约。缓存根目录的同一把 `flock` 串行化元数据提交、启用及清理；删除须取得非阻塞独占版本租约，并检查旧进程的 `/proc`。只有严格匹配原生所有权 manifest 且直属内容全部可识别的目录可删除，共享 companion 目标不删除。首次仅迁移既有 `omp-1` 无 companion 布局且校验标记匹配的目录，初始顺序明确来自目录 mtime，并非恢复的历史使用记录。未登记的失败部署、未知 namespace（包括数字版本目录）、损坏元数据和陌生文件保持不动；不执行旧二进制，也不对所有缓存重新计算哈希。
+
+成功连接报告保留的不同构建及副本、删除副本及完全移除的构建哈希、忙碌豁免和未分类哈希目录候选数。大小为普通、非符号链接 worker 二进制的**已分配磁盘字节数之和**，不是逻辑大小或整个缓存占用；共享资产不计入。提交及清理总预算 10 秒，失败报告不可用而非零占用。上传或握手失败不推进使用序号。status 不访问 SSH，只展示该带时间戳快照。协议 frame 上限 16 MiB，部署输出上限 1 MiB；SSH 保持 batch mode、严格 host checking、`ForwardAgent=no` 和 `ClearAllForwardings=yes`，断连不回退本机执行。`nohup`、`setsid` 等主动脱离监管的进程仍不受管理。
 
 连接界面显示探测、缓存检查、上传、激活阶段。`remote_connect` 和 `remote_reconnect` 工具都响应调用取消，`/remote-exit` 可取消进行中的命令部署。同一扩展实例内的同主机部署串行执行并重新检查缓存，避免重复上传；上传失败后在 SSH 可达时尽力清理临时文件。每次连接重新采集当前宿主的工具契约，避免复用其他模型或 session 的握手。
 

@@ -65,7 +65,7 @@ const prepared = await prepareRemoteWorker(
 );
 const deployCacheMs = milliseconds(started);
 const cwd = requestedCwd ?? prepared.home;
-if (!cwd) throw new Error("Remote cwd and probed remote home are unavailable");
+if (!cwd) { await prepared.dispose(); throw new Error("Remote cwd and probed remote home are unavailable"); }
 const client = new RemoteRuntimeClient({
   command: buildSshWorkerCommand({
     ...connection,
@@ -79,8 +79,11 @@ try {
     cwd,
     OMP_RUNTIME_HANDSHAKE,
     30_000,
+    { signal: prepared.signal },
   );
   const initializeMs = milliseconds(started);
+  await prepared.commitUsage();
+  await prepared.dispose();
   await client.execute("write", "benchmark-write", {
     path: benchmarkFile,
     content: "export interface RemoteBenchmark { id: string }\n",
@@ -121,6 +124,7 @@ try {
     }),
   );
 } finally {
+  await prepared.dispose();
   if (!client.isClosed) {
     try {
       await client.execute("bash", "benchmark-cleanup", {

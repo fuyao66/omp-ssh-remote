@@ -1,6 +1,6 @@
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
-import { ensureRemoteWorker } from "../src/deploy.ts";
+import { prepareRemoteWorker } from "../src/deploy.ts";
 import { buildSshWorkerCommand } from "../src/ssh.ts";
 
 const target = Bun.env.REMOTE_TARGET;
@@ -35,13 +35,16 @@ const run = async (
 };
 
 log("deploy:start");
-const workerPath = await ensureRemoteWorker(options);
+const prepared = await prepareRemoteWorker(options);
+const workerPath = prepared.workerPath;
 log("deploy:done");
 const client = new RemoteRuntimeClient({
   command: buildSshWorkerCommand({ ...options, workerPath }),
 });
 try {
-  await client.initialize(cwd, OMP_RUNTIME_HANDSHAKE);
+  await client.initialize(cwd, OMP_RUNTIME_HANDSHAKE, undefined, { signal: prepared.signal });
+  await prepared.commitUsage();
+  await prepared.dispose();
   log("initialize:done");
   const py1 = await run(client, "py-setup", {
     language: "py",
@@ -65,6 +68,7 @@ try {
   });
   console.log(JSON.stringify({ py1, py2, js1, js2 }));
 } finally {
+  await prepared.dispose();
   log("close:start");
   await client.close();
   log("close:done");

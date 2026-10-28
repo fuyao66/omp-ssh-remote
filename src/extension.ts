@@ -15,7 +15,7 @@ import {
   type RemoteConnectRequest,
 } from "./connect-options.ts";
 import { RemoteRuntimeClient } from "./client.ts";
-import { describeRemoteWorkerCacheAudit, prepareRemoteWorker, resolveRemoteHome, type RemoteWorkerCacheAudit } from "./deploy.ts";
+import { describeRemoteWorkerCacheAudit, prepareRemoteWorker, resolveRemoteHome, type PreparedRemoteWorker, type RemoteWorkerCacheAudit } from "./deploy.ts";
 import { REMOTE_TOOL_NAMES, type RemoteToolName, type ReadyMessage } from "./protocol.ts";
 import { createOmpRuntimeHandshake, captureOmpToolSnapshot } from "./omp/runtime-contract.ts";
 import { ompHostCompatibility, resolveOmpHostVersion, type OmpHostCompatibility } from "./omp/host-identity.ts";
@@ -987,9 +987,11 @@ async function reconnectRemoteRuntime(
   family.cacheAudit = undefined;
   const deployment = new AbortController();
   state.deployment = deployment;
+  let prepared: PreparedRemoteWorker | undefined;
+  let next: RemoteRuntimeClient | undefined;
   try {
     const signal = options.signal ? AbortSignal.any([options.signal, deployment.signal]) : deployment.signal;
-    const prepared = await prepareRemoteWorker({ ...family.connection, signal, onProgress: (stage) => ctx?.ui?.setWorkingMessage(stage) });
+    prepared = await prepareRemoteWorker({ ...family.connection, signal, onProgress: (stage) => ctx?.ui?.setWorkingMessage(stage) });
     const connection = { ...family.connection, cwd: family.remoteCwd, workerPath: prepared.workerPath };
     const { client, ready, binding } = await openRemoteTransport(
       pi,
@@ -997,8 +999,9 @@ async function reconnectRemoteRuntime(
       family.remoteCwd,
       state,
       ctx,
-      signal,
+      prepared.signal,
     );
+    next = client;
     if (family.closing || signal.aborted) {
       client.kill();
       signal.throwIfAborted();
@@ -1009,6 +1012,7 @@ async function reconnectRemoteRuntime(
       client.kill();
       throw new Error("Remote workspace canonical directory changed during reconnect");
     }
+    await prepared.commitUsage();
     if (state.owner) family.connection = connection;
     state.client = client;
     state.binding = binding;
@@ -1024,9 +1028,11 @@ async function reconnectRemoteRuntime(
       cacheAudit: prepared.cacheAudit,
     };
   } catch (error) {
+    next?.kill();
     state.connectionError = `Remote runtime reconnect failed: ${error instanceof Error ? error.message : String(error)}`;
     throw error;
   } finally {
+    await prepared?.dispose();
     if (state.deployment === deployment) state.deployment = undefined;
   }
 }
@@ -1189,10 +1195,11 @@ export default async function remoteRuntimeExtension(
         target, cwd: p.cwd, identity: p.identity, port: p.port,
       }, configuredHosts);
       let next: RemoteRuntimeClient | undefined;
+      let prepared: PreparedRemoteWorker | undefined;
       state.deployment = new AbortController();
       try {
         const signal = _signal ? AbortSignal.any([_signal, state.deployment.signal]) : state.deployment.signal;
-        const prepared = await prepareRemoteWorker({ ...request, signal, onProgress: (stage) => _onUpdate?.({ content: [{ type: "text", text: stage }] }) });
+        prepared = await prepareRemoteWorker({ ...request, signal, onProgress: (stage) => _onUpdate?.({ content: [{ type: "text", text: stage }] }) });
         const remoteCwd: string =
           request.cwd ?? prepared.home ?? (await resolveRemoteHome(request));
         const options: RemoteConnectOptions = { ...request, cwd: remoteCwd };
@@ -1200,10 +1207,11 @@ export default async function remoteRuntimeExtension(
           ...options,
           workerPath: prepared.workerPath,
         };
-        const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, signal);
+        const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, prepared.signal);
         next = opened.client;
         state.deployment.signal.throwIfAborted();
         _signal?.throwIfAborted();
+        await prepared.commitUsage();
         const ready = opened.ready;
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
@@ -1251,6 +1259,7 @@ export default async function remoteRuntimeExtension(
         next?.kill();
         throw error;
       } finally {
+        await prepared?.dispose();
         state.deployment = undefined;
       }
     },
@@ -1377,9 +1386,10 @@ export default async function remoteRuntimeExtension(
       const request = parseConnectArgs(args, configuredHosts);
       ctx.ui.setWorkingMessage("Deploying remote OMP runtime");
       let next: RemoteRuntimeClient | undefined;
+      let prepared: PreparedRemoteWorker | undefined;
       state.deployment = new AbortController();
       try {
-        const prepared = await prepareRemoteWorker({ ...request, signal: state.deployment.signal, onProgress: (stage) => ctx.ui.setWorkingMessage(stage) });
+        prepared = await prepareRemoteWorker({ ...request, signal: state.deployment.signal, onProgress: (stage) => ctx.ui.setWorkingMessage(stage) });
         const remoteCwd: string =
           request.cwd ?? prepared.home ?? (await resolveRemoteHome(request));
         const options: RemoteConnectOptions = { ...request, cwd: remoteCwd };
@@ -1387,9 +1397,10 @@ export default async function remoteRuntimeExtension(
           ...options,
           workerPath: prepared.workerPath,
         };
-        const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, state.deployment.signal);
+        const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, prepared.signal);
         next = opened.client;
         state.deployment.signal.throwIfAborted();
+        await prepared.commitUsage();
         const ready = opened.ready;
         const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
         const family: RemoteFamily = {
@@ -1425,6 +1436,7 @@ export default async function remoteRuntimeExtension(
         next?.kill();
         throw error;
       } finally {
+        await prepared?.dispose();
         state.deployment = undefined;
         ctx.ui.setWorkingMessage();
       }

@@ -1,6 +1,6 @@
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
-import { ensureRemoteWorker } from "../src/deploy.ts";
+import { prepareRemoteWorker } from "../src/deploy.ts";
 import { buildSshWorkerCommand } from "../src/ssh.ts";
 
 const target = Bun.env.REMOTE_TARGET;
@@ -21,12 +21,15 @@ const options = {
   knownHostsFile,
   localArtifactDir: new URL("../packages/omp/dist/", import.meta.url).pathname,
 };
-const workerPath = await ensureRemoteWorker(options);
+const prepared = await prepareRemoteWorker(options);
+const workerPath = prepared.workerPath;
 const client = new RemoteRuntimeClient({
   command: buildSshWorkerCommand({ ...options, workerPath }),
 });
 try {
-  const ready = await client.initialize(cwd, OMP_RUNTIME_HANDSHAKE);
+  const ready = await client.initialize(cwd, OMP_RUNTIME_HANDSHAKE, undefined, { signal: prepared.signal });
+  await prepared.commitUsage();
+  await prepared.dispose();
   if (ready.cwd !== cwd) throw new Error(`Unexpected remote cwd: ${ready.cwd}`);
 
   const content = `remote-arm64-${Date.now()}`;
@@ -75,5 +78,6 @@ try {
     }),
   );
 } finally {
+  await prepared.dispose();
   await client.close();
 }

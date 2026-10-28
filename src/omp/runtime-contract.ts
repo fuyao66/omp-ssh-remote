@@ -248,6 +248,7 @@ export const OMP_RUNTIME_HANDSHAKE: RemoteRuntimeHandshake =
   });
 
 export const OMP_WORKER_BUNDLE: RemoteWorkerBundle = {
+  owner: "omp-ssh-remote/native-omp",
   cacheNamespace: `omp-${OMP_HOST_CONTRACT_VERSION}`,
   companionArtifacts: [],
 };

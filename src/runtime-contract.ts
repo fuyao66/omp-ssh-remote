@@ -19,6 +19,7 @@ export interface RemoteCompanionArtifact {
 }
 
 export interface RemoteWorkerBundle {
+  owner: "omp-ssh-remote/native-omp";
   cacheNamespace: string;
   companionArtifacts: readonly RemoteCompanionArtifact[];
 }

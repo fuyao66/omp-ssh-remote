@@ -9,7 +9,6 @@ import {
   createRemoteArtifacts,
   sweepOrphanedArtifactNamespaces,
 } from "../src/omp/artifacts.ts";
-import { buildPruneStaleWorkersCommand } from "../src/deploy.ts";
 import { buildSshWorkerCommand } from "../src/ssh.ts";
 
 const HOUR = 60 * 60 * 1000;
@@ -77,50 +76,20 @@ describe("remote artifact namespace hygiene", () => {
   });
 });
 
-describe("remote worker cache prune command", () => {
-  test("an active version survives pruning and becomes reclaimable after exit", async () => {
+describe("native worker launch lease", () => {
+  test("holds the shared build lock until worker exit", async () => {
     const ns = await mkdtemp(join(tmpdir(), "worker lease '"));
-    const old = "a".repeat(64), current = "b".repeat(64);
-    await mkdir(join(ns, old)); await mkdir(join(ns, current));
-    const worker = join(ns, old, "worker path'quoted");
+    const worker = join(ns, "worker path'quoted");
     await writeFile(worker, '#!/bin/sh\necho READY\nread input\nprintf "%s" "$input"\n', { mode: 0o700 });
     const proc = Bun.spawn(["sh", "-c", buildSshWorkerCommand({ target: "example", workerPath: worker }).at(-1)!], { stdin: "pipe", stdout: "pipe" });
     try {
       const reader = proc.stdout.getReader();
       expect(new TextDecoder().decode((await reader.read()).value)).toContain("READY");
-      expect(Bun.spawnSync(["sh", "-c", buildPruneStaleWorkersCommand(ns, current, 1)]).exitCode).toBe(0);
-      expect(await readFile(worker, "utf8")).toContain("READY");
+      expect(Bun.spawnSync(["flock", "-n", "-x", join(ns, ".worker.lock"), "true"]).exitCode).not.toBe(0);
       proc.stdin.write("still-live\n"); proc.stdin.end();
       expect(new TextDecoder().decode((await reader.read()).value)).toContain("still-live");
       await proc.exited;
-      expect(Bun.spawnSync(["sh", "-c", buildPruneStaleWorkersCommand(ns, current, 1)]).exitCode).toBe(0);
-      expect(await readdir(ns)).toEqual([current]);
+      expect(Bun.spawnSync(["flock", "-n", "-x", join(ns, ".worker.lock"), "true"]).exitCode).toBe(0);
     } finally { proc.kill(); await proc.exited; await rm(ns, { recursive: true, force: true }); }
-  });
-  test("keeps the active hash plus the newest other version and ignores foreign entries", async () => {
-    const base = await mkdtemp(join(tmpdir(), "worker-prune-"));
-    const ns = join(base, "omp-1");
-    const hash = (c: string) => c.repeat(64);
-    let t = 1;
-    for (const c of ["a", "b", "c", "d"]) {
-      const dir = join(ns, hash(c));
-      await mkdir(dir, { recursive: true });
-      await writeFile(join(dir, "worker-linux-x64"), "bin");
-      const when = new Date(1000 * t++);
-      await utimes(dir, when, when);
-    }
-    await mkdir(join(ns, "17.3.3"), { recursive: true });
-    await mkdir(join(ns, "not-a-hash"), { recursive: true });
-
-    const result = Bun.spawnSync(["sh", "-c", buildPruneStaleWorkersCommand(ns, hash("c"))]);
-    expect(result.exitCode).toBe(0);
-    expect((await readdir(ns)).sort()).toEqual([hash("c"), hash("d"), "17.3.3", "not-a-hash"].sort());
-
-    const missing = Bun.spawnSync(["sh", "-c", buildPruneStaleWorkersCommand(join(base, "absent"), hash("c"))]);
-    expect(missing.exitCode).toBe(0);
-  });
-
-  test("rejects an unvalidated hash before it reaches a shell", () => {
-    expect(() => buildPruneStaleWorkersCommand("/x", "abc; rm -rf /")).toThrow("Invalid worker hash");
   });
 });

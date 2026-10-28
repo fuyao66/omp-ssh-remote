@@ -112,6 +112,6 @@ export function buildSshWorkerCommand(options: SshWorkerOptions): string[] {
   return [
     ...buildSshBaseCommand(options),
     getSshDestination(options),
-    `exec flock --shared ${quoteRemoteArgument(posix.join(posix.dirname(options.workerPath), ".worker.lock"))} ${quoteRemoteArgument(options.workerPath)}`,
+    `set -eu; d=${quoteRemoteArgument(posix.dirname(options.workerPath))}; root=${quoteRemoteArgument(posix.dirname(posix.dirname(posix.dirname(options.workerPath))))}; locked=0; if test -f "$root/.native-cache.lock" && test ! -L "$root/.native-cache.lock"; then exec 8>"$root/.native-cache.lock"; flock -w 8 -x 8; locked=1; fi; test -d "$d" && test ! -L "$d"; test ! -L "$d/.worker.lock"; exec 9>"$d/.worker.lock"; flock -s 9; test -x ${quoteRemoteArgument(options.workerPath)}; if test "$locked" -eq 1; then flock -u 8; fi; exec flock --shared "$d/.worker.lock" ${quoteRemoteArgument(options.workerPath)}`,
   ];
 }

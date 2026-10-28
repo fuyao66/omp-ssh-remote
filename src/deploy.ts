@@ -16,6 +16,7 @@ import {
   quoteRemoteArgument,
   type SshConnectionOptions,
 } from "./ssh.ts";
+import { buildCommitWorkerCacheCommand, buildWorkerDeploymentLeaseCommand, cacheRootSetup, validateWorkerCacheIdentity, NATIVE_WORKER_OWNER } from "./worker-cache.ts";
 
 export interface WorkerDeploymentOptions extends Omit<
   SshConnectionOptions,
@@ -170,31 +171,24 @@ function parseProbe(output: string): { platform: string; home: string } {
   return { platform: `${os}/${arch}`, home };
 }
 
-export type RemoteWorkerCacheUsage = {
-  namespace: string;
-  versions: number;
-  binaryFiles: number;
-  allocatedBytes: number;
-};
-
-export type RemoteWorkerCacheAudit = {
-  observedAt: string;
-} & ({
+export type RemoteWorkerCacheAudit = { observedAt: string } & ({
   available: true;
   scope: "worker binaries only; excludes shared assets and other cache contents";
   metric: "sum of per-file allocated bytes (stat blocks × block size), not logical size";
-  current: RemoteWorkerCacheUsage;
-  retainedOld: Omit<RemoteWorkerCacheUsage, "namespace">;
-  legacy: RemoteWorkerCacheUsage[];
-} | {
-  available: false;
-  warning: string;
-});
+  retained: { builds: number; replicas: number; binaryFiles: number; allocatedBytes: number };
+  deleted: { builds: number; replicas: number; allocatedBytes: number };
+  busy: { builds: number; replicas: number };
+  unclassified: number;
+} | { available: false; warning: string });
 
 export type PreparedRemoteWorker = {
   workerPath: string;
   home?: string;
+  /** Combined caller/lease signal, only for deployment and admission. */
+  signal: AbortSignal;
   cacheAudit: RemoteWorkerCacheAudit;
+  commitUsage(): Promise<RemoteWorkerCacheAudit>;
+  dispose(): Promise<void>;
 };
 
 export async function resolveRemoteHome(
@@ -231,11 +225,17 @@ export async function prepareRemoteWorker(
   const abort = () => cancelled.reject(new Error("Remote deployment cancelled", { cause: options.signal?.reason }));
   options.signal.addEventListener("abort", abort, { once: true });
   if (options.signal.aborted) abort();
-  try { return await Promise.race([result, cancelled.promise]); }
+  // A queued cancellation returns promptly; the producer retains ownership until delivery.
+  const deliver = result.then(async prepared => {
+    if (options.signal?.aborted) { await prepared.dispose(); options.signal.throwIfAborted(); }
+    return prepared;
+  });
+  try { return await Promise.race([deliver, cancelled.promise]); }
   finally { options.signal.removeEventListener("abort", abort); }
 }
 
 async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: RemoteWorkerBundle): Promise<PreparedRemoteWorker> {
+  if (bundle.owner !== NATIVE_WORKER_OWNER) throw new Error("Unsupported worker bundle owner");
   const probe = parseProbe(
     await run(
       [
@@ -259,6 +259,10 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
   );
   const hash = await readWorkerHash(localWorker);
   const cacheDir = `${probe.home}/.cache/omp-ssh-remote`;
+  validateWorkerCacheIdentity(bundle.cacheNamespace, hash);
+  const lease = await acquireDeploymentLease(options, cacheDir, bundle.cacheNamespace, hash);
+  try {
+    return await deploymentContext.run({ ...options, signal: lease.signal }, async () => {
   const workerFile = `worker-linux-${arch}`;
   const remoteDir = `${cacheDir}/${bundle.cacheNamespace}/${hash}`;
   const remoteWorker = `${remoteDir}/${workerFile}`;
@@ -269,7 +273,7 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
     [
       ...buildSshBaseCommand(options),
       getSshDestination(options),
-      `test -x ${quotedWorker} && test "$(cat ${quotedMarker} 2>/dev/null)" = '${hash}' && printf present || printf missing`,
+      `test ! -L ${quotedWorker} && test ! -L ${quotedMarker} && test -x ${quotedWorker} && test "$(cat ${quotedMarker} 2>/dev/null)" = '${hash}' && printf present || printf missing`,
     ],
     "Remote worker check",
   );
@@ -281,8 +285,7 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
       remoteDir,
       bundle,
     );
-    const cacheAudit = await pruneAndAuditRemoteWorkers(options, `${cacheDir}/${bundle.cacheNamespace}`, hash);
-    return { workerPath: remoteWorker, home: probe.home, cacheAudit };
+    return preparedWorker(options, cacheDir, bundle.cacheNamespace, hash, remoteWorker, probe.home, bundle.companionArtifacts.map(artifact => artifact.executableName), lease);
   }
   if (exists !== "missing")
     throw new Error(`Unexpected remote worker check response: ${exists}`);
@@ -296,8 +299,10 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
     "Remote cache setup",
   );
   const nonce = crypto.randomUUID();
-  const temporary = `${remoteWorker}.upload-${nonce}`;
-  const temporaryMarker = `${marker}.upload-${nonce}`;
+  // Independent clients may upload the same hash while another admits it.
+  // Staging must not make the admitted generation's strict owned layout invalid.
+  const temporary = `${cacheDir}/.${hash}.upload-${nonce}`;
+  const temporaryMarker = `${cacheDir}/.${hash}.marker-${nonce}`;
   const scp = buildScpBaseCommand(options);
   // The worker is a ~200 MB uncompressed Bun executable; ssh-level compression
   // measured ~40% fewer bytes on the wire for the one-time upload per version.
@@ -310,7 +315,7 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
     [
       ...buildSshBaseCommand(options),
       getSshDestination(options),
-      `set -eu; actual=$(sha256sum ${quotedTemporary} | cut -d ' ' -f 1); test "$actual" = '${hash}'; chmod 700 ${quotedTemporary}; mv -f ${quotedTemporary} ${quotedWorker}; printf '%s\\n' '${hash}' > ${quotedTemporaryMarker}; chmod 600 ${quotedTemporaryMarker}; mv -f ${quotedTemporaryMarker} ${quotedMarker}`,
+      `${cacheRootSetup(cacheDir)} actual=$(sha256sum ${quotedTemporary} | cut -d ' ' -f 1); test "$actual" = '${hash}'; test ! -L ${quotedWorker}; test ! -L ${quotedMarker}; if test -x ${quotedWorker} && test "$(cat ${quotedMarker} 2>/dev/null)" = '${hash}'; then rm -f -- ${quotedTemporary}; else chmod 700 ${quotedTemporary}; mv -f ${quotedTemporary} ${quotedWorker}; printf '%s\\n' '${hash}' > ${quotedTemporaryMarker}; chmod 600 ${quotedTemporaryMarker}; mv -f ${quotedTemporaryMarker} ${quotedMarker}; fi`,
     ],
     "Worker activation",
   );
@@ -322,129 +327,87 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
     throw error;
   }
   await deployCompanionArtifacts(options, probe.home, arch, remoteDir, bundle);
-  const cacheAudit = await pruneAndAuditRemoteWorkers(options, `${cacheDir}/${bundle.cacheNamespace}`, hash);
-  return { workerPath: remoteWorker, home: probe.home, cacheAudit };
+  return preparedWorker(options, cacheDir, bundle.cacheNamespace, hash, remoteWorker, probe.home, bundle.companionArtifacts.map(artifact => artifact.executableName), lease);
+    });
+  } catch (error) { await lease.dispose(); throw error; }
 }
 
-/** Versions retained under one contract namespace: the one just activated plus the previous one. */
-export const RETAINED_REMOTE_WORKER_VERSIONS = 2;
-
-/**
- * Shell fragment that deletes every sibling version directory under `namespaceDir`
- * except the active hash and the most recently modified `keep - 1` others.
- * A newly activated version is always the newest, so the previous version
- * survives and a rollback of the local plugin does not re-upload 200 MB.
- * A version lease protects worker self-reentry (eval and broker subprocesses).
- * Legacy processes without a lease are also checked via /proc before deletion.
- */
-export function buildPruneStaleWorkersCommand(
-  namespaceDir: string,
-  activeHash: string,
-  keep = RETAINED_REMOTE_WORKER_VERSIONS,
-): string {
-  if (!/^[a-f0-9]{64}$/.test(activeHash)) throw new Error("Invalid worker hash");
-  const dir = quoteRemoteArgument(namespaceDir);
-  const others = Math.max(0, keep - 1);
-  // ls -t sorts by mtime (newest first); only 64-hex sibling names are candidates.
-  return `cd ${dir} 2>/dev/null || exit 0; ls -1t | grep -E '^[a-f0-9]{64}$' | grep -v '^${activeHash}$' | tail -n +${others + 1} | while IFS= read -r d; do ( exec 9>"$d/.worker.lock" || exit 0; flock -n -x 9 || exit 0; for exe in /proc/[0-9]*/exe; do target=$(readlink "$exe" 2>/dev/null) || continue; case "$target" in "$PWD/$d/"*) exit 0;; esac; done; rm -rf -- "$d" ); done; exit 0`;
-}
-
-/** Shallow worker-binary accounting only: never traverse shared assets or hash binaries. */
-export function buildPruneAndAuditWorkersCommand(namespaceDir: string, activeHash: string): string {
-  const prune = buildPruneStaleWorkersCommand(namespaceDir, activeHash);
-  // Keep the script a single shell argument compatible with quoteRemoteArgument.
-  // Separators are explicit: function/loop openers cannot be followed by `;`.
-  return [
-    `(${prune});`,
-    "set -eu;",
-    `namespace=${quoteRemoteArgument(namespaceDir)};`,
-    'root=$(dirname -- "$namespace");',
-    'if test -e "$root"; then test -r "$root" && test -x "$root" || exit 1; fi;',
-    'audit_namespace() {',
-    'ns=$1; kind=$2; versions=0; files=0; bytes=0; old_versions=0; old_files=0; old_bytes=0;',
-    'if test -e "$ns"; then test -r "$ns" && test -x "$ns" || exit 1; fi;',
-    'for d in "$ns"/*; do',
-    'test -d "$d" && test ! -L "$d" || continue;',
-    'name=${d##*/};',
-    `printf '%s\\n' "$name" | grep -Eq '^[a-f0-9]{64}$' || continue;`,
-    'test -r "$d" && test -x "$d" || exit 1;',
-    'versions=$((versions + 1)); version_files=0; version_bytes=0;',
-    'for binary in "$d/worker" "$d/worker-linux-x64" "$d/worker-linux-arm64"; do',
-    'test -f "$binary" && test ! -L "$binary" || continue;',
-    `allocation=$(stat -c '%b %B' -- "$binary") || exit 1;`,
-    'set -- $allocation;',
-    'test "$#" -eq 2 || exit 1;',
-    'version_files=$((version_files + 1)); version_bytes=$((version_bytes + $1 * $2));',
-    'done;',
-    'files=$((files + version_files)); bytes=$((bytes + version_bytes));',
-    `if test "$name" != '${activeHash}'; then`,
-    'old_versions=$((old_versions + 1)); old_files=$((old_files + version_files)); old_bytes=$((old_bytes + version_bytes));',
-    'fi;',
-    'done;',
-    `printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$kind" "\${ns##*/}" "$versions" "$files" "$bytes" "$old_versions" "$old_files" "$old_bytes";`,
-    '};',
-    'audit_namespace "$namespace" current;',
-    'for ns in "$root"/*; do',
-    'test -d "$ns" && test ! -L "$ns" && test "$ns" != "$namespace" || continue;',
-    'name=${ns##*/};',
-    `printf '%s\\n' "$name" | grep -Eq '^(omp-[a-zA-Z0-9][a-zA-Z0-9._-]*|[0-9]+\\.[0-9]+\\.[0-9]+([+-][a-zA-Z0-9.-]+)?)$' || continue;`,
-    'audit_namespace "$ns" legacy;',
-    'done',
-  ].join(" ");
-}
-
-export function parseRemoteWorkerCacheAudit(output: string, namespace: string): RemoteWorkerCacheAudit {
-  const rows = output.split("\n").map(line => {
-    const [kind, name, ...fields] = line.split("\t");
-    if (!name || fields.length !== 6 || fields.some(field => !/^(0|[1-9][0-9]*)$/.test(field) || !Number.isSafeInteger(Number(field)))) {
-      throw new Error("Invalid worker cache audit response");
-    }
-    const [versions, binaryFiles, allocatedBytes, oldVersions, oldFiles, oldBytes] = fields.map(Number) as [number, number, number, number, number, number];
-    if (oldVersions > versions || oldFiles > binaryFiles || oldBytes > allocatedBytes) throw new Error("Inconsistent worker cache audit response");
-    return { kind, usage: { namespace: name, versions, binaryFiles, allocatedBytes }, old: { versions: oldVersions, binaryFiles: oldFiles, allocatedBytes: oldBytes } };
-  });
-  const current = rows.shift();
-  if (current?.kind !== "current" || current.usage.namespace !== namespace || rows.some(row => row.kind !== "legacy" || !/^(omp-[a-zA-Z0-9][a-zA-Z0-9._-]*|[0-9]+\.[0-9]+\.[0-9]+([+-][a-zA-Z0-9.-]+)?)$/.test(row.usage.namespace)) || new Set(rows.map(row => row.usage.namespace)).size !== rows.length) {
-    throw new Error("Invalid worker cache audit namespaces");
-  }
-  return {
-    available: true,
-    observedAt: new Date().toISOString(),
-    scope: "worker binaries only; excludes shared assets and other cache contents",
-    metric: "sum of per-file allocated bytes (stat blocks × block size), not logical size",
-    current: current.usage,
-    retainedOld: current.old,
-    legacy: rows.map(row => row.usage),
-  };
+export function parseRemoteWorkerCacheAudit(output: string): RemoteWorkerCacheAudit {
+  const [kind, ...fields] = output.split("\t");
+  if (kind !== "managed" || fields.length !== 10 || fields.some(value => !/^(0|[1-9][0-9]*)$/.test(value) || !Number.isSafeInteger(Number(value)))) throw new Error("Invalid worker cache audit response");
+  const [builds, replicas, binaryFiles, allocatedBytes, deletedBuilds, deletedReplicas, deletedBytes, busyBuilds, busyReplicas, unclassified] = fields.map(Number) as [number, number, number, number, number, number, number, number, number, number];
+  if (builds > replicas || busyBuilds > busyReplicas || busyReplicas > replicas || deletedBuilds > deletedReplicas) throw new Error("Inconsistent worker cache audit response");
+  return { available: true, observedAt: new Date().toISOString(), scope: "worker binaries only; excludes shared assets and other cache contents", metric: "sum of per-file allocated bytes (stat blocks × block size), not logical size", retained: { builds, replicas, binaryFiles, allocatedBytes }, deleted: { builds: deletedBuilds, replicas: deletedReplicas, allocatedBytes: deletedBytes }, busy: { builds: busyBuilds, replicas: busyReplicas }, unclassified };
 }
 
 export function describeRemoteWorkerCacheAudit(audit: RemoteWorkerCacheAudit): string {
   if (!audit.available) return audit.warning;
   const size = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
-  const usage = (entry: Omit<RemoteWorkerCacheUsage, "namespace">) => `${entry.versions} version(s), ${entry.binaryFiles} binary file(s), ${size(entry.allocatedBytes)}`;
-  const legacy = audit.legacy.length ? audit.legacy.slice(0, 3).map(entry => `${entry.namespace}: ${usage(entry)}`).join("; ") + (audit.legacy.length > 3 ? `; +${audit.legacy.length - 3} more namespace(s)` : "") : "none";
-  return `Worker cache (${audit.current.namespace}): ${usage(audit.current)}; retained old: ${usage(audit.retainedOld)}; legacy: ${legacy}. Allocated binary bytes only, not total cache usage; shared assets excluded. Retained versions may still be in use.`;
+  return `Worker cache (managed native OMP): retained ${audit.retained.builds} distinct build(s), ${audit.retained.replicas} replica(s), ${size(audit.retained.allocatedBytes)}; deleted ${audit.deleted.replicas} replica(s), ${size(audit.deleted.allocatedBytes)}; busy exemptions ${audit.busy.builds} build(s), ${audit.busy.replicas} replica(s); unclassified ${audit.unclassified} candidate directories. Policy: two distinct used builds, plus busy exemptions. Allocated binary bytes only, not total cache usage; shared assets excluded.`;
 }
 
-async function pruneAndAuditRemoteWorkers(
-  options: WorkerDeploymentOptions,
-  namespaceDir: string,
-  activeHash: string,
-): Promise<RemoteWorkerCacheAudit> {
-  try {
-    const output = await run(
-      [
-        ...buildSshBaseCommand(options),
-        getSshDestination(options),
-        `timeout -k 1s 8s sh -c ${quoteRemoteArgument(buildPruneAndAuditWorkersCommand(namespaceDir, activeHash))}`,
-      ],
-      "Remote worker cache prune and audit",
-      10_000,
-    );
-    return parseRemoteWorkerCacheAudit(output, namespaceDir.slice(namespaceDir.lastIndexOf("/") + 1));
-  } catch {
-    return { available: false, observedAt: new Date().toISOString(), warning: "Worker cache audit unavailable (prune/audit failed or exceeded 10s); connection continues." };
-  }
+async function acquireDeploymentLease(options: WorkerDeploymentOptions, root: string, namespace: string, hash: string): Promise<{ signal: AbortSignal; dispose(): Promise<void> }> {
+  options.signal?.throwIfAborted();
+  const failed = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, failed.signal]) : failed.signal;
+  const command = [...buildSshBaseCommand(options), getSshDestination(options), buildWorkerDeploymentLeaseCommand(root, namespace, hash)];
+  const [file, ...args] = command;
+  const proc = spawn(file, args, { stdio: ["pipe", "pipe", "pipe"] });
+  let disposed = false;
+  let ready = false;
+  let output = "";
+  let errors = "";
+  proc.stdin.on("error", () => {});
+  const acquired = Promise.withResolvers<void>();
+  const closed = Promise.withResolvers<void>();
+  const abort = () => { proc.stdin.end(); proc.kill("SIGKILL"); acquired.reject(new Error("Worker deployment lease cancelled", { cause: signal.reason })); };
+  signal.addEventListener("abort", abort, { once: true });
+  if (signal.aborted) abort();
+  proc.stdout.on("data", (chunk: Buffer) => {
+    output += chunk.toString();
+    if (!ready && output === "READY\n") { ready = true; acquired.resolve(); }
+    else if (output.length > 1024 || output.includes("\n") && output !== "READY\n") failed.abort(new Error("Invalid worker deployment lease response"));
+  });
+  proc.stderr.on("data", (chunk: Buffer) => { errors = (errors + chunk.toString()).slice(-4096); });
+  proc.on("error", error => { acquired.reject(error); if (!disposed) failed.abort(error); });
+  proc.on("close", () => {
+    closed.resolve();
+    if (!disposed) { const error = new Error(`Worker deployment lease lost: ${errors || "SSH channel closed"}`); acquired.reject(error); failed.abort(error); }
+  });
+  const timer = setTimeout(() => failed.abort(new Error("Worker deployment lease acquisition timed out")), 20_000);
+  const dispose = async () => {
+    if (disposed) return;
+    disposed = true;
+    signal.removeEventListener("abort", abort);
+    proc.stdin.end();
+    const kill = setTimeout(() => proc.kill("SIGKILL"), 2000);
+    try { await closed.promise; } finally { clearTimeout(kill); }
+  };
+  try { await acquired.promise; signal.throwIfAborted(); return { signal, dispose }; }
+  catch (error) { await dispose(); throw error; }
+  finally { clearTimeout(timer); }
+}
+
+function preparedWorker(options: WorkerDeploymentOptions, root: string, namespace: string, hash: string, workerPath: string, home: string, links: readonly string[], lease: { signal: AbortSignal; dispose(): Promise<void> }): PreparedRemoteWorker {
+  let committed: Promise<RemoteWorkerCacheAudit> | undefined;
+  const result: PreparedRemoteWorker = {
+    workerPath, home, signal: lease.signal, dispose: lease.dispose,
+    cacheAudit: { available: false, observedAt: new Date().toISOString(), warning: "Worker cache usage not committed: native admission has not succeeded." },
+    commitUsage() {
+      return committed ??= deploymentContext.run({ ...options, signal: lease.signal }, async () => {
+        lease.signal.throwIfAborted();
+        try {
+          const output = await run([...buildSshBaseCommand(options), getSshDestination(options), `timeout -k 1s 8s sh -c ${quoteRemoteArgument(buildCommitWorkerCacheCommand(root, namespace, hash, links))}`], "Commit admitted worker usage and collect cache", 10_000);
+          result.cacheAudit = parseRemoteWorkerCacheAudit(output);
+        } catch {
+          result.cacheAudit = { available: false, observedAt: new Date().toISOString(), warning: "Worker cache audit unavailable (usage commit/collection failed or exceeded 10s); connection continues." };
+        }
+        lease.signal.throwIfAborted();
+        return result.cacheAudit;
+      });
+    },
+  };
+  return result;
 }
 
 async function deployCompanionArtifacts(
@@ -537,5 +500,6 @@ async function deployCompanionArtifact(
 export async function ensureRemoteWorker(
   options: WorkerDeploymentOptions,
 ): Promise<string> {
-  return (await prepareRemoteWorker(options)).workerPath;
+  const prepared = await prepareRemoteWorker(options);
+  try { return prepared.workerPath; } finally { await prepared.dispose(); }
 }

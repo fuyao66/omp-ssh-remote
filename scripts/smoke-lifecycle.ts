@@ -132,9 +132,9 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       const cacheStatus = (await invoke("remote_workspace_status", {})).details as any;
       assert.equal(cacheStatus.cacheAudit?.available, true, JSON.stringify(cacheStatus.cacheAudit));
       assert(Date.parse(cacheStatus.cacheAudit.observedAt) >= auditStartedAt);
-      assert(cacheStatus.cacheAudit.current.versions >= 1);
-      assert(cacheStatus.cacheAudit.current.binaryFiles >= 1);
-      assert(cacheStatus.cacheAudit.current.allocatedBytes > 0);
+      assert(cacheStatus.cacheAudit.retained.builds >= 1);
+      assert(cacheStatus.cacheAudit.retained.binaryFiles >= 1);
+      assert(cacheStatus.cacheAudit.retained.allocatedBytes > 0);
       assert.match(cacheStatus.cacheAudit.scope, /worker binaries only/);
       assert.match(cacheStatus.cacheAudit.metric, /allocated bytes.*not logical size/);
       assert(notifications.some(message => message.includes("Worker cache (") && message.includes("not total cache usage")));
