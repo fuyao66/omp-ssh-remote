@@ -170,9 +170,31 @@ function parseProbe(output: string): { platform: string; home: string } {
   return { platform: `${os}/${arch}`, home };
 }
 
+export type RemoteWorkerCacheUsage = {
+  namespace: string;
+  versions: number;
+  binaryFiles: number;
+  allocatedBytes: number;
+};
+
+export type RemoteWorkerCacheAudit = {
+  observedAt: string;
+} & ({
+  available: true;
+  scope: "worker binaries only; excludes shared assets and other cache contents";
+  metric: "sum of per-file allocated bytes (stat blocks × block size), not logical size";
+  current: RemoteWorkerCacheUsage;
+  retainedOld: Omit<RemoteWorkerCacheUsage, "namespace">;
+  legacy: RemoteWorkerCacheUsage[];
+} | {
+  available: false;
+  warning: string;
+});
+
 export type PreparedRemoteWorker = {
   workerPath: string;
   home?: string;
+  cacheAudit: RemoteWorkerCacheAudit;
 };
 
 export async function resolveRemoteHome(
@@ -259,10 +281,8 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
       remoteDir,
       bundle,
     );
-    await pruneStaleRemoteWorkers(options, `${cacheDir}/${bundle.cacheNamespace}`, hash).catch(
-      () => undefined,
-    );
-    return { workerPath: remoteWorker, home: probe.home };
+    const cacheAudit = await pruneAndAuditRemoteWorkers(options, `${cacheDir}/${bundle.cacheNamespace}`, hash);
+    return { workerPath: remoteWorker, home: probe.home, cacheAudit };
   }
   if (exists !== "missing")
     throw new Error(`Unexpected remote worker check response: ${exists}`);
@@ -302,10 +322,8 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
     throw error;
   }
   await deployCompanionArtifacts(options, probe.home, arch, remoteDir, bundle);
-  await pruneStaleRemoteWorkers(options, `${cacheDir}/${bundle.cacheNamespace}`, hash).catch(
-    () => undefined,
-  );
-  return { workerPath: remoteWorker, home: probe.home };
+  const cacheAudit = await pruneAndAuditRemoteWorkers(options, `${cacheDir}/${bundle.cacheNamespace}`, hash);
+  return { workerPath: remoteWorker, home: probe.home, cacheAudit };
 }
 
 /** Versions retained under one contract namespace: the one just activated plus the previous one. */
@@ -331,19 +349,102 @@ export function buildPruneStaleWorkersCommand(
   return `cd ${dir} 2>/dev/null || exit 0; ls -1t | grep -E '^[a-f0-9]{64}$' | grep -v '^${activeHash}$' | tail -n +${others + 1} | while IFS= read -r d; do ( exec 9>"$d/.worker.lock" || exit 0; flock -n -x 9 || exit 0; for exe in /proc/[0-9]*/exe; do target=$(readlink "$exe" 2>/dev/null) || continue; case "$target" in "$PWD/$d/"*) exit 0;; esac; done; rm -rf -- "$d" ); done; exit 0`;
 }
 
-async function pruneStaleRemoteWorkers(
+/** Shallow worker-binary accounting only: never traverse shared assets or hash binaries. */
+export function buildPruneAndAuditWorkersCommand(namespaceDir: string, activeHash: string): string {
+  const prune = buildPruneStaleWorkersCommand(namespaceDir, activeHash);
+  // Keep the script a single shell argument compatible with quoteRemoteArgument.
+  // Separators are explicit: function/loop openers cannot be followed by `;`.
+  return [
+    `(${prune});`,
+    "set -eu;",
+    `namespace=${quoteRemoteArgument(namespaceDir)};`,
+    'root=$(dirname -- "$namespace");',
+    'if test -e "$root"; then test -r "$root" && test -x "$root" || exit 1; fi;',
+    'audit_namespace() {',
+    'ns=$1; kind=$2; versions=0; files=0; bytes=0; old_versions=0; old_files=0; old_bytes=0;',
+    'if test -e "$ns"; then test -r "$ns" && test -x "$ns" || exit 1; fi;',
+    'for d in "$ns"/*; do',
+    'test -d "$d" && test ! -L "$d" || continue;',
+    'name=${d##*/};',
+    `printf '%s\\n' "$name" | grep -Eq '^[a-f0-9]{64}$' || continue;`,
+    'test -r "$d" && test -x "$d" || exit 1;',
+    'versions=$((versions + 1)); version_files=0; version_bytes=0;',
+    'for binary in "$d/worker" "$d/worker-linux-x64" "$d/worker-linux-arm64"; do',
+    'test -f "$binary" && test ! -L "$binary" || continue;',
+    `allocation=$(stat -c '%b %B' -- "$binary") || exit 1;`,
+    'set -- $allocation;',
+    'test "$#" -eq 2 || exit 1;',
+    'version_files=$((version_files + 1)); version_bytes=$((version_bytes + $1 * $2));',
+    'done;',
+    'files=$((files + version_files)); bytes=$((bytes + version_bytes));',
+    `if test "$name" != '${activeHash}'; then`,
+    'old_versions=$((old_versions + 1)); old_files=$((old_files + version_files)); old_bytes=$((old_bytes + version_bytes));',
+    'fi;',
+    'done;',
+    `printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$kind" "\${ns##*/}" "$versions" "$files" "$bytes" "$old_versions" "$old_files" "$old_bytes";`,
+    '};',
+    'audit_namespace "$namespace" current;',
+    'for ns in "$root"/*; do',
+    'test -d "$ns" && test ! -L "$ns" && test "$ns" != "$namespace" || continue;',
+    'name=${ns##*/};',
+    `printf '%s\\n' "$name" | grep -Eq '^(omp-[a-zA-Z0-9][a-zA-Z0-9._-]*|[0-9]+\\.[0-9]+\\.[0-9]+([+-][a-zA-Z0-9.-]+)?)$' || continue;`,
+    'audit_namespace "$ns" legacy;',
+    'done',
+  ].join(" ");
+}
+
+export function parseRemoteWorkerCacheAudit(output: string, namespace: string): RemoteWorkerCacheAudit {
+  const rows = output.split("\n").map(line => {
+    const [kind, name, ...fields] = line.split("\t");
+    if (!name || fields.length !== 6 || fields.some(field => !/^(0|[1-9][0-9]*)$/.test(field) || !Number.isSafeInteger(Number(field)))) {
+      throw new Error("Invalid worker cache audit response");
+    }
+    const [versions, binaryFiles, allocatedBytes, oldVersions, oldFiles, oldBytes] = fields.map(Number) as [number, number, number, number, number, number];
+    if (oldVersions > versions || oldFiles > binaryFiles || oldBytes > allocatedBytes) throw new Error("Inconsistent worker cache audit response");
+    return { kind, usage: { namespace: name, versions, binaryFiles, allocatedBytes }, old: { versions: oldVersions, binaryFiles: oldFiles, allocatedBytes: oldBytes } };
+  });
+  const current = rows.shift();
+  if (current?.kind !== "current" || current.usage.namespace !== namespace || rows.some(row => row.kind !== "legacy" || !/^(omp-[a-zA-Z0-9][a-zA-Z0-9._-]*|[0-9]+\.[0-9]+\.[0-9]+([+-][a-zA-Z0-9.-]+)?)$/.test(row.usage.namespace)) || new Set(rows.map(row => row.usage.namespace)).size !== rows.length) {
+    throw new Error("Invalid worker cache audit namespaces");
+  }
+  return {
+    available: true,
+    observedAt: new Date().toISOString(),
+    scope: "worker binaries only; excludes shared assets and other cache contents",
+    metric: "sum of per-file allocated bytes (stat blocks × block size), not logical size",
+    current: current.usage,
+    retainedOld: current.old,
+    legacy: rows.map(row => row.usage),
+  };
+}
+
+export function describeRemoteWorkerCacheAudit(audit: RemoteWorkerCacheAudit): string {
+  if (!audit.available) return audit.warning;
+  const size = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  const usage = (entry: Omit<RemoteWorkerCacheUsage, "namespace">) => `${entry.versions} version(s), ${entry.binaryFiles} binary file(s), ${size(entry.allocatedBytes)}`;
+  const legacy = audit.legacy.length ? audit.legacy.slice(0, 3).map(entry => `${entry.namespace}: ${usage(entry)}`).join("; ") + (audit.legacy.length > 3 ? `; +${audit.legacy.length - 3} more namespace(s)` : "") : "none";
+  return `Worker cache (${audit.current.namespace}): ${usage(audit.current)}; retained old: ${usage(audit.retainedOld)}; legacy: ${legacy}. Allocated binary bytes only, not total cache usage; shared assets excluded. Retained versions may still be in use.`;
+}
+
+async function pruneAndAuditRemoteWorkers(
   options: WorkerDeploymentOptions,
   namespaceDir: string,
   activeHash: string,
-): Promise<void> {
-  await run(
-    [
-      ...buildSshBaseCommand(options),
-      getSshDestination(options),
-      buildPruneStaleWorkersCommand(namespaceDir, activeHash),
-    ],
-    "Remote worker cache prune",
-  );
+): Promise<RemoteWorkerCacheAudit> {
+  try {
+    const output = await run(
+      [
+        ...buildSshBaseCommand(options),
+        getSshDestination(options),
+        `timeout -k 1s 8s sh -c ${quoteRemoteArgument(buildPruneAndAuditWorkersCommand(namespaceDir, activeHash))}`,
+      ],
+      "Remote worker cache prune and audit",
+      10_000,
+    );
+    return parseRemoteWorkerCacheAudit(output, namespaceDir.slice(namespaceDir.lastIndexOf("/") + 1));
+  } catch {
+    return { available: false, observedAt: new Date().toISOString(), warning: "Worker cache audit unavailable (prune/audit failed or exceeded 10s); connection continues." };
+  }
 }
 
 async function deployCompanionArtifacts(

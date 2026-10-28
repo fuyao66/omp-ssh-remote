@@ -15,7 +15,7 @@ import {
   type RemoteConnectRequest,
 } from "./connect-options.ts";
 import { RemoteRuntimeClient } from "./client.ts";
-import { prepareRemoteWorker, resolveRemoteHome } from "./deploy.ts";
+import { describeRemoteWorkerCacheAudit, prepareRemoteWorker, resolveRemoteHome, type RemoteWorkerCacheAudit } from "./deploy.ts";
 import { REMOTE_TOOL_NAMES, type RemoteToolName, type ReadyMessage } from "./protocol.ts";
 import { createOmpRuntimeHandshake, captureOmpToolSnapshot } from "./omp/runtime-contract.ts";
 import { ompHostCompatibility, resolveOmpHostVersion, type OmpHostCompatibility } from "./omp/host-identity.ts";
@@ -124,6 +124,8 @@ export type RemoteWorkspaceStatus = {
   remoteCwd: string | null;
   sessionRole: "owner" | "subagent" | null;
   connectionError: string | null;
+  /** Last connection deployment snapshot; status never probes SSH. */
+  cacheAudit: RemoteWorkerCacheAudit | null;
   remoteWorkspaceTools: RemoteToolName[];
   pendingRemoteAstProposals: number;
   hostCompatibility: {
@@ -153,6 +155,7 @@ type RemoteWorkspaceStatusInput = {
   wrappedTools: Iterable<RemoteToolName>;
   proposalSources: Iterable<ExecutionTarget>;
   hostCompatibility?: OmpHostCompatibility;
+  cacheAudit?: RemoteWorkerCacheAudit;
 };
 
 export function workspaceStatus(
@@ -178,6 +181,7 @@ export function workspaceStatus(
       mode === "unavailable"
         ? (input.connectionError ?? "Remote runtime transport is unavailable")
         : null,
+    cacheAudit: selected ? (input.cacheAudit ?? null) : null,
     remoteWorkspaceTools: selected
       ? [...new Set(input.wrappedTools)].sort()
       : [],
@@ -267,6 +271,7 @@ type RemoteFamily = {
   localCwd: string;
   remoteCwd: string;
   connection: RemoteConnectOptions & { workerPath: string };
+  cacheAudit?: RemoteWorkerCacheAudit;
   members: Set<RemoteExtensionState>;
   closing: boolean;
 };
@@ -943,6 +948,7 @@ export type RemoteReconnectOutcome = {
   remoteCwd: string;
   droppedRemoteProposals: number;
   replacedLiveTransport: boolean;
+  cacheAudit: RemoteWorkerCacheAudit;
 };
 
 /**
@@ -978,6 +984,7 @@ async function reconnectRemoteRuntime(
   const droppedRemoteProposals = state.proposalSources.filter((source) => source === "remote").length;
   state.proposalSources = state.proposalSources.filter((source) => source === "local");
   state.connectionError = "Remote runtime reconnect in progress";
+  family.cacheAudit = undefined;
   const deployment = new AbortController();
   state.deployment = deployment;
   try {
@@ -1007,12 +1014,14 @@ async function reconnectRemoteRuntime(
     state.binding = binding;
     state.remoteCwd = remoteCwd;
     state.connectionError = undefined;
+    family.cacheAudit = prepared.cacheAudit;
     state.editMode = ready.editMode;
     return {
       target: family.connection.displayTarget,
       remoteCwd,
       droppedRemoteProposals,
       replacedLiveTransport: live,
+      cacheAudit: prepared.cacheAudit,
     };
   } catch (error) {
     state.connectionError = `Remote runtime reconnect failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -1029,7 +1038,7 @@ function describeReconnect(outcome: RemoteReconnectOutcome): string {
     notes.push(`${outcome.droppedRemoteProposals} remote staged proposal(s) were lost with the old worker`);
   }
   notes.push("non-persistent remote services stopped by the disconnect are not restarted");
-  return `Remote runtime reconnected: ${outcome.target}:${outcome.remoteCwd} (${notes.join("; ")})`;
+  return `Remote runtime reconnected: ${outcome.target}:${outcome.remoteCwd} (${notes.join("; ")})\n${describeRemoteWorkerCacheAudit(outcome.cacheAudit)}`;
 }
 
 async function attachFamilyMember(
@@ -1121,6 +1130,7 @@ export default async function remoteRuntimeExtension(
         wrappedTools: state.wrappedTools,
         proposalSources: state.proposalSources,
         hostCompatibility,
+        cacheAudit: state.family?.cacheAudit,
       });
       return {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
@@ -1202,6 +1212,7 @@ export default async function remoteRuntimeExtension(
           localCwd,
           remoteCwd: resolvedRemoteCwd,
           connection: { ...connection, cwd: resolvedRemoteCwd },
+          cacheAudit: prepared.cacheAudit,
           members: new Set([state]),
           closing: false,
         };
@@ -1221,8 +1232,8 @@ export default async function remoteRuntimeExtension(
           `ssh ${request.displayTarget}:${ready.cwd}`,
         );
         ctx?.ui?.notify?.(
-          `Remote runtime connected: ${request.displayTarget}:${ready.cwd}`,
-          "info",
+          `Remote runtime connected: ${request.displayTarget}:${ready.cwd}\n${describeRemoteWorkerCacheAudit(prepared.cacheAudit)}`,
+          prepared.cacheAudit.available ? "info" : "warning",
         );
         const details = {
           success: true,
@@ -1230,6 +1241,7 @@ export default async function remoteRuntimeExtension(
           target: request.displayTarget,
           remoteCwd: resolvedRemoteCwd,
           wrappedTools: [...state.wrappedTools],
+          cacheAudit: prepared.cacheAudit,
         };
         return {
           content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
@@ -1335,7 +1347,7 @@ export default async function remoteRuntimeExtension(
       const p = asRecord(params);
       const outcome = await reconnectRemoteRuntime(pi, state, ctx, { force: p.force === true, signal: _signal });
       ctx?.ui?.setStatus?.("remote-runtime", `ssh ${outcome.target}:${outcome.remoteCwd}`);
-      ctx?.ui?.notify?.(describeReconnect(outcome), "info");
+      ctx?.ui?.notify?.(describeReconnect(outcome), outcome.cacheAudit.available ? "info" : "warning");
       const details = { success: true, mode: "remote", ...outcome, wrappedTools: [...state.wrappedTools] };
       return {
         content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
@@ -1386,6 +1398,7 @@ export default async function remoteRuntimeExtension(
           localCwd: ctx.cwd,
           remoteCwd: resolvedRemoteCwd,
           connection: { ...connection, cwd: resolvedRemoteCwd },
+          cacheAudit: prepared.cacheAudit,
           members: new Set([state]),
           closing: false,
         };
@@ -1405,8 +1418,8 @@ export default async function remoteRuntimeExtension(
           `ssh ${request.displayTarget}:${ready.cwd}`,
         );
         ctx.ui.notify(
-          `Remote runtime connected: ${request.displayTarget}:${ready.cwd}`,
-          "info",
+          `Remote runtime connected: ${request.displayTarget}:${ready.cwd}\n${describeRemoteWorkerCacheAudit(prepared.cacheAudit)}`,
+          prepared.cacheAudit.available ? "info" : "warning",
         );
       } catch (error) {
         next?.kill();
@@ -1431,7 +1444,9 @@ export default async function remoteRuntimeExtension(
       const build = hostCompatibility.compatible
         ? `plugin built for OMP ${hostCompatibility.compiledHostVersion}`
         : (hostCompatibility.advice ?? "plugin build version unknown");
-      ctx.ui.notify(`${status}. ${build}`, hostCompatibility.compatible ? "info" : "warning");
+      const cacheAudit = state.family?.cacheAudit;
+      const audit = state.selected && cacheAudit ? ` Last deployment (${cacheAudit.observedAt}): ${describeRemoteWorkerCacheAudit(cacheAudit)}` : "";
+      ctx.ui.notify(`${status}. ${build}${audit}`, hostCompatibility.compatible ? "info" : "warning");
     },
   });
 
@@ -1443,7 +1458,7 @@ export default async function remoteRuntimeExtension(
       try {
         const outcome = await reconnectRemoteRuntime(pi, state, ctx, { force });
         ctx.ui.setStatus("remote-runtime", `ssh ${outcome.target}:${outcome.remoteCwd}`);
-        ctx.ui.notify(describeReconnect(outcome), "info");
+        ctx.ui.notify(describeReconnect(outcome), outcome.cacheAudit.available ? "info" : "warning");
       } finally {
         ctx.ui.setWorkingMessage();
       }

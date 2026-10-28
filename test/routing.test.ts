@@ -308,6 +308,15 @@ describe("remote workspace status", () => {
       },
     });
   });
+
+  test("status returns only the supplied last-deployment snapshot and hides it in local mode", async () => {
+    const { workspaceStatus } = await import("../src/extension.ts");
+    const cacheAudit = { available: false as const, observedAt: "2026-10-01T00:00:00.000Z", warning: "Worker cache audit unavailable" };
+    const input = { selected: true, clientPresent: true, clientClosed: false, owner: true, wrappedTools: [], proposalSources: [], cacheAudit };
+    expect(workspaceStatus(input).cacheAudit).toEqual(cacheAudit);
+    expect(workspaceStatus({ ...input, cacheAudit: undefined }).cacheAudit).toBeNull();
+    expect(workspaceStatus({ ...input, selected: false }).cacheAudit).toBeNull();
+  });
 });
 
 describe("AST proposal tracking", () => {

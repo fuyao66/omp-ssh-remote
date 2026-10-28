@@ -59,6 +59,7 @@ describe("OMP extension loading", () => {
         remoteCwd: null,
         sessionRole: null,
         connectionError: null,
+        cacheAudit: null,
         remoteWorkspaceTools: [],
         pendingRemoteAstProposals: 0,
         hostCompatibility: {

@@ -117,7 +117,30 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       const began = performance.now();
       phase = "command:remote-connect";
       record("connect");
-      await commands.get("remote-connect")!.handler(args, ctx); connected = true;
+      const notifications: string[] = [];
+      const connectContext = new Proxy(ctx, { get(target, key) {
+        if (key === "ui") return new Proxy(target.ui, { get(ui, uiKey) {
+          if (uiKey === "notify") return (message: string, ...rest: unknown[]) => { notifications.push(message); return (ui.notify as (...params: any[]) => unknown)(message, ...rest); };
+          const value = Reflect.get(ui, uiKey);
+          return typeof value === "function" ? value.bind(ui) : value;
+        }});
+        const value = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      }});
+      const auditStartedAt = Date.now();
+      await commands.get("remote-connect")!.handler(args, connectContext); connected = true;
+      const cacheStatus = (await invoke("remote_workspace_status", {})).details as any;
+      assert.equal(cacheStatus.cacheAudit?.available, true, JSON.stringify(cacheStatus.cacheAudit));
+      assert(Date.parse(cacheStatus.cacheAudit.observedAt) >= auditStartedAt);
+      assert(cacheStatus.cacheAudit.current.versions >= 1);
+      assert(cacheStatus.cacheAudit.current.binaryFiles >= 1);
+      assert(cacheStatus.cacheAudit.current.allocatedBytes > 0);
+      assert.match(cacheStatus.cacheAudit.scope, /worker binaries only/);
+      assert.match(cacheStatus.cacheAudit.metric, /allocated bytes.*not logical size/);
+      assert(notifications.some(message => message.includes("Worker cache (") && message.includes("not total cache usage")));
+      const cachedStatus = (await invoke("remote_workspace_status", {})).details as any;
+      assert.deepEqual(cachedStatus.cacheAudit, cacheStatus.cacheAudit);
+      console.log("CACHE_AUDIT_PASS", JSON.stringify(cacheStatus.cacheAudit));
       console.log("LIFECYCLE_CONNECT_MS", performance.now() - began);
       const remote = text(await invoke("bash", { command: "hostname" })).trim();
       assert.notEqual(remote, local);
@@ -247,6 +270,13 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       console.log("SERVICE_NATURAL_EXIT_PASS");
       const removed = await invoke("bash", { command: `rm -- '${file}' '${asyncGate}' '${serviceGate}'` });
       assert(!removed.isError, text(removed));
+      const reconnectStartedAt = Date.now();
+      const reconnect = (await invoke("remote_reconnect", { force: true })).details as any;
+      assert.equal(reconnect.cacheAudit?.available, true, JSON.stringify(reconnect.cacheAudit));
+      assert(Date.parse(reconnect.cacheAudit.observedAt) >= reconnectStartedAt);
+      assert.notEqual(reconnect.cacheAudit.observedAt, cacheStatus.cacheAudit.observedAt);
+      assert.deepEqual(((await invoke("remote_workspace_status", {})).details as any).cacheAudit, reconnect.cacheAudit);
+      console.log("CACHE_AUDIT_RECONNECT_PASS");
       phase = "command:remote-exit";
       record("disconnect");
       await commands.get("remote-exit")!.handler("", ctx); connected = false;
