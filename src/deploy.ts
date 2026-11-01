@@ -1,6 +1,6 @@
 import { access, readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { sha256File } from "./file-hash.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { OMP_WORKER_BUNDLE } from "./omp/runtime-contract.ts";
@@ -164,8 +164,7 @@ async function readWorkerHash(workerPath: string): Promise<string> {
     if (!(error instanceof Error && "code" in error && error.code === "ENOENT"))
       throw error;
   }
-  const data = await readFile(workerPath);
-  return createHash("sha256").update(data).digest("hex");
+  return sha256File(workerPath);
 }
 function parseProbe(output: string): { platform: string; home: string } {
   const [os, arch, home, ...extra] = output.split("\n");

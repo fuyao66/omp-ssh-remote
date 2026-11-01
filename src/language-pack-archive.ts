@@ -3,6 +3,14 @@ export const LANGUAGE_PACK_ARCHIVE_SCRIPT = String.raw`
 import os, sys, json, hashlib, tarfile, pathlib, tempfile, shutil, stat, fcntl
 
 def digest(data): return hashlib.sha256(data).hexdigest()
+def digest_file(path):
+    checksum=hashlib.sha256()
+    with open(path,'rb') as f:
+        while True:
+            chunk=f.read(1024*1024)
+            if not chunk: break
+            checksum.update(chunk)
+    return checksum.hexdigest()
 def safe_name(name):
     p = pathlib.PurePosixPath(name)
     if not name or name.startswith('/') or '..' in p.parts or '\\' in name or any(ord(c)<32 for c in name):
@@ -62,8 +70,7 @@ def verify(root, ident, arch):
             actual.add(rel)
             item=expected.get(rel)
             if not item or stat.S_IMODE(st.st_mode)!=item['mode']: raise ValueError('file/mode mismatch: '+rel)
-            with open(path,'rb') as f:
-                if digest(f.read())!=item['sha256']: raise ValueError('file checksum mismatch: '+rel)
+            if digest_file(path)!=item['sha256']: raise ValueError('file checksum mismatch: '+rel)
     if actual!=set(expected): raise ValueError('incomplete pack')
     for n in EXECUTABLES[profile]:
         if expected[n]['mode']!=0o755: raise ValueError('nonexecutable launcher')
@@ -75,7 +82,7 @@ def publish(pack,out,arch,provenance):
     for base,dirs,names in os.walk(pack):
         for name in names:
             p=os.path.join(base,name); rel=os.path.relpath(p,pack)
-            with open(p,'rb') as f: checksum=digest(f.read())
+            checksum=digest_file(p)
             files[rel]={'sha256':checksum,'mode':stat.S_IMODE(os.stat(p).st_mode)}
     manifest={'format':1,'platform':'linux','arch':arch,'entrypoint':entrypoint,'provenance':provenance,'files':files}
     raw=(json.dumps(manifest,sort_keys=True,separators=(',',':'))+'\n').encode()
@@ -88,7 +95,7 @@ def publish(pack,out,arch,provenance):
             info=tar.gettarinfo(os.path.join(pack,rel),arcname=rel)
             info.uid=info.gid=0; info.uname=info.gname=''; info.mtime=0
             with open(os.path.join(pack,rel),'rb') as f: tar.addfile(info,f)
-    with open(out+'.tar.gz','rb') as f: archive_hash=digest(f.read())
+    archive_hash=digest_file(out+'.tar.gz')
     with open(out+'.json','w') as f: json.dump({'format':1,'platform':'linux','arch':arch,'id':ident,'archiveSha256':archive_hash},f,sort_keys=True)
     print(ident)
 
@@ -109,8 +116,7 @@ if mode=='cache':
             print(final)
         elif archive=='-': print('missing')
         else:
-            with open(archive,'rb') as f:
-                if digest(f.read())!=archive_hash: raise ValueError('archive checksum mismatch')
+            if digest_file(archive)!=archive_hash: raise ValueError('archive checksum mismatch')
             staging=tempfile.mkdtemp(prefix='.'+ident+'.stage-',dir=root)
             try:
                 with tarfile.open(archive,'r:gz') as tar: extract(tar,members(tar),staging)

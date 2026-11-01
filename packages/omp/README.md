@@ -232,6 +232,13 @@ October 2026, OMP 18.9.1 on a Linux x86_64 acceptance host, cached worker and pe
 
 Worker initialization was `2439 ms`. A separate initial upload took `88.36 s`, with read/bash medians around `0.8 s`; the later interleaved control returned to the table above. These are historical measurements, not a controlled speedup comparison or current-version memory/performance claims. ARM64 has build validation, not live performance acceptance.
 
+### 0.13.1 controlled local comparison
+
+On Linux x86_64 with Bun 1.4.4 and OMP 18.15.0, three alternating baseline/candidate pairs used fresh processes and warm filesystem caches. Language-pack verification still checks every manifest-listed file, mode and checksum; only hashing changes to bounded streaming reads. For the same C++ pack (345 files, 287,392,119 bytes), complete Python cache verification median peak RSS fell from **166.13 to 22.04 MiB**; elapsed time was **271.79 to 202.46 ms**. Local archive hashing (87,563,069 bytes) fell from **115.71 to 69.21 MiB** peak RSS, **76.49 to 64.15 ms**. These are transient verification costs, not resident worker memory or SSH latency.
+
+A separate compiled lifecycle comparison staged both binaries onto the same path, initialized a companion, reused a real JS kernel, and started an owned ready service. Six simultaneous memory samples per run, then three paired-run medians, gave combined companion/JS/broker PSS **488.77 → 417.54 MiB**. Initialized JS PSS was **145.50 → 102.89 MiB** and serving broker **148.05 → 112.90 MiB**. Companion RSS was essentially unchanged (**246.19 → 246.45 MiB**); its PSS increased **195.20 → 201.34 MiB**, partly reflecting shared-page attribution. Do not claim main-worker savings. Cold JS/service request medians were **705.43 → 550.72 ms / 781.67 → 626.27 ms**; warm requests showed no demonstrated improvement. Subprocess state and cleanup semantics are unchanged; this does not measure large-project LSP memory or remote network performance.
+
+
 ## Prompt Cache Stability
 
 Connect, disconnect and reconnect change the execution binding, not the tool roster or descriptions. The fixed `remote_workspace_status` description explains routing, remote limitations and when to query status. Native approvals and renderers remain attached; other plugins' tools are not replaced. Tools not bound at startup fail closed remotely rather than being dynamically registered on reconnect.

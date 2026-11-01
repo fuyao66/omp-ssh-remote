@@ -1,7 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { LANGUAGE_PACK_ARCHIVE_SCRIPT } from "./language-pack-archive.ts";
-import { parseLanguagePackDescriptor, sha256, type LanguagePackArchitecture, type LanguagePackDescriptor } from "./language-pack.ts";
+import { parseLanguagePackDescriptor, type LanguagePackArchitecture, type LanguagePackDescriptor } from "./language-pack.ts";
+import { sha256File } from "./file-hash.ts";
 import { buildScpBaseCommand, buildSshBaseCommand, getSshDestination, quoteRemoteArgument, type SshConnectionOptions } from "./ssh.ts";
 
 export type PackRun = (command: string[], description: string, timeoutMs?: number) => Promise<string>;
@@ -19,7 +20,7 @@ export async function deployLanguagePack(profile: LanguagePackProfile, options: 
   try { descriptor = parseLanguagePackDescriptor(JSON.parse(await readFile(`${prefix}.json`, "utf8")), arch, label); }
   catch (error) { throw new Error(`${label} LSP opt-in requires a prepared ${arch} pack; run bun scripts/prepare-${profile}-lsp.ts ${arch}`, { cause: error }); }
   const archive = `${prefix}.tar.gz`;
-  if (sha256(await readFile(archive)) !== descriptor.archiveSha256) throw new Error(`Local ${label} LSP pack archive checksum mismatch`);
+  if (await sha256File(archive) !== descriptor.archiveSha256) throw new Error(`Local ${label} LSP pack archive checksum mismatch`);
   const root = `${home}/.cache/omp-ssh-remote/language-packs/${profile}/linux-${arch}`;
   const expected = `${root}/${descriptor.id}`;
   const ssh = (command: string) => [...buildSshBaseCommand(options), getSshDestination(options), command];

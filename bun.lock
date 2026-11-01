@@ -19,7 +19,7 @@
     },
     "packages/omp": {
       "name": "omp-ssh-remote",
-      "version": "0.13.0",
+      "version": "0.13.1",
       "peerDependencies": {
         "@oh-my-pi/pi-coding-agent": ">=18.15.0",
       },

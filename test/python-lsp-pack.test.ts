@@ -81,6 +81,16 @@ describe("private Python pack cache", () => {
     expect(path).toContain('/home/test user/');expect(commands).toHaveLength(1);expect(commands[0]![0]).toBe('ssh');
     expect(commands[0]).toContain('StrictHostKeyChecking=yes');
   });
+  test("local archive checksum mismatch rejects before any SSH or SCP",async()=>{
+    const f=await fixture(); const prefix=join(f.dir,'python-lsp-linux-arm64');
+    await writeFile(prefix+'.json',JSON.stringify(f.descriptor));
+    await writeFile(prefix+'.tar.gz','corrupt archive');
+    const commands:string[][]=[];
+    await expect(deployPythonLspPack({target:'example.com'},'/home/test','arm64',f.dir,async command=>{
+      commands.push(command);return '';
+    })).rejects.toThrow('Local Python LSP pack archive checksum mismatch');
+    expect(commands).toHaveLength(0);
+  });
   test("missing pack gives actionable opt-in error",async()=>{
     await expect(deployPythonLspPack({target:'example.com'},'/home/test','arm64',work,async()=>'' )).rejects.toThrow('prepare-python-lsp.ts arm64');
   });

@@ -12,6 +12,26 @@ import { executeOwnedRemoteService } from "../src/omp/service-lifecycle.ts";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { PROTOCOL_VERSION, TOOL_RUNTIME_VERSION, encodeMessage, decodeFrames } from "../src/protocol.ts";
 
+test("worker bootstrap isolates native re-entry imports and installs signal ownership first", async () => {
+  const entry = await readFile(join(import.meta.dir, "../src/worker.ts"), "utf8");
+  const staticImports = [...entry.matchAll(/^import .* from "([^"]+)";/gm)].map(match => match[1]);
+  expect(staticImports.sort()).toEqual([
+    "@oh-my-pi/pi-coding-agent/launch/protocol",
+    "@oh-my-pi/pi-utils/postmortem",
+  ]);
+  expect(entry.match(/installProcessHandlers\(\)/g)).toHaveLength(1);
+  const installed = entry.indexOf("installProcessHandlers();");
+  for (const module of ["./worker-js-eval.ts", "@oh-my-pi/pi-coding-agent/launch/broker", "./worker-companion.ts"]) {
+    expect(entry.indexOf(`import("${module}")`)).toBeGreaterThan(installed);
+  }
+  const jsHost = await readFile(join(import.meta.dir, "../src/worker-js-eval.ts"), "utf8");
+  expect(jsHost).toContain("interceptUnhandledRejections,");
+  for (const module of ["worker-js-eval.ts", "worker-companion.ts"]) {
+    const source = await readFile(join(import.meta.dir, `../src/${module}`), "utf8");
+    expect(source).not.toContain("installProcessHandlers");
+  }
+});
+
 const ownerSessionId = "native-worker-owner";
 let cwd: string;
 let client: RemoteRuntimeClient;
@@ -714,8 +734,8 @@ describe("hub launch ownership", () => {
     }
   }, 60_000);
 
-  test("CLI-owned worker awaits service cleanup on SIGHUP and raw transport EOF", async () => {
-    for (const mode of ["sighup", "eof"] as const) {
+  test("CLI-owned worker awaits service cleanup on SIGHUP, SIGTERM and raw transport EOF", async () => {
+    for (const mode of ["sighup", "sigterm", "eof"] as const) {
       const ownedCwd = await mkdtemp(join(tmpdir(), `omp-worker-${mode}-`));
       const worker = Bun.spawn([process.execPath, join(import.meta.dir, "../src/worker.ts")], {
         stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -741,8 +761,9 @@ describe("hub launch ownership", () => {
         if (status.op !== "describe") throw new Error("Unexpected daemon status reply");
         const daemon = status.daemon;
         expect(daemon.pid).toBeNumber();
-        if (mode === "sighup") worker.kill("SIGHUP"); else await worker.stdin.end();
-        expect(await worker.exited).toBe(mode === "sighup" ? 129 : 0);
+        if (mode === "eof") await worker.stdin.end();
+        else worker.kill(mode === "sighup" ? "SIGHUP" : "SIGTERM");
+        expect(await worker.exited).toBe(mode === "sighup" ? 129 : mode === "sigterm" ? 143 : 0);
         expect(() => process.kill(daemon!.pid!, 0)).toThrow();
         broker.close();
       } finally {
