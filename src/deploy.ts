@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { OMP_WORKER_BUNDLE } from "./omp/runtime-contract.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { deployPythonLspPack } from "./python-lsp-deploy.ts";
+import { deployTypescriptLspPack } from "./typescript-lsp-deploy.ts";
 import type {
   RemoteCompanionArtifact,
   RemoteWorkerBundle,
@@ -27,6 +28,7 @@ export interface WorkerDeploymentOptions extends Omit<
   localWorkerPath?: string;
   localArtifactDir?: string;
   pythonLsp?: boolean;
+  typescriptLsp?: boolean;
   signal?: AbortSignal;
   onProgress?: (stage: string) => void;
 }
@@ -186,6 +188,7 @@ export type RemoteWorkerCacheAudit = { observedAt: string } & ({
 export type PreparedRemoteWorker = {
   workerPath: string;
   pythonLspPack?: string;
+  typescriptLspPack?: string;
   home?: string;
   /** Combined caller/lease signal, only for deployment and admission. */
   signal: AbortSignal;
@@ -269,6 +272,9 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
   const pythonLspPack = options.pythonLsp
     ? await deployPythonLspPack(options, probe.home, arch, options.localArtifactDir ?? MODULE_DIR, run)
     : undefined;
+  const typescriptLspPack = options.typescriptLsp
+    ? await deployTypescriptLspPack(options, probe.home, arch, options.localArtifactDir ?? MODULE_DIR, run)
+    : undefined;
   const workerFile = `worker-linux-${arch}`;
   const remoteDir = `${cacheDir}/${bundle.cacheNamespace}/${hash}`;
   const remoteWorker = `${remoteDir}/${workerFile}`;
@@ -291,7 +297,7 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
       remoteDir,
       bundle,
     );
-    return Object.assign(preparedWorker(options, cacheDir, bundle.cacheNamespace, hash, remoteWorker, probe.home, bundle.companionArtifacts.map(artifact => artifact.executableName), lease), { pythonLspPack });
+    return Object.assign(preparedWorker(options, cacheDir, bundle.cacheNamespace, hash, remoteWorker, probe.home, bundle.companionArtifacts.map(artifact => artifact.executableName), lease), { pythonLspPack, typescriptLspPack });
   }
   if (exists !== "missing")
     throw new Error(`Unexpected remote worker check response: ${exists}`);
@@ -333,7 +339,7 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
     throw error;
   }
   await deployCompanionArtifacts(options, probe.home, arch, remoteDir, bundle);
-  return Object.assign(preparedWorker(options, cacheDir, bundle.cacheNamespace, hash, remoteWorker, probe.home, bundle.companionArtifacts.map(artifact => artifact.executableName), lease), { pythonLspPack });
+  return Object.assign(preparedWorker(options, cacheDir, bundle.cacheNamespace, hash, remoteWorker, probe.home, bundle.companionArtifacts.map(artifact => artifact.executableName), lease), { pythonLspPack, typescriptLspPack });
     });
   } catch (error) { await lease.dispose(); throw error; }
 }

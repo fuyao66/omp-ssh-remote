@@ -1,6 +1,7 @@
 import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { adaptNativePythonLspConfig } from "../src/python-lsp-native-adapter.ts";
+import { adaptNativeLspConfig } from "../src/native-lsp-config-adapter.ts";
+import { adaptNativeMutationSettlement, type NativeMutationModule } from "../src/omp/native-mutation-adapter.ts";
 import {
   resolveOmpBuildVersion,
   resolveOmpNativeBuildVersion,
@@ -104,14 +105,23 @@ await writeFile(
 );
 
 let adaptedLspConfigModules = 0;
+const adaptedMutationModules = new Set<NativeMutationModule>();
 const buildPlugin: Bun.BunPlugin = {
   name: "omp-ssh-remote:worker-modules",
   setup(build) {
+    build.onLoad({ filter: /[/\\](?:tools[/\\](?:write|ast-edit)|lsp[/\\]writethrough)\.ts$/ }, async args => {
+      if (!args.path.includes("@oh-my-pi/pi-coding-agent/")) return undefined;
+      const module = /writethrough\.ts$/.test(args.path) ? "writethrough" : /ast-edit\.ts$/.test(args.path) ? "ast-edit" : "write";
+      if (adaptedMutationModules.has(module)) throw new Error(`Duplicate native mutation module: ${module}`);
+      adaptedMutationModules.add(module);
+      return { contents: adaptNativeMutationSettlement(await readFile(args.path, "utf8"), hostVersion, module,
+        resolve(root, "src/omp/mutation-settlement.ts")), loader: "ts" };
+    });
     build.onLoad({ filter: /[/\\]lsp[/\\]config\.ts$/ }, async (args) => {
       if (!args.path.includes("@oh-my-pi/pi-coding-agent/")) return undefined;
       adaptedLspConfigModules++;
       return {
-        contents: adaptNativePythonLspConfig(await readFile(args.path, "utf8"), hostVersion,
+        contents: adaptNativeLspConfig(await readFile(args.path, "utf8"), hostVersion,
           resolve(root, "src/python-lsp-fallback.ts")),
         loader: "ts",
       };
@@ -166,6 +176,7 @@ const result = await Bun.build({
 if (!result.success)
   throw new AggregateError(result.logs, `${target} worker compile failed`);
 if (adaptedLspConfigModules !== 1) throw new Error(`Expected exactly one native LSP config module, adapted ${adaptedLspConfigModules}`);
+if (adaptedMutationModules.size !== 3) throw new Error(`Expected three native mutation modules, adapted ${[...adaptedMutationModules].join(", ")}`);
 await chmod(outfile, 0o755);
 const workerHash = new Bun.CryptoHasher("sha256")
   .update(await Bun.file(outfile).arrayBuffer())

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { startJsEvalProcess } from "@oh-my-pi/pi-coding-agent/eval/js/process-entry";
 import type { WorkerInbound, WorkerOutbound } from "@oh-my-pi/pi-coding-agent/eval/js/worker-protocol";
-import { interceptUnhandledRejections, register as registerCleanup } from "@oh-my-pi/pi-utils/postmortem";
+import { installProcessHandlers, interceptUnhandledRejections, register as registerCleanup } from "@oh-my-pi/pi-utils/postmortem";
 import { dapSessionManager } from "@oh-my-pi/pi-coding-agent/dap";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { disposeAllKernelSessions } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
@@ -152,6 +152,9 @@ async function initialize(request: InitializeRequest): Promise<void> {
     bashServices: request.bashServices,
     resourceBinding: request.resourceBinding,
     serviceLifecycle: { execute: executeOwnedRemoteService, stop: stopRemoteServiceInstance },
+    onLspMutation: mutation => send({ type: "event", event: "lsp-mutation", payload: mutation }),
+    onDeferredDiagnostics: diagnostics => send({ type: "event", event: "lsp-diagnostics", payload: diagnostics }),
+    onLspOperation: (operation, phase) => send({ type: "event", event: phase === "begin" ? "lsp-operation-begin" : "lsp-operation-end", payload: operation }),
     onLaunchCompletion: (notification) => new Promise<void>((resolve, reject) => {
       pendingEvents.set(notification.completionId, { resolve, reject });
       send({ type: "event", event: "launch-completion", payload: notification as unknown as Record<string, unknown> });
@@ -297,6 +300,10 @@ async function dispatch(request: Request): Promise<boolean> {
       return false;
   }
 }
+
+// SDK imports no longer claim process signals in 18.15. This executable owns
+// all entry modes, including native JS and broker re-entry subprocesses.
+installProcessHandlers();
 
 if (process.argv[2] === JS_EVAL_PROCESS_ARG) {
   await runJsEvalProcessHost();

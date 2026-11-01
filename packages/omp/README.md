@@ -64,11 +64,11 @@ flowchart LR
 
 ## Requirements
 
-- local Linux or WSL with OMP `>=18.13.1`, Bun `1.3.14+`, npm, tar, OpenSSH, and SCP;
+- local Linux or WSL with OMP `>=18.15.0`, Bun `1.4.4+`, npm, tar, OpenSSH, and SCP;
 - remote glibc Linux `x86_64` or `aarch64`;
 - public-key SSH that succeeds in batch mode;
 - an existing remote project directory;
-- the remote host needs project-specific language servers and debug adapters, unless using the opt-in private Python LSP pack below; it does not need Bun or OMP.
+- the remote host needs project-specific language servers and debug adapters, unless using an opt-in private Python or TypeScript LSP pack below; it does not need Bun or OMP.
 
 Host key verification is strict. Trust a host through normal OpenSSH `known_hosts`; do not disable host checking. Agent forwarding and SSH forwarding are disabled.
 
@@ -95,7 +95,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 Restart OMP after linking. Rebuild the extension and both workers when updating. Run `/remote-exit` before disabling, suspending, or reloading the extension. OMP 18.12.6 dynamic suspension neither sends shutdown nor offers a before-suspend hook: suspending a connected extension restores native local tools but may retain its old worker. A plugin cannot guarantee interception or cleanup after its own hooks have been suspended.
 
-The companion is built against OMP 18.13.1 (runtime contract 0.14.0). Build identity comes from the installed source and native dependencies, never an OMP executable on PATH. Rebuild both workers when updating runtime dependencies or capture behavior, even if schemas are unchanged. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Admission reports version, edit-language, and schema drift.
+The companion is built against OMP 18.15.0 (runtime contract 0.15.0). Build identity comes from the installed source and native dependencies, never an OMP executable on PATH. Rebuild both workers when updating runtime dependencies or capture behavior, even if schemas are unchanged. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Admission reports version, edit-language, and schema drift.
 
 Uploads explicitly use `scp -O` (the SCP protocol), because remote destination paths are shell-quoted; the SFTP default in OpenSSH 9+ would treat those quotes as literal filename characters. The local SCP client must support `-O`.
 
@@ -154,7 +154,7 @@ The first connection transfers the compressed archive over the existing strict S
 
 Later connections verify and reuse the complete cache without upload. Full file hashing on reuse is intentional in this prototype and adds local/remote I/O; it is not a sidecar-only fast path. Packs have **no automatic GC** and are independent of the two-worker retention window. Invalid existing final directories are refused, not overwritten or recursively removed; remove only the specifically diagnosed pack directory yourself after stopping its users if repair is needed.
 
-Native LSP discovery, root markers, lazy startup, diagnostics-on-edit and reload remain native. Project-local/PATH servers win; the private launcher is used only for missing default Pyright. Explicit Pyright `command`, `disabled`, file-type or root-marker configuration is not replaced. A configured semantic alternative (even missing) or an installed basedpyright/pylsp/other Python semantic server suppresses the extra Pyright; Ruff alone does not. Settings-only Pyright configuration can use the fallback. The worker build narrowly adapts SDK **18.13.1** configuration loading after native resolution; mismatched version/source anchors fail the build. Installed OMP source is never edited and native runtime exports are not monkeypatched.
+Native LSP discovery, root markers, lazy startup, diagnostics-on-edit and reload remain native. Project-local/PATH servers win; the private launcher is used only for missing default Pyright. Explicit Pyright `command`, `disabled`, file-type or root-marker configuration is not replaced. A configured semantic alternative (even missing) or an installed basedpyright/pylsp/other Python semantic server suppresses the extra Pyright; Ruff alone does not. Settings-only Pyright configuration can use the fallback. The worker build narrowly adapts SDK **18.15.0** configuration loading after native resolution; mismatched version/source anchors fail the build. Installed OMP source is never edited and native runtime exports are not monkeypatched.
 
 Use existing remote `pyrightconfig.json` / `pyproject.toml` for analysis paths and environments. If an explicit remote interpreter is needed, use native project `lsp.json` settings without a `command` override:
 
@@ -163,6 +163,32 @@ Use existing remote `pyrightconfig.json` / `pyproject.toml` for analysis paths a
 ```
 
 That path is remote, project-owned and must already exist. The extension neither guesses arbitrary venvs nor writes this configuration. Inspect native `lsp` status/reload and exercise definition/references/diagnostics for the actual project; a running server is not proof of correct environment resolution.
+
+## Optional Private TypeScript LSP Pack
+
+The second pack uses the same bounded archive validation, per-manifest lock, atomic extraction and full cache verification as Python, with a separate TypeScript required-file profile. Python's format-1 manifest, artifact names and content-addressed cache layout remain compatible; no old cache is deleted or migrated.
+
+It pins **Node 22.22.0 + typescript-language-server 4.3.4 + TypeScript 5.8.3**. The published language server bundles its runtime dependencies, and TypeScript has no runtime npm dependency edges; preparation rejects unexpected dependency edges rather than resolving a floating tree. Both official npm archives are SRI-pinned ([server metadata](https://registry.npmjs.org/typescript-language-server/4.3.4), [TypeScript metadata](https://registry.npmjs.org/typescript/5.8.3)). Complete published package trees retain upstream licenses/notices, including the server's Apache/MIT notices, TypeScript's Apache license/third-party notices, and Node's license aggregation. No npm install or lifecycle script runs locally or remotely.
+
+```sh
+bun scripts/prepare-typescript-lsp.ts arm64  # or x64
+```
+
+Keep `packages/omp/dist/typescript-lsp-linux-<arch>.tar.gz` and `.json` beside the extension. Enable only an OMP SSH alias:
+
+```json
+{"hosts":{"code-box":{"host":"example.com","lsp":{"typescript":true,"python":false}}}}
+```
+
+Either boolean can be omitted; unknown keys and non-boolean values are rejected. This is local host configuration, not a model-facing `remote_connect` parameter. Preparation/deployment requires existing stdlib `python3`; the physical launcher uses absolute pack-owned Node without changing `PATH`. The worker receives only its selected `OMP_REMOTE_TYPESCRIPT_LSP_PACK`. First deployment publishes to `~/.cache/omp-ssh-remote/language-packs/typescript/linux-<arch>/<pack-id>/`; reconnect verifies and reuses it. Packs remain outside worker GC.
+
+Only an unresolved native default `typescript-language-server` gets the private launcher. Explicit command/disable/file-type/root-marker intent and custom semantic servers take precedence; linters do not suppress semantic fallback. Native TypeScript selection still probes project/PATH `tsc`: usable native TS7 wins, while TS5 `tsc` alone is not an LSP server. Within TLS, explicit initialization `tsserver.path` wins, then project TypeScript (including supported PnP SDK paths), and finally the bundled TypeScript. The pack does not force its older TypeScript over the project's version. Native `lsp` actions, edit diagnostics and reload use the same native clients; this is not a parallel LSP implementation. No other language binaries (including clangd) are provisioned by this feature.
+
+The private TLS fallback defaults `initOptions.disableAutomaticTypingAcquisition` to `true`, preventing unsolicited npm-based acquisition. Existing project initialization options are preserved: an explicit `false` opts back into upstream behavior and requires project-owned remote npm/network access. Known supplemental servers such as Tailwind, HTML/CSS helpers and linters coexist with the semantic TypeScript fallback.
+
+Late write/edit diagnostics return to the owning host session's native yield queue, scoped to the exact session and connection binding. Native deduplication is retained; consumption-time version checks reject obsolete results. Mutating tool requests serialize until actual operation settlement, with per-file content revisions covering LSP/AST changes that omit native mutation counters. Cancellation remains cooperative but waits for an in-flight native mutation to settle before releasing that delivery barrier.
+
+Worker builds apply narrowly guarded SDK 18.15.0 adaptations for configuration fallback and mutation settlement. They also correct native single/batch writethrough finalization: a formatter-only, unverified diagnostic placeholder must not cancel a pending late diagnostic fetch. Verified inline clean/error results retain native finalization. Source drift fails the build; the installed host SDK is not modified.
 
 ## Deployment and Security
 
@@ -240,13 +266,14 @@ One plugin upgrade/reload can change the initial prefix. Model/configuration cha
 ## Limits
 
 - Linux glibc x86_64 and ARM64 only;
-- OMP `>=18.13.1` with matching compiled companion schemas;
+- OMP `>=18.15.0` with matching compiled companion schemas;
 - remote `flock` (util-linux) is required: workers hold shared per-version leases so cache pruning cannot delete a live worker's self-reentry executable;
 - explicit async Bash and eligible automatic backgrounding are supported; interactive Bash PTY is not bridged;
 - no `task isolated:true` remote worktrees;
 - no remote-to-local artifact bridge;
 - settings outside the forwarded allowlist keep the companion's compiled defaults; there is no arbitrary settings passthrough;
 - `tools.restrictedFolders` applies to native local resources; remote filesystem restriction prompts are not implemented;
+- Native host approval and enabled-tool gating are retained, but SDK 18.15.0 has no public AgentSession API for effective `ToolSession.lspReadOnly` / `deviceOnlyWrite` policy. Remote execution cannot mirror explicit per-session overrides of those fields; do not use this release as a read-only sandbox. AgentRef read-only history metadata is not the execution policy.
 - one companion process per session or subagent; concurrent children each cost an SSH channel and a worker process;
 - no output frame above 16 MiB;
 - no remote browser, desktop, model credentials, memory, or local session control plane.

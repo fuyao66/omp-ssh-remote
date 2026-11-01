@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { adaptNativePythonLspConfig } from "../src/python-lsp-native-adapter.ts";
+import { adaptNativeLspConfig } from "../src/native-lsp-config-adapter.ts";
 
 const root = resolve(import.meta.dir, "..");
 let work: string;
@@ -19,7 +19,7 @@ beforeAll(async () => {
         contents: "export const BUNDLED_PI_MODULE_LOADERS = {};", loader: "js",
       }));
       build.onLoad({ filter: /[/\\]lsp[/\\]config\.ts$/ }, async args => ({
-        contents: adaptNativePythonLspConfig(await readFile(args.path, "utf8"), "18.13.1", join(root, "src/python-lsp-fallback.ts")), loader: "ts",
+        contents: adaptNativeLspConfig(await readFile(args.path, "utf8"), "18.15.0", join(root, "src/python-lsp-fallback.ts")), loader: "ts",
       }));
     } }],
   });
@@ -113,7 +113,68 @@ describe("production-adapted native LSP configuration", () => {
     expect(second.servers.pyright).toBeUndefined();
   });
   test("adapter refuses SDK and source drift", async () => {
-    expect(() => adaptNativePythonLspConfig("", "18.14.0", "fallback.ts")).toThrow("requires SDK");
-    expect(() => adaptNativePythonLspConfig("", "18.13.1", "fallback.ts")).toThrow("anchor drift");
+    expect(() => adaptNativeLspConfig("", "18.14.0", "fallback.ts")).toThrow("requires SDK");
+    expect(() => adaptNativeLspConfig("", "18.15.0", "fallback.ts")).toThrow("anchor drift");
+  });
+});
+
+async function runTypescriptCase(servers: unknown = {}, compiler?: "5" | "7", installedServer = false, reload = false, supplementalServer = false) {
+  const dir = await mkdtemp(join(work, "typescript project "));
+  const pack = join(dir, "private pack"); const bin = join(dir, "node_modules/.bin");
+  await mkdir(join(pack, "bin"), { recursive: true }); await mkdir(bin, { recursive: true });
+  const launcher = join(pack, "bin/typescript-language-server");
+  await writeFile(launcher, "#!/bin/sh\nexit 0\n"); await chmod(launcher, 0o755);
+  await writeFile(join(dir, "package.json"), "{}");
+  await writeFile(join(dir, "lsp.json"), JSON.stringify({ servers }));
+  if (compiler) {
+    await writeFile(join(bin, "tsc"), `#!/bin/sh\nprintf 'Version ${compiler}.0.0\\n'\n`); await chmod(join(bin, "tsc"), 0o755);
+  }
+  if (installedServer) {
+    await writeFile(join(bin, "typescript-language-server"), "#!/bin/sh\nexit 0\n"); await chmod(join(bin, "typescript-language-server"), 0o755);
+  }
+  if (supplementalServer) {
+    await writeFile(join(dir, "tailwind.config.js"), "module.exports = {};\n");
+    await writeFile(join(bin, "tailwindcss-language-server"), "#!/bin/sh\nexit 0\n"); await chmod(join(bin, "tailwindcss-language-server"), 0o755);
+  }
+  const script = `import {getConfig,configCache} from ${JSON.stringify(bundled)};
+    const cwd=${JSON.stringify(dir)}; const first=getConfig(cwd); if (${reload}) configCache.delete(cwd);
+    console.log(JSON.stringify({first,second:getConfig(cwd)}));`;
+  const proc = Bun.spawn([process.execPath, "-e", script], { cwd: dir, env: { ...process.env,
+    HOME: dir, PI_CODING_AGENT_DIR: join(dir, "user"), PATH: "", OMP_REMOTE_PYTHON_LSP_PACK: "", OMP_REMOTE_TYPESCRIPT_LSP_PACK: pack }, stdout: "pipe", stderr: "pipe" });
+  const output = await new Response(proc.stdout).text(); const errors = await new Response(proc.stderr).text();
+  if (await proc.exited !== 0) throw new Error(errors);
+  return { ...JSON.parse(output.trim().split("\n").at(-1)!), launcher, bin };
+}
+
+describe("production-adapted native TypeScript selection", () => {
+  const name = "typescript-language-server";
+  test("private fallback preserves native defaults and survives native reload", async () => {
+    const result = await runTypescriptCase({}, undefined, false, true);
+    expect(result.first.servers[name].resolvedCommand).toBe(result.launcher);
+    expect(result.first.servers[name].args).toEqual(["--stdio"]);
+    expect(result.first.servers[name].initOptions.disableAutomaticTypingAcquisition).toBe(true);
+    expect(result.second.servers[name].resolvedCommand).toBe(result.launcher);
+  });
+  test("project installed TLS and native TS7 win; TS5 compiler retains TLS fallback", async () => {
+    const installed = await runTypescriptCase({}, undefined, true);
+    expect(installed.first.servers[name].resolvedCommand).toBe(join(installed.bin, name));
+    const supplemental = await runTypescriptCase({}, undefined, false, false, true);
+    expect(supplemental.first.servers.tailwindcss).toBeDefined();
+    expect(supplemental.first.servers[name].resolvedCommand).toBe(supplemental.launcher);
+    const oldCompiler = await runTypescriptCase({}, "5");
+    expect(oldCompiler.first.servers[name].resolvedCommand).toBe(oldCompiler.launcher);
+    expect(oldCompiler.first.servers["typescript-native"]).toBeUndefined();
+    const nativeCompiler = await runTypescriptCase({}, "7");
+    expect(nativeCompiler.first.servers[name]).toBeUndefined();
+    expect(nativeCompiler.first.servers["typescript-native"].resolvedCommand).toBe(join(nativeCompiler.bin, "tsc"));
+  });
+  test("explicit native disable/command and custom semantic intent are not replaced", async () => {
+    for (const override of [{ disabled: true }, { command: name }, { command: "missing-custom" }, { fileTypes: [".ts"] }, { rootMarkers: ["package.json"] }]) {
+      expect((await runTypescriptCase({ [name]: override })).first.servers[name]).toBeUndefined();
+    }
+    expect((await runTypescriptCase({ custom: { command: "missing-custom", fileTypes: [".ts"], rootMarkers: ["package.json"] } })).first.servers[name]).toBeUndefined();
+    const initializationOptions = { tsserver: { path: "/remote/project/typescript/lib/tsserver.js" }, disableAutomaticTypingAcquisition: false };
+    const configured = await runTypescriptCase({ [name]: { initOptions: initializationOptions } });
+    expect(configured.first.servers[name].initOptions).toEqual(initializationOptions);
   });
 });

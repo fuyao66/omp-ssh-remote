@@ -18,6 +18,7 @@ export type RemoteConnectRequest = {
   knownHostsFile?: string;
   workerPath?: string;
   pythonLsp?: boolean;
+  typescriptLsp?: boolean;
 };
 
 export type RemoteConnectInput = {
@@ -35,7 +36,7 @@ export type ConfiguredSshHost = {
   username?: string;
   port?: number;
   keyPath?: string;
-  lsp?: { python: boolean };
+  lsp?: { python?: boolean; typescript?: boolean };
 };
 
 type RawSshHost = {
@@ -98,11 +99,11 @@ function normalizeHost(
   let lsp: ConfiguredSshHost["lsp"];
   if (raw.lsp !== undefined) {
     if (!raw.lsp || typeof raw.lsp !== "object" || Array.isArray(raw.lsp) ||
-      Object.keys(raw.lsp).some(key => key !== "python") ||
-      typeof (raw.lsp as { python?: unknown }).python !== "boolean") {
-      throw new Error(`SSH host ${JSON.stringify(name)} has invalid lsp; expected {"python":true|false}`);
+      Object.keys(raw.lsp).length === 0 ||
+      Object.entries(raw.lsp).some(([key, value]) => !["python", "typescript"].includes(key) || typeof value !== "boolean")) {
+      throw new Error(`SSH host ${JSON.stringify(name)} has invalid lsp; expected python/typescript boolean opt-ins`);
     }
-    lsp = { python: (raw.lsp as { python: boolean }).python };
+    lsp = { ...raw.lsp as NonNullable<ConfiguredSshHost["lsp"]> };
   }
   return {
     name,
@@ -280,6 +281,7 @@ export function parseConnectOptions(
     ...(knownHostsFile ? { knownHostsFile } : {}),
     ...(workerPath ? { workerPath } : {}),
     ...(configured?.lsp?.python ? { pythonLsp: true } : {}),
+    ...(configured?.lsp?.typescript ? { typescriptLsp: true } : {}),
   };
 }
 

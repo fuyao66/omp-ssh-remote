@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { resolveEditMode } from "@oh-my-pi/pi-coding-agent/utils/edit-mode";
@@ -34,6 +35,9 @@ import type { JobCaptureSender } from "./omp/job-capture.ts";
 import { RemoteConflictHistory } from "./omp/conflict-resources.ts";
 import { bindRemoteResourceResult } from "./resource-routing.ts";
 import type { executeOwnedRemoteService, stopRemoteServiceInstance, ServiceStopReceipt } from "./omp/service-lifecycle.ts";
+import { mayMutateLsp, type LspMutation, type LspDiagnostics, type LspOperation } from "./omp/lsp-diagnostics.ts";
+import { LspDiagnosticRevisions } from "./omp/lsp-revisions.ts";
+import { cfgLspDiagnosticsOnEdit, cfgLspDiagnosticsOnWrite } from "@oh-my-pi/pi-coding-agent/lsp/settings";
 export interface RemoteNativeTool {
   readonly name: string;
   readonly description: string;
@@ -138,6 +142,10 @@ export type NativeWorkerRuntimeOptions = {
   sessionId?: string;
   /** Receives broker completion notifications for daemons this owner started. */
   onLaunchCompletion?: (notification: DaemonCompletionNotification) => void | Promise<void>;
+  /** Worker-native mutation ordering and late diagnostics, owned by this session. */
+  onLspMutation?: (mutation: LspMutation) => void;
+  onDeferredDiagnostics?: (diagnostics: LspDiagnostics) => void;
+  onLspOperation?: (operation: LspOperation, phase: "begin" | "end") => void;
   /** Execution-domain settings forwarded by the local host; structural pins win. */
   settings?: RemoteExecutionSettings;
   /** Negotiated effective edit mode; shared by read's anchors and edit's parser. */
@@ -178,6 +186,17 @@ export async function createNativeWorkerRuntime(
     ...(options.editMode === undefined ? {} : { "edit.mode": options.editMode }),
   });
   const mutationVersions = new Map<string, number>();
+  const mutationScope = new AsyncLocalStorage<string>();
+  let mutationQueue = Promise.resolve();
+  let nextMutationOperation = 0;
+  const revisions = new LspDiagnosticRevisions(path => mutationVersions.get(path) ?? 0, path => {
+    const version = (mutationVersions.get(path) ?? 0) + 1;
+    mutationVersions.set(path, version);
+    options.onLspMutation?.({ sessionId, resourceBinding, path, version });
+  }, entry => {
+    if (!entry.isStale()) options.onDeferredDiagnostics?.({ sessionId, resourceBinding, path: entry.path,
+      version: mutationVersions.get(entry.path) ?? 0, summary: entry.summary, messages: entry.messages, errored: entry.errored });
+  });
   const pendingInvokers = new PendingInvokerQueueAdapter();
   const xdevTools = new Map<string, RemoteNativeTool>();
   const xdevMountedNames = new Set<string>(["lsp", "ast_grep", "ast_edit", "debug"]);
@@ -226,8 +245,13 @@ export async function createNativeWorkerRuntime(
     bumpFileMutationVersion: (path) => {
       const next = (mutationVersions.get(path) ?? 0) + 1;
       mutationVersions.set(path, next);
+      if (options.onDeferredDiagnostics && (cfgLspDiagnosticsOnEdit.get(settings) || cfgLspDiagnosticsOnWrite.get(settings))) revisions.bumped(path, next);
+      options.onLspMutation?.({ sessionId, resourceBinding, path, version: next });
       return next;
     },
+    ...(options.onDeferredDiagnostics ? {
+      queueDeferredDiagnostics: entry => { if (!entry.isStale()) revisions.diagnostics(entry); },
+    } : {}),
     isToolActive: (name) => REMOTE_TOOL_NAMES.includes(name as (typeof REMOTE_TOOL_NAMES)[number]),
     getToolByName: name => {
       const tool = callableTools.get(name);
@@ -278,6 +302,29 @@ export async function createNativeWorkerRuntime(
   tools.read.execute = (...args) => conflictHistory.captureRead(() => read(...args));
   const publishTool = (tool: RemoteNativeTool): RemoteNativeTool => {
     const execute = tool.execute.bind(tool);
+    const executeMutation = async (...args: Parameters<RemoteNativeTool["execute"]>) => {
+      if (!mayMutateLsp(tool.name, args[1]) || mutationScope.getStore()) return execute(...args);
+      const previous = mutationQueue;
+      const release = Promise.withResolvers<void>();
+      mutationQueue = Promise.all([previous, release.promise]).then(() => undefined);
+      const signal = args[2];
+      try {
+        signal?.throwIfAborted();
+        if (signal) {
+          const aborted = Promise.withResolvers<never>();
+          const abort = () => aborted.reject(signal.reason);
+          signal.addEventListener("abort", abort, { once: true });
+          try { await Promise.race([previous, aborted.promise]); }
+          finally { signal.removeEventListener("abort", abort); }
+        } else await previous;
+        signal?.throwIfAborted();
+        const operation = { sessionId, resourceBinding, id: ++nextMutationOperation };
+        revisions.begin();
+        options.onLspOperation?.(operation, "begin");
+        try { return await mutationScope.run(tool.name, () => execute(...args)); }
+        finally { revisions.end(); options.onLspOperation?.(operation, "end"); }
+      } finally { release.resolve(); }
+    };
     tool.execute = async (id, params, signal, onUpdate, context) => {
       const resolved = await resolveRemoteArtifactArgs(tool.name, params);
       const update = onUpdate ? (value: unknown) => onUpdate(artifacts.publish(value, tool.name)) : undefined;
@@ -287,9 +334,9 @@ export async function createNativeWorkerRuntime(
       const result = artifacts.publish(
         serviceName && options.serviceLifecycle
           ? await options.serviceLifecycle.execute(absoluteCwd, sessionId, serviceName, (steeringSignal) =>
-            execute(id, resolved, undefined, update, { ...callContext, toolCall: { ...toolCall, steeringSignal } }),
+            executeMutation(id, resolved, undefined, update, { ...callContext, toolCall: { ...toolCall, steeringSignal } }),
             signal, toolCall.steeringSignal instanceof AbortSignal ? toolCall.steeringSignal : undefined)
-          : await execute(id, resolved, signal, update, context),
+          : await executeMutation(id, resolved, signal, update, context),
         tool.name,
       );
       // Bind only after native artifact footers have been published. Eval's
@@ -311,7 +358,7 @@ export async function createNativeWorkerRuntime(
   for (const name of xdevMountedNames)
     xdevTools.set(name, tools[name as RemoteToolName]);
   let disposed: Promise<void> | undefined;
-  const dispose = () => (disposed ??= artifacts.dispose());
+  const dispose = () => (disposed ??= (revisions.dispose(), artifacts.dispose()));
   return {
     cwd: absoluteCwd, sessionId, tools, session, editMode, resourceBinding, dispose,
     executeEval: async (invoke, ...args) => {

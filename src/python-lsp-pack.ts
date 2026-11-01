@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
-
-export type PythonLspArchitecture = "arm64" | "x64";
+import { parseLanguagePackDescriptor, type LanguagePackArchitecture, type LanguagePackDescriptor } from "./language-pack.ts";
+export { sha256 } from "./language-pack.ts";
+export type PythonLspArchitecture = LanguagePackArchitecture;
 export const PYTHON_LSP_PINS = {
   node: {
     version: "22.22.0",
@@ -17,23 +17,8 @@ export const PYTHON_LSP_PINS = {
   },
 } as const;
 
-export interface PythonLspPackDescriptor {
-  format: 1;
-  platform: "linux";
-  arch: PythonLspArchitecture;
-  id: string;
-  archiveSha256: string;
-}
+export type PythonLspPackDescriptor = LanguagePackDescriptor;
 
 export function parsePythonLspPackDescriptor(value: unknown, arch: PythonLspArchitecture): PythonLspPackDescriptor {
-  const descriptor = value as PythonLspPackDescriptor;
-  if (!descriptor || descriptor.format !== 1 || descriptor.platform !== "linux" || descriptor.arch !== arch ||
-    !/^[a-f0-9]{64}$/.test(descriptor.id) || !/^[a-f0-9]{64}$/.test(descriptor.archiveSha256)) {
-    throw new Error("Invalid Python LSP pack descriptor");
-  }
-  return descriptor;
-}
-
-export function sha256(bytes: Uint8Array): string {
-  return createHash("sha256").update(bytes).digest("hex");
+  return parseLanguagePackDescriptor(value, arch, "Python");
 }

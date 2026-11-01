@@ -10,6 +10,7 @@ import { daemonClientForProject } from "@oh-my-pi/pi-coding-agent/launch/client"
 import { startRemoteService } from "../src/omp/service-jobs.ts";
 import { executeOwnedRemoteService } from "../src/omp/service-lifecycle.ts";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { PROTOCOL_VERSION, TOOL_RUNTIME_VERSION, encodeMessage, decodeFrames } from "../src/protocol.ts";
 
 const ownerSessionId = "native-worker-owner";
 let cwd: string;
@@ -710,6 +711,44 @@ describe("hub launch ownership", () => {
     } finally {
       await worker.close().catch(() => {});
       await rm(eventCwd, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("CLI-owned worker awaits service cleanup on SIGHUP and raw transport EOF", async () => {
+    for (const mode of ["sighup", "eof"] as const) {
+      const ownedCwd = await mkdtemp(join(tmpdir(), `omp-worker-${mode}-`));
+      const worker = Bun.spawn([process.execPath, join(import.meta.dir, "../src/worker.ts")], {
+        stdin: "pipe", stdout: "pipe", stderr: "pipe",
+      });
+      const errors = new Response(worker.stderr).text();
+      const frames = decodeFrames(worker.stdout)[Symbol.asyncIterator]();
+      const send = async (value: object) => { worker.stdin.write(encodeMessage(value as never)); await worker.stdin.flush(); };
+      try {
+        await send({ type: "initialize", protocolVersion: PROTOCOL_VERSION, runtimeVersion: TOOL_RUNTIME_VERSION,
+          cwd: ownedCwd, tools: ["bash"], sessionId: `${mode}-owner` });
+        expect(JSON.parse((await frames.next()).value!).type).toBe("ready");
+        await send({ type: "execute", id: "start", toolCallId: "start", tool: "bash",
+          args: { name: "owned", command: "echo ready; sleep 120", ready: { log: "ready", timeout: 10 } } });
+        let started = false;
+        while (!started) {
+          const next = await frames.next(); if (next.done) throw new Error("Worker exited before service readiness");
+          const frame = JSON.parse(next.value);
+          if (frame.type === "error") throw new Error(JSON.stringify(frame.error));
+          started = frame.type === "result" && frame.id === "start";
+        }
+        const broker = await daemonClientForProject(ownedCwd);
+        const status = await broker.request({ op: "describe", name: "owned" });
+        if (status.op !== "describe") throw new Error("Unexpected daemon status reply");
+        const daemon = status.daemon;
+        expect(daemon.pid).toBeNumber();
+        if (mode === "sighup") worker.kill("SIGHUP"); else await worker.stdin.end();
+        expect(await worker.exited).toBe(mode === "sighup" ? 129 : 0);
+        expect(() => process.kill(daemon!.pid!, 0)).toThrow();
+        broker.close();
+      } finally {
+        if (worker.exitCode === null) worker.kill("SIGKILL");
+        await worker.exited; await errors; await rm(ownedCwd, { recursive: true, force: true });
+      }
     }
   }, 60_000);
 });

@@ -14,7 +14,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.14.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.15.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
@@ -143,7 +143,7 @@ export type ErrorMessage = {
 /** Unsolicited worker-originated notification (no request id). */
 export type EventMessage = {
   type: "event";
-  event: "launch-completion";
+  event: "launch-completion" | "lsp-mutation" | "lsp-diagnostics" | "lsp-operation-begin" | "lsp-operation-end";
   payload: Record<string, unknown>;
 };
 export type Message =
@@ -344,7 +344,7 @@ export function parseMessage(line: string): Message {
   }
   if (type === "event") {
     const event = stringField(value, "event");
-    if (event !== "launch-completion")
+    if (event !== "launch-completion" && event !== "lsp-mutation" && event !== "lsp-diagnostics" && event !== "lsp-operation-begin" && event !== "lsp-operation-end")
       throw new Error(`Unknown protocol event: ${event}`);
     return { type, event, payload: asRecord(value.payload, "payload") };
   }

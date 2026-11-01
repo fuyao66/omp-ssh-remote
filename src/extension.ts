@@ -56,6 +56,7 @@ import type { HostToolInvoker } from "./client.ts";
 import { validateAgentToolArguments } from "@oh-my-pi/pi-agent-core";
 import { resourceOwnershipTarget } from "./resource-ownership.ts";
 import type { ToolContextStore } from "@oh-my-pi/pi-coding-agent/tools/context";
+import { RemoteLspDiagnostics, mayMutateLsp, parseLspEvent, type LspDiagnostics } from "./omp/lsp-diagnostics.ts";
 
 /**
  * Snapshot the execution-domain subset of the local session's settings.
@@ -249,10 +250,12 @@ type ExecutionTarget = "local" | "remote";
 type RemoteConnectOptions = Omit<RemoteConnectRequest, "cwd"> & {
   cwd: string;
   pythonLspPack?: string;
+  typescriptLspPack?: string;
 };
 type RemoteExtensionState = {
   binding: string;
   client?: RemoteRuntimeClient;
+  lspDiagnostics?: RemoteLspDiagnostics;
   deployment?: AbortController;
   remoteCwd?: string;
   localCwd?: string;
@@ -592,9 +595,13 @@ async function executeWithTarget(
   const client = state.client;
   if (!client) throw new Error("Remote runtime is disconnected");
   const remoteParams = resolveRemoteResourceArgs(name, params, state.binding);
-  const execute = async (steeringSignal?: AbortSignal) =>
-    await client.execute(name, toolCallId, remoteParams, signal, onUpdate,
-      { toolNames: state.activeToolNames(), steeringSignal, ...(name === "eval" ? { onInvoke: hostEvalInvoker(state, client, ctx) } : {}) }) as AgentToolResult;
+  const execute = async (steeringSignal?: AbortSignal) => {
+    const endMutation = mayMutateLsp(name, remoteParams) ? state.lspDiagnostics?.beginMutation() : undefined;
+    try {
+      return await client.execute(name, toolCallId, remoteParams, signal, onUpdate,
+        { toolNames: state.activeToolNames(), steeringSignal, ...(name === "eval" ? { onInvoke: hostEvalInvoker(state, client, ctx) } : {}) }) as AgentToolResult;
+    } finally { endMutation?.(); }
+  };
   try {
     if (name === "bash" && typeof params.name === "string" && params.ready !== undefined) {
       return await withReadinessSteering(hostSessionFor(state, ctx) ?? undefined, execute);
@@ -929,6 +936,24 @@ async function openRemoteTransport(
       resourceBinding: binding,
     });
     bindLaunchCompletionDelivery(pi, client);
+    const owner = hostSessionFor(state, ctx);
+    const sessionId = launchOwnerId(ctx);
+    if (owner && sessionId) {
+      const diagnostics = new RemoteLspDiagnostics(owner, sessionId, binding, () =>
+        state.client === client && !client.isClosed && state.binding === binding &&
+        hostSessionFor(state, ctx) === owner && owner.sessionManager.getSessionId() === sessionId);
+      state.lspDiagnostics = diagnostics;
+      client.onClose(() => diagnostics.close());
+      client.onEvent(event => {
+        if (event.event === "lsp-mutation") diagnostics.mutation(parseLspEvent(event.payload, false));
+        else if (event.event === "lsp-diagnostics") diagnostics.diagnostics(parseLspEvent(event.payload, true) as LspDiagnostics);
+        else if (event.event === "lsp-operation-begin" || event.event === "lsp-operation-end") {
+          const { sessionId, resourceBinding, id } = event.payload;
+          if (typeof sessionId !== "string" || typeof resourceBinding !== "string" || typeof id !== "number") throw new Error("Invalid remote LSP operation event");
+          diagnostics.operation({ sessionId, resourceBinding, id }, event.event === "lsp-operation-begin" ? "begin" : "end");
+        }
+      });
+    }
     return { client, ready, binding };
   } catch (error) {
     client.kill();
@@ -985,7 +1010,8 @@ async function reconnectRemoteRuntime(
   try {
     const signal = options.signal ? AbortSignal.any([options.signal, deployment.signal]) : deployment.signal;
     prepared = await prepareRemoteWorker({ ...family.connection, signal, onProgress: (stage) => ctx?.ui?.setWorkingMessage(stage) });
-    const connection = { ...family.connection, cwd: family.remoteCwd, workerPath: prepared.workerPath, pythonLspPack: prepared.pythonLspPack };
+    const connection = { ...family.connection, cwd: family.remoteCwd, workerPath: prepared.workerPath,
+      pythonLspPack: prepared.pythonLspPack, typescriptLspPack: prepared.typescriptLspPack };
     const { client, ready, binding } = await openRemoteTransport(
       pi,
       connection,
@@ -1200,6 +1226,7 @@ export default async function remoteRuntimeExtension(
           ...options,
           workerPath: prepared.workerPath,
           pythonLspPack: prepared.pythonLspPack,
+          typescriptLspPack: prepared.typescriptLspPack,
         };
         const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, prepared.signal);
         next = opened.client;
@@ -1391,6 +1418,7 @@ export default async function remoteRuntimeExtension(
           ...options,
           workerPath: prepared.workerPath,
           pythonLspPack: prepared.pythonLspPack,
+          typescriptLspPack: prepared.typescriptLspPack,
         };
         const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, prepared.signal);
         next = opened.client;

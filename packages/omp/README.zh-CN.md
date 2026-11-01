@@ -64,11 +64,11 @@ flowchart LR
 
 ## 环境要求
 
-- 本机 Linux 或 WSL，OMP `>=18.13.1`，并安装 Bun `1.3.14+`、npm、tar、OpenSSH 和 SCP；
+- 本机 Linux 或 WSL，OMP `>=18.15.0`，并安装 Bun `1.4.4+`、npm、tar、OpenSSH 和 SCP；
 - 远端为 glibc Linux `x86_64` 或 `aarch64`；
 - 公钥 SSH 可在 batch mode 下登录；
 - 远端项目目录已存在；
-- 远端需要项目所需的 language server 和 debug adapter；Python 可显式启用下述私有 pack，不需要安装 Bun 或 OMP。
+- 远端需要项目所需的 language server 和 debug adapter；Python／TypeScript 可显式启用下述私有 pack，不需要安装 Bun 或 OMP。
 
 主机密钥使用严格校验。请通过正常的 OpenSSH `known_hosts` 信任主机，不要关闭 host checking。插件同时禁用 agent forwarding 和 SSH forwarding。
 
@@ -95,7 +95,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 链接后重启 OMP。更新时重新构建 extension 和双架构 worker。停用、暂停或 reload 插件前，必须先执行 `/remote-exit`。OMP 18.12.6 的动态暂停不发送 shutdown，也没有暂停前回调；连接中直接暂停会恢复本机工具但可能保留旧 worker，插件无法在自己的 hook 一起被暂停后保证拦截或清理。
 
-当前 companion 基于 OMP 18.13.1 构建，runtime contract 为 0.14.0。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。
+当前 companion 基于 OMP 18.15.0 构建，runtime contract 为 0.15.0。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。
 
 上传显式使用 `scp -O`（SCP 协议），与远端目标路径的 shell 转义保持一致；OpenSSH 9+ 默认的 SFTP 会把这些引号当作文件名字符。本机 SCP 客户端须支持 `-O`。
 
@@ -152,7 +152,7 @@ bun run build:worker:all
 
 后续连接完整校验并复用，不重复上传。原型每次复用仍计算本机 archive 和远端全部文件哈希，有额外 I/O，不宣称 sidecar 快速路径。Pack **暂不自动 GC**，不参与 worker 的“两代”回收。损坏最终目录只拒绝，不覆盖、不递归删除；需要修复时停止使用者后由操作者仅处理报错的具体目录。
 
-原生 LSP 的项目标记、惰性启动、定义／引用、编辑诊断与 reload 保持不变。项目本地／PATH server 优先；仅原生默认 Pyright 缺失时补充私有 launcher。显式 Pyright `command`、`disabled`、fileTypes／rootMarkers 不覆盖；显式选择的其他 Python 语义 server 即使命令缺失也不额外补 Pyright，已安装 basedpyright／pylsp／其他 Python 语义 server 同样优先，Ruff 单独存在不阻止补充。仅修改 Pyright settings 可使用 fallback。Worker 构建对 SDK **18.13.1** 的 config loader 做小范围编译期适配，版本或源码锚点变化即构建失败；不编辑安装的 OMP 源码、不 monkeypatch 运行时导出。
+原生 LSP 的项目标记、惰性启动、定义／引用、编辑诊断与 reload 保持不变。项目本地／PATH server 优先；仅原生默认 Pyright 缺失时补充私有 launcher。显式 Pyright `command`、`disabled`、fileTypes／rootMarkers 不覆盖；显式选择的其他 Python 语义 server 即使命令缺失也不额外补 Pyright，已安装 basedpyright／pylsp／其他 Python 语义 server 同样优先，Ruff 单独存在不阻止补充。仅修改 Pyright settings 可使用 fallback。Worker 构建对 SDK **18.15.0** 的 config loader 做小范围编译期适配，版本或源码锚点变化即构建失败；不编辑安装的 OMP 源码、不 monkeypatch 运行时导出。
 
 分析环境由远端已有 `pyrightconfig.json`／`pyproject.toml` 决定。需要显式指定远端解释器时，可自行在项目原生 `lsp.json` 中配置 settings，不设置 `command`：
 
@@ -161,6 +161,32 @@ bun run build:worker:all
 ```
 
 解释器必须已存在，路径属于远端项目；插件不扫描任意 venv、不自动写配置。通过原生 `lsp` status／reload，并对实际项目验证定义、引用、诊断；仅 server 启动不代表解释器和依赖解析正确。
+
+## 可选私有 TypeScript LSP Pack
+
+第二个 pack 与 Python 共用有界归档校验、manifest 锁、原子解包发布和完整缓存校验，仅必需文件 profile 不同。Python 原有 format-1 manifest、产物名称和内容 ID 保持兼容，不迁移或删除旧缓存。
+
+固定版本为 **Node 22.22.0 + typescript-language-server 4.3.4 + TypeScript 5.8.3**。发布的 server 已打包运行时依赖，TypeScript 无 npm 运行时依赖；准备脚本遇到新增依赖边即拒绝，不解析浮动依赖树。官方 npm 压缩包按 SRI 固定（[server](https://registry.npmjs.org/typescript-language-server/4.3.4)、[TypeScript](https://registry.npmjs.org/typescript/5.8.3)），完整保留 server 的 Apache／MIT 声明、TypeScript 的 Apache／第三方声明及 Node 许可证汇总。不运行 npm install 或生命周期脚本。
+
+```sh
+bun scripts/prepare-typescript-lsp.ts arm64  # 或 x64
+```
+
+将 `packages/omp/dist/typescript-lsp-linux-<arch>.tar.gz` 和 `.json` 保留在 extension 旁，仅对本机 OMP SSH alias 启用：
+
+```json
+{"hosts":{"code-box":{"host":"example.com","lsp":{"typescript":true,"python":false}}}}
+```
+
+两个布尔值可分别省略，未知字段或非布尔值报错；这不是模型 `remote_connect` 参数。准备和部署需要已有的标准库 `python3`，启动时使用绝对路径的私有 Node，不修改 `PATH`。Worker 仅接收该连接的 `OMP_REMOTE_TYPESCRIPT_LSP_PACK`。首次发布到 `~/.cache/omp-ssh-remote/language-packs/typescript/linux-<arch>/<pack-id>/`，重连完整校验复用；pack 不参与 worker GC。
+
+仅缺失的原生默认 `typescript-language-server` 使用私有 launcher。显式 command／disabled／fileTypes／rootMarkers 和自定义语义 server 优先，linter 不阻止语义 fallback。原生选择器仍检查项目／PATH `tsc` 版本：可用 TS7 优先，TS5 `tsc` 本身不是 LSP。TLS 内先采用显式初始化 `tsserver.path`，再选项目 TypeScript（包括支持的 PnP SDK 路径），最后才用内置版本，不强制覆盖项目版本。原生 `lsp` 动作、编辑诊断和 reload 共用原生客户端，不另建 LSP 实现；此功能不提供 clangd 等其他语言二进制。
+
+私有 TLS 默认设置 `initOptions.disableAutomaticTypingAcquisition:true`，避免自动调用 npm 获取类型包；已有项目初始化选项优先，显式 `false` 会恢复上游行为，此时远端 npm／网络由项目自行提供。Tailwind、HTML／CSS 辅助 server 和 linter 不替代 TypeScript 语义 server，可与 fallback 并存。
+
+写入／编辑的迟到诊断通过宿主原生 yield queue 交付，严格绑定所属会话和连接。保留原生去重，消费时根据版本拒绝过期结果。修改类工具串行执行至实际操作完成，并以文件内容修订覆盖原生 LSP／AST 未更新 mutation counter 的情况。取消仍会协作传递，但须等进行中的原生修改实际完成，才释放诊断交付屏障。
+
+Worker 构建仅对 SDK 18.15.0 做严格锚点匹配的配置后备与修改完成适配，同时修正原生单文件／批量 writethrough 的完成判定：只承载格式化状态、尚未验证的诊断占位结果不能取消迟到诊断等待；已验证的行内正常／错误结果仍按原生方式完成。源码漂移即构建失败，不修改已安装的宿主 SDK。
 
 ## 部署与安全
 
@@ -217,10 +243,11 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 ## 限制
 
 - 仅支持 Linux glibc x86_64 和 ARM64；
-- OMP `>=18.13.1`，且 companion schema 匹配；
+- OMP `>=18.15.0`，且 companion schema 匹配；
 - 远端须有 util-linux 的 `flock`，用于保护活跃 worker 可执行文件；
 - 支持显式 async Bash 和符合条件的自动后台化，不桥接交互 Bash PTY；
 - `tools.restrictedFolders` 适用于原生本机资源，尚未实现远端文件系统的目录限制审批；
+- 保留原生宿主审批及 enabled-tool 门控，但 SDK 18.15.0 的公开 AgentSession API 不暴露有效 `ToolSession.lspReadOnly`／`deviceOnlyWrite` 策略，无法镜像这些字段的显式会话级覆盖；不要将此版本当作只读沙箱。AgentRef 的只读历史元数据不是执行策略。
 - 不支持 `task isolated:true` 远端 worktree；
 - 不支持远端到本机 artifact bridge；
 - 白名单之外的 settings 在 companion 中保持编译默认值，不提供任意 settings 透传；

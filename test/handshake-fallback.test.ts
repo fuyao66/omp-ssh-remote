@@ -18,7 +18,7 @@ test("missing edit metadata uses the effective host edit mode", async () => {
   process.argv[1] = import.meta.resolve("@oh-my-pi/pi-coding-agent").replace(/^file:\/\//, "");
   delete process.env.PI_EDIT_VARIANT;
   const settings = Settings.isolated({ "edit.mode": "replace" });
-  const runtime = await createNativeWorkerRuntime(cwd, "18.13.1", { editMode: "replace" });
+  const runtime = await createNativeWorkerRuntime(cwd, "18.15.0", { editMode: "replace" });
   try {
     const pi = { getAllTools: () => Object.values(runtime.tools).filter(tool => tool.name !== "edit") } as unknown as ExtensionAPI;
     const state = {
@@ -28,7 +28,7 @@ test("missing edit metadata uses the effective host edit mode", async () => {
     const handshake = await withActiveSettings(settings, () => captureOmpHandshake(pi, state));
     expect(handshake.editMode).toBe("replace");
     expect(() => handshake.validateReady({
-      type: "ready", protocolVersion: PROTOCOL_VERSION, host: "omp", hostVersion: "18.13.1",
+      type: "ready", protocolVersion: PROTOCOL_VERSION, host: "omp", hostVersion: "18.15.0",
       runtimeVersion: TOOL_RUNTIME_VERSION, editMode: "replace", cwd,
       tools: Object.values(runtime.tools).map(tool => ({ ...captureOmpToolSnapshot(tool), description: tool.description })),
     })).not.toThrow();

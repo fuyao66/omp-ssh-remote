@@ -263,6 +263,7 @@ describe("remote async bash job bridge", () => {
     expect(job.widgetInputs?.sources()[0]?.read(0)).toMatchObject({ text: "raw", start: 0, end: 3, open: true });
     expect(job.widgetInputs?.sources()).toHaveLength(2);
     expect(job.widgetInputs?.brief()).toMatchObject({ kind: "bash", command: "printf raw | cat", intent: "Read Raw Bytes" });
+    expect(job.intent).toBe("Read Raw Bytes");
     result.resolve(textResult("formatted final, not bytes"));
     await job.promise;
     expect(job.widgetInputs?.sources()[0]?.read(0)).toMatchObject({ text: "raw", open: false });

@@ -168,6 +168,7 @@ function registerRemoteBashJob(options: RemoteAsyncBashJobOptions, foreground: b
     {
       ownerId,
       foreground,
+      ...(typeof params.i === "string" ? { intent: params.i } : {}),
       process: { command, cwd: remoteCwd, pids: () => [], streams: capture.streams },
       widgetInputs: {
         sources: () => capture.sources(),
