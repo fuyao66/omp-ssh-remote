@@ -10,7 +10,7 @@ export type SshConnectionOptions = {
   knownHostsFile?: string;
 };
 
-export type SshWorkerOptions = SshConnectionOptions & { workerPath: string; pythonLspPack?: string; typescriptLspPack?: string };
+export type SshWorkerOptions = SshConnectionOptions & { workerPath: string; pythonLspPack?: string; typescriptLspPack?: string; cppLspPack?: string };
 
 function validateTarget(target: string): void {
   if (!/^[A-Za-z0-9_.@-]+$/.test(target) || target.startsWith("-")) {
@@ -109,7 +109,7 @@ export function buildScpBaseCommand(options: SshConnectionOptions): string[] {
 }
 
 export function buildSshWorkerCommand(options: SshWorkerOptions): string[] {
-  for (const [label, path] of [["Python", options.pythonLspPack], ["TypeScript", options.typescriptLspPack]]) {
+  for (const [label, path] of [["Python", options.pythonLspPack], ["TypeScript", options.typescriptLspPack], ["C/C++", options.cppLspPack]]) {
     if (path !== undefined && (!path.startsWith("/") || /[\0\r\n]/.test(path))) {
       throw new Error(`${label} LSP pack path must be a remote absolute path`);
     }
@@ -117,10 +117,11 @@ export function buildSshWorkerCommand(options: SshWorkerOptions): string[] {
   const packEnvironment = [
     options.pythonLspPack ? `OMP_REMOTE_PYTHON_LSP_PACK=${quoteRemoteArgument(options.pythonLspPack)}` : "",
     options.typescriptLspPack ? `OMP_REMOTE_TYPESCRIPT_LSP_PACK=${quoteRemoteArgument(options.typescriptLspPack)}` : "",
+    options.cppLspPack ? `OMP_REMOTE_CPP_LSP_PACK=${quoteRemoteArgument(options.cppLspPack)}` : "",
   ].filter(Boolean).join(" ");
   return [
     ...buildSshBaseCommand(options),
     getSshDestination(options),
-    `set -eu; unset OMP_REMOTE_PYTHON_LSP_PACK OMP_REMOTE_TYPESCRIPT_LSP_PACK; d=${quoteRemoteArgument(posix.dirname(options.workerPath))}; root=${quoteRemoteArgument(posix.dirname(posix.dirname(posix.dirname(options.workerPath))))}; locked=0; if test -f "$root/.native-cache.lock" && test ! -L "$root/.native-cache.lock"; then exec 8>"$root/.native-cache.lock"; flock -w 8 -x 8; locked=1; fi; test -d "$d" && test ! -L "$d"; test ! -L "$d/.worker.lock"; exec 9>"$d/.worker.lock"; flock -s 9; test -x ${quoteRemoteArgument(options.workerPath)}; if test "$locked" -eq 1; then flock -u 8; fi; ${packEnvironment} exec flock --shared "$d/.worker.lock" ${quoteRemoteArgument(options.workerPath)}`,
+    `set -eu; unset OMP_REMOTE_PYTHON_LSP_PACK OMP_REMOTE_TYPESCRIPT_LSP_PACK OMP_REMOTE_CPP_LSP_PACK; d=${quoteRemoteArgument(posix.dirname(options.workerPath))}; root=${quoteRemoteArgument(posix.dirname(posix.dirname(posix.dirname(options.workerPath))))}; locked=0; if test -f "$root/.native-cache.lock" && test ! -L "$root/.native-cache.lock"; then exec 8>"$root/.native-cache.lock"; flock -w 8 -x 8; locked=1; fi; test -d "$d" && test ! -L "$d"; test ! -L "$d/.worker.lock"; exec 9>"$d/.worker.lock"; flock -s 9; test -x ${quoteRemoteArgument(options.workerPath)}; if test "$locked" -eq 1; then flock -u 8; fi; ${packEnvironment} exec flock --shared "$d/.worker.lock" ${quoteRemoteArgument(options.workerPath)}`,
   ];
 }

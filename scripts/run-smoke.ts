@@ -9,6 +9,7 @@ const commands: Record<string, { command: string; marker: string }> = {
   capture: { command: "remote-capture-smoke", marker: "CAPTURE_SMOKE_PASS" },
   "rich-output": { command: "remote-rich-output-smoke", marker: "RICH_OUTPUT_SMOKE_PASS" },
   lsp: { command: "remote-lsp-smoke", marker: "LSP_SMOKE_PASS" },
+  "cpp-lsp": { command: "remote-cpp-lsp-smoke", marker: "CPP_LSP_SMOKE_PASS" },
 };
 const requested = process.argv[2] ?? "cache";
 const admissionOnly = Bun.env.SMOKE_ADMISSION_ONLY === "1";
@@ -19,7 +20,7 @@ const mcCompat = name === "cache" && (requested === "cache-mc" || !!Bun.env.CACH
   : undefined;
 const selected = Object.hasOwn(commands, name)
   ? { ...commands[name], ...(mcCompat ? { marker: "MC_CACHE_SMOKE_PASS" } : {}) } : undefined;
-if (!selected) throw new Error("Usage: bun scripts/run-smoke.ts [cache|cache-mc|lifecycle|capture|rich-output|lsp]");
+if (!selected) throw new Error("Usage: bun scripts/run-smoke.ts [cache|cache-mc|lifecycle|capture|rich-output|lsp|cpp-lsp]");
 if (mcCompat && !await Bun.file(mcCompat).exists()) throw new Error(`Installed MC compat not found: ${mcCompat}`);
 const bundle = resolve(import.meta.dir, `../packages/omp/dist/${name}-smoke.js`);
 if (!await Bun.file(bundle).exists()) throw new Error(`Build the helper first: bun scripts/build-smoke.ts ${name}`);

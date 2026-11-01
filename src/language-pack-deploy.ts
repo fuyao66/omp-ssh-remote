@@ -5,7 +5,7 @@ import { parseLanguagePackDescriptor, sha256, type LanguagePackArchitecture, typ
 import { buildScpBaseCommand, buildSshBaseCommand, getSshDestination, quoteRemoteArgument, type SshConnectionOptions } from "./ssh.ts";
 
 export type PackRun = (command: string[], description: string, timeoutMs?: number) => Promise<string>;
-export type LanguagePackProfile = "python" | "typescript";
+export type LanguagePackProfile = "python" | "typescript" | "cpp";
 export function languagePackCacheCommand(profile: LanguagePackProfile, root: string, descriptor: LanguagePackDescriptor, archive = "-"): string {
   const encoded = Buffer.from(LANGUAGE_PACK_ARCHIVE_SCRIPT).toString("base64");
   const program = `import base64;exec(base64.b64decode('${encoded}'))`;
@@ -13,7 +13,7 @@ export function languagePackCacheCommand(profile: LanguagePackProfile, root: str
     .map(quoteRemoteArgument).join(" ");
 }
 export async function deployLanguagePack(profile: LanguagePackProfile, options: SshConnectionOptions, home: string, arch: LanguagePackArchitecture, artifactDir: string, run: PackRun): Promise<string> {
-  const label = profile === "python" ? "Python" : "TypeScript";
+  const label = { python: "Python", typescript: "TypeScript", cpp: "C/C++" }[profile];
   const prefix = join(artifactDir, `${profile}-lsp-linux-${arch}`);
   let descriptor: LanguagePackDescriptor;
   try { descriptor = parseLanguagePackDescriptor(JSON.parse(await readFile(`${prefix}.json`, "utf8")), arch, label); }

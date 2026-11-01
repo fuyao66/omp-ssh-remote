@@ -180,13 +180,29 @@ bun scripts/prepare-typescript-lsp.ts arm64  # 或 x64
 
 两个布尔值可分别省略，未知字段或非布尔值报错；这不是模型 `remote_connect` 参数。准备和部署需要已有的标准库 `python3`，启动时使用绝对路径的私有 Node，不修改 `PATH`。Worker 仅接收该连接的 `OMP_REMOTE_TYPESCRIPT_LSP_PACK`。首次发布到 `~/.cache/omp-ssh-remote/language-packs/typescript/linux-<arch>/<pack-id>/`，重连完整校验复用；pack 不参与 worker GC。
 
-仅缺失的原生默认 `typescript-language-server` 使用私有 launcher。显式 command／disabled／fileTypes／rootMarkers 和自定义语义 server 优先，linter 不阻止语义 fallback。原生选择器仍检查项目／PATH `tsc` 版本：可用 TS7 优先，TS5 `tsc` 本身不是 LSP。TLS 内先采用显式初始化 `tsserver.path`，再选项目 TypeScript（包括支持的 PnP SDK 路径），最后才用内置版本，不强制覆盖项目版本。原生 `lsp` 动作、编辑诊断和 reload 共用原生客户端，不另建 LSP 实现；此功能不提供 clangd 等其他语言二进制。
+仅缺失的原生默认 `typescript-language-server` 使用私有 launcher。显式 command／disabled／fileTypes／rootMarkers 和自定义语义 server 优先，linter 不阻止语义 fallback。原生选择器仍检查项目／PATH `tsc` 版本：可用 TS7 优先，TS5 `tsc` 本身不是 LSP。TLS 内先采用显式初始化 `tsserver.path`，再选项目 TypeScript（包括支持的 PnP SDK 路径），最后才用内置版本，不强制覆盖项目版本。原生 `lsp` 动作、编辑诊断和 reload 共用原生客户端，不另建 LSP 实现；其他语言需要单独启用对应 pack。
 
 私有 TLS 默认设置 `initOptions.disableAutomaticTypingAcquisition:true`，避免自动调用 npm 获取类型包；已有项目初始化选项优先，显式 `false` 会恢复上游行为，此时远端 npm／网络由项目自行提供。Tailwind、HTML／CSS 辅助 server 和 linter 不替代 TypeScript 语义 server，可与 fallback 并存。
 
 写入／编辑的迟到诊断通过宿主原生 yield queue 交付，严格绑定所属会话和连接。保留原生去重，消费时根据版本拒绝过期结果。修改类工具串行执行至实际操作完成，并以文件内容修订覆盖原生 LSP／AST 未更新 mutation counter 的情况。取消仍会协作传递，但须等进行中的原生修改实际完成，才释放诊断交付屏障。
 
 Worker 构建仅对 SDK 18.15.0 做严格锚点匹配的配置后备与修改完成适配，同时修正原生单文件／批量 writethrough 的完成判定：只承载格式化状态、尚未验证的诊断占位结果不能取消迟到诊断等待；已验证的行内正常／错误结果仍按原生方式完成。源码漂移即构建失败，不修改已安装的宿主 SDK。
+
+## 可选私有 C/C++ LSP Pack
+
+在本机 SSH alias 设置 `"lsp":{"cpp":true}`，与 Python／TypeScript 独立。运行 `bun scripts/prepare-cpp-lsp.ts arm64`（或 `x64`），将 `packages/omp/dist/cpp-lsp-linux-<arch>.{tar.gz,json}` 保留在 extension 旁。准备需要已有 `python3` 和 `readelf`，部署只需标准库 `python3`，不运行 apt／pip／npm 安装。
+
+两个架构固定同一 **clangd 23.1.5** 官方 [apt.llvm.org](https://apt.llvm.org/) Focal 构建（2026-10-28，`a738f2737189`），并非独立发布的 23.1.0，也不是第三方 PyPI 二进制。`src/cpp-lsp-pack.ts` 保存精确包版本、URL、SHA-256、已验证签名的元数据哈希与签名指纹。固定版本审计时已验证 LLVM Release／Ubuntu InRelease；重新准备检查不可变包哈希，不依赖滚动更新的索引。当时 Focal 22 分支已无所需 ARM64 二进制。
+
+包内仅保留 clangd、Clang 资源头文件、libclang-cpp、libLLVM 及私有动态依赖闭包。ARM64 额外包含 GCC C++／unwind 运行库；x64 还包含 ffi、edit、xml2、zlib／zstd、bsd／tinfo、ICU 和 lzma。每个 ELF 均检查架构与最高 **glibc 2.29** 符号要求，不捆绑 glibc 或系统 loader。保留各包版权声明、GCC 运行库例外和引用的完整通用许可证；LLVM 使用 Apache-2.0 with LLVM exceptions，依赖各自许可证不变。远端 OS／项目不安装任何包。
+
+运行库固定于公开 Focal 仓库，不含 Ubuntu Pro／ESM 更新。[Focal 标准安全维护已于 2025 年 5 月结束](https://ubuntu.com/about/release-cycle)；来源认证与 ABI 兼容不保证包含当前安全修复。私有运行库仍需独立安全审查和版本更新，尤其在解析不受信任的项目之前。
+
+复用通用 format-1 manifest、有界仅普通文件归档、完整缓存校验及原子发布，路径为 `~/.cache/omp-ssh-remote/language-packs/cpp/linux-<arch>/<pack-id>/`。仅所选 worker 接收 `OMP_REMOTE_CPP_LSP_PACK`；`bin/clangd` 用系统 loader 的显式私有库搜索路径与私有资源目录启动，不修改 `PATH` 或 `LD_LIBRARY_PATH`。Python／TypeScript 内容 ID 和缓存不变。
+
+只为缺失的原生默认 clangd 补可执行文件；项目／PATH clangd、显式 command／disabled／fileTypes／rootMarkers 和 ccls 等语义替代配置优先，即使显式替代命令不可用也不新增重复 server。保留原生 `--background-index`／`--clang-tidy`／`--header-insertion=iwyu` 及文件类型；后台索引可能创建 clangd 常规项目缓存。不自动添加通配 `--query-driver`，执行项目编译器探测 include 必须由项目显式授权配置。
+
+不提供标准库 SDK、编译器、CANN SDK 或编译数据库。clangd 使用项目已有 `compile_commands.json`／`.clangd`，需要时可在原生 `lsp.json` 参数设置 `--compile-commands-dir=...`。应验证实际标准头文件和厂商 API，不能以 server 启动代替正确性。CUDA／Objective-C 文件类型仅继承原生选择，不代表捆绑其 SDK。
 
 ## 部署与安全
 

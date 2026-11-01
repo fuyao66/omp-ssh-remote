@@ -31,8 +31,10 @@ def extract(tar, entries, target):
             os.chmod(dest,0o755 if m.mode & 0o111 else 0o644)
 PROFILES={
     'python': ('bin/pyright-langserver', {'bin/node','bin/pyright-langserver','pyright/langserver.index.js','pyright/package.json','pyright/LICENSE.txt','licenses/node-LICENSE'}),
-    'typescript': ('bin/typescript-language-server', {'bin/node','bin/typescript-language-server','typescript-language-server/lib/cli.mjs','typescript-language-server/package.json','typescript-language-server/LICENSE','typescript-language-server/node_modules/typescript/lib/tsserver.js','typescript-language-server/node_modules/typescript/lib/_tsserver.js','typescript-language-server/node_modules/typescript/lib/typescript.js','typescript-language-server/node_modules/typescript/package.json','typescript-language-server/node_modules/typescript/LICENSE.txt','typescript-language-server/node_modules/typescript/ThirdPartyNoticeText.txt','licenses/node-LICENSE'})
+    'typescript': ('bin/typescript-language-server', {'bin/node','bin/typescript-language-server','typescript-language-server/lib/cli.mjs','typescript-language-server/package.json','typescript-language-server/LICENSE','typescript-language-server/node_modules/typescript/lib/tsserver.js','typescript-language-server/node_modules/typescript/lib/_tsserver.js','typescript-language-server/node_modules/typescript/lib/typescript.js','typescript-language-server/node_modules/typescript/package.json','typescript-language-server/node_modules/typescript/LICENSE.txt','typescript-language-server/node_modules/typescript/ThirdPartyNoticeText.txt','licenses/node-LICENSE'}),
+    'cpp': ('bin/clangd', {'bin/clangd','bin/clangd.real','lib/libLLVM.so.23.1','lib/libclang-cpp.so.23.1','lib/libstdc++.so.6','lib/libgcc_s.so.1','lib/clang/23/include/stddef.h','licenses/clangd-23-copyright','licenses/libclang-common-23-dev-copyright','licenses/libclang-cpp23-copyright','licenses/libllvm23-copyright','licenses/gcc-10-base-copyright'})
 }
+EXECUTABLES={'python':('bin/node','bin/pyright-langserver'),'typescript':('bin/node','bin/typescript-language-server'),'cpp':('bin/clangd','bin/clangd.real')}
 profile='python'
 def verify(root, ident, arch):
     if os.path.islink(root) or not os.path.isdir(root): raise ValueError('missing or linked pack')
@@ -44,6 +46,9 @@ def verify(root, ident, arch):
     entrypoint,required=PROFILES[profile]
     if manifest['format']!=1 or manifest['platform']!='linux' or manifest['arch']!=arch or manifest['entrypoint']!=entrypoint: raise ValueError('invalid manifest')
     expected=manifest['files']
+    if profile=='cpp': required=required | {'licenses/common/Apache-2.0','licenses/common/GPL-3','licenses/common/LGPL-2.1'}
+    if profile=='cpp' and arch=='x64':
+        required=required | {'lib/'+name for name in ('libffi.so.7','libedit.so.2','libxml2.so.2','libzstd.so.1','libz.so.1','libbsd.so.0','libtinfo.so.6','libicuuc.so.66','libicudata.so.66','liblzma.so.5')} | {'licenses/'+name+'-copyright' for name in ('libffi7','libedit2','libxml2','libzstd1','zlib1g','libbsd0','libtinfo6','libicu66','liblzma5')}
     if not required.issubset(expected): raise ValueError('incomplete manifest')
     actual=set()
     for base,dirs,files in os.walk(root,followlinks=False):
@@ -60,9 +65,32 @@ def verify(root, ident, arch):
             with open(path,'rb') as f:
                 if digest(f.read())!=item['sha256']: raise ValueError('file checksum mismatch: '+rel)
     if actual!=set(expected): raise ValueError('incomplete pack')
-    for n in ('bin/node',entrypoint):
+    for n in EXECUTABLES[profile]:
         if expected[n]['mode']!=0o755: raise ValueError('nonexecutable launcher')
     return manifest
+
+def publish(pack,out,arch,provenance):
+    entrypoint,_=PROFILES[profile]
+    files={}
+    for base,dirs,names in os.walk(pack):
+        for name in names:
+            p=os.path.join(base,name); rel=os.path.relpath(p,pack)
+            with open(p,'rb') as f: checksum=digest(f.read())
+            files[rel]={'sha256':checksum,'mode':stat.S_IMODE(os.stat(p).st_mode)}
+    manifest={'format':1,'platform':'linux','arch':arch,'entrypoint':entrypoint,'provenance':provenance,'files':files}
+    raw=(json.dumps(manifest,sort_keys=True,separators=(',',':'))+'\n').encode()
+    with open(os.path.join(pack,'manifest.json'),'wb') as f: f.write(raw)
+    ident=digest(raw)
+    verify(pack,ident,arch)
+    import gzip
+    with open(out+'.tar.gz','wb') as rawout, gzip.GzipFile(filename='',fileobj=rawout,mode='wb',mtime=0) as zipped, tarfile.open(fileobj=zipped,mode='w',format=tarfile.USTAR_FORMAT) as tar:
+        for rel in sorted(['manifest.json']+list(files)):
+            info=tar.gettarinfo(os.path.join(pack,rel),arcname=rel)
+            info.uid=info.gid=0; info.uname=info.gname=''; info.mtime=0
+            with open(os.path.join(pack,rel),'rb') as f: tar.addfile(info,f)
+    with open(out+'.tar.gz','rb') as f: archive_hash=digest(f.read())
+    with open(out+'.json','w') as f: json.dump({'format':1,'platform':'linux','arch':arch,'id':ident,'archiveSha256':archive_hash},f,sort_keys=True)
+    print(ident)
 
 mode=sys.argv[1]
 if mode=='cache':
@@ -133,26 +161,10 @@ elif mode in ('prepare','prepare-typescript'):
         launcher='#!/bin/sh\nset -eu\npack=$(CDPATH= cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd -P)\nexec "$pack/bin/node" "$pack/'+program+'" "$@"\n'
         with open(os.path.join(pack,entrypoint),'w') as f: f.write(launcher)
         os.chmod(os.path.join(pack,entrypoint),0o755)
-        files={}
-        for base,dirs,names in os.walk(pack):
-            for name in names:
-                p=os.path.join(base,name); rel=os.path.relpath(p,pack)
-                with open(p,'rb') as f: checksum=digest(f.read())
-                files[rel]={'sha256':checksum,'mode':stat.S_IMODE(os.stat(p).st_mode)}
-        manifest={'format':1,'platform':'linux','arch':arch,'entrypoint':entrypoint,'provenance':provenance,'files':files}
-        raw=(json.dumps(manifest,sort_keys=True,separators=(',',':'))+'\n').encode()
-        with open(os.path.join(pack,'manifest.json'),'wb') as f: f.write(raw)
-        ident=digest(raw)
-        verify(pack,ident,arch)
-        # Stable tar metadata; gzip mtime is explicitly zeroed.
-        import gzip
-        with open(out+'.tar.gz','wb') as rawout, gzip.GzipFile(filename='',fileobj=rawout,mode='wb',mtime=0) as zipped, tarfile.open(fileobj=zipped,mode='w',format=tarfile.USTAR_FORMAT) as tar:
-            for rel in sorted(['manifest.json']+list(files)):
-                info=tar.gettarinfo(os.path.join(pack,rel),arcname=rel)
-                info.uid=info.gid=0; info.uname=info.gname=''; info.mtime=0
-                with open(os.path.join(pack,rel),'rb') as f: tar.addfile(info,f)
-        with open(out+'.tar.gz','rb') as f: archive_hash=digest(f.read())
-        with open(out+'.json','w') as f: json.dump({'format':1,'platform':'linux','arch':arch,'id':ident,'archiveSha256':archive_hash},f,sort_keys=True)
-        print(ident)
+        publish(pack,out,arch,provenance)
+elif mode=='prepare-cpp-directory':
+    profile='cpp'
+    pack,out,arch,provenance_json=sys.argv[2:]
+    publish(pack,out,arch,json.loads(provenance_json))
 else: raise ValueError('unknown operation')
 `;

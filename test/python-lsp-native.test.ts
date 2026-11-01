@@ -178,3 +178,37 @@ describe("production-adapted native TypeScript selection", () => {
     expect(configured.first.servers[name].initOptions).toEqual(initializationOptions);
   });
 });
+
+async function runCppCase(servers: unknown = {}, marker = true, installed = false) {
+  const dir = await mkdtemp(join(work, "cpp-project-"));
+  const pack = join(dir, "private pack");
+  await mkdir(join(pack, "bin"), { recursive: true });
+  const launcher = join(pack, "bin/clangd");
+  await writeFile(launcher, "#!/bin/sh\nexit 0\n"); await chmod(launcher, 0o755);
+  if (marker) await writeFile(join(dir, "CMakeLists.txt"), "project(fixture)\n");
+  await writeFile(join(dir, "lsp.json"), JSON.stringify({ servers }));
+  const bin = join(dir, "bin"); await mkdir(bin);
+  if (installed) { await writeFile(join(bin, "clangd"), "#!/bin/sh\nexit 0\n"); await chmod(join(bin, "clangd"), 0o755); }
+  const script = `import {getConfig,configCache} from ${JSON.stringify(bundled)}; const cwd=${JSON.stringify(dir)}; const first=getConfig(cwd); configCache.delete(cwd); console.log(JSON.stringify({first,second:getConfig(cwd)}));`;
+  const p = Bun.spawn([process.execPath, "-e", script], { cwd: dir, env: { ...process.env, HOME: dir, PI_CODING_AGENT_DIR: join(dir, "user"), PATH: installed ? bin : "", OMP_REMOTE_PYTHON_LSP_PACK: "", OMP_REMOTE_TYPESCRIPT_LSP_PACK: "", OMP_REMOTE_CPP_LSP_PACK: pack }, stdout: "pipe", stderr: "pipe" });
+  const output = await new Response(p.stdout).text(); const errors = await new Response(p.stderr).text();
+  if (await p.exited !== 0) throw new Error(errors);
+  return { ...JSON.parse(output.trim().split("\n").at(-1)!), launcher, bin };
+}
+describe("production-adapted native clangd selection", () => {
+  test("private executable keeps native defaults, no query-driver widening, and reload", async () => {
+    const r = await runCppCase();
+    expect(r.first.servers.clangd.resolvedCommand).toBe(r.launcher);
+    expect(r.first.servers.clangd.command).toBe("clangd");
+    expect(r.first.servers.clangd.args).toEqual(["--background-index", "--clang-tidy", "--header-insertion=iwyu"]);
+    expect(r.first.servers.clangd.args.some((arg: string) => arg.startsWith("--query-driver"))).toBe(false);
+    expect(r.second.servers.clangd.resolvedCommand).toBe(r.launcher);
+    expect((await runCppCase({}, false)).first.servers.clangd).toBeUndefined();
+    const installed = await runCppCase({}, true, true); expect(installed.first.servers.clangd.resolvedCommand).toBe(join(installed.bin, "clangd"));
+  });
+  test("explicit default or missing ccls semantic selection suppresses fallback", async () => {
+    for (const override of [{ command: "clangd" }, { disabled: true }, { fileTypes: [".cpp"] }, { rootMarkers: ["CMakeLists.txt"] }]) expect((await runCppCase({ clangd: override })).first.servers.clangd).toBeUndefined();
+    expect((await runCppCase({ ccls: { command: "missing-ccls", fileTypes: [".cpp"], rootMarkers: ["CMakeLists.txt"] } })).first.servers.clangd).toBeUndefined();
+    const settings = { project: true }; expect((await runCppCase({ clangd: { settings } })).first.servers.clangd.settings).toEqual(settings);
+  });
+});
