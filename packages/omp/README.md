@@ -68,7 +68,7 @@ flowchart LR
 - remote glibc Linux `x86_64` or `aarch64`;
 - public-key SSH that succeeds in batch mode;
 - an existing remote project directory;
-- the remote host needs project-specific language servers and debug adapters, but does not need Bun or OMP.
+- the remote host needs project-specific language servers and debug adapters, unless using the opt-in private Python LSP pack below; it does not need Bun or OMP.
 
 Host key verification is strict. Trust a host through normal OpenSSH `known_hosts`; do not disable host checking. Agent forwarding and SSH forwarding are disabled.
 
@@ -123,6 +123,46 @@ Explicit form:
 The model can invoke the same lifecycle through `remote_connect`, `remote_workspace_status`, `remote_reconnect`, and `remote_exit`. Status is on-demand and reports in-process state; it is not a per-turn prompt and does not actively ping SSH.
 
 Ordinary paths route remotely; local internal resources stay local and explicit remote references route by binding. Mixed-domain operations are rejected. An unavailable selected connection remains fail-closed. Each session may reconnect its own independent transport; only the owner can exit and close the family. Reconnect uses the original canonical directory, drops that companion's AST proposals, and accepts `--force` to replace a live transport. Stopped non-persistent services are not restarted. Owner reconnect does not restart child kernels; children can reconnect independently. Forced family closure leaves active descendants unavailable rather than allowing new tasks to fall back locally.
+
+## Optional Private Python LSP Pack (Prototype)
+
+This opt-in ships **Node 22.22.0 + Pyright 1.1.407** privately; it does not install npm, Node, Python packages, or project dependencies remotely. Python analysis still uses the project's own interpreter/configuration. Both preparation and opt-in deployment require existing `python3` (stdlib only); launching the server uses pack-owned Node. Linux glibc ARM64 and x64 are supported build targets; real-host acceptance is separate from building the artifacts.
+
+Prepare only the architecture you intend to deploy, from the repository root:
+
+```sh
+bun scripts/prepare-python-lsp.ts arm64  # or x64
+bun run build:omp
+bun run build:worker:all
+```
+
+Preparation downloads exact upstream archives into the ignored local `.cache/`, checks official [Node SHA-256 pins](https://nodejs.org/dist/v22.22.0/SHASUMS256.txt) and [Pyright npm SRI](https://registry.npmjs.org/pyright/1.1.407), and produces `packages/omp/dist/python-lsp-linux-<arch>.tar.gz` plus `.json`. No package-manager install scripts run. The pack contains `manifest.json`, `bin/node`, a physical-path `bin/pyright-langserver` launcher, the complete published `pyright/` runtime/resources/license tree, and `licenses/node-LICENSE` including Node's bundled notices. The manifest records provenance and every file's SHA-256/mode; its exact bytes define an independent pack ID. The descriptor separately pins the archive SHA-256. Keep both optional artifacts beside `extension.js` when distributing an enabled pack.
+
+Enable only the selected alias in local project `.omp/ssh.json` or user `~/.omp/agent/ssh.json` (retain your existing SSH fields):
+
+```json
+{"hosts":{"python-box":{"host":"example.com","lsp":{"python":true}}}}
+```
+
+Connect using that alias. Plain SSH aliases/direct `user@host` connections remain unchanged unless a matching OMP alias explicitly enables the pack. A missing local pack, missing remote Python, or partial/corrupt remote cache fails preparation with an error rather than silently claiming the fallback is enabled. Reconnects and child workers preserve opt-in and receive the immutable path through their own launch environment, not global `PATH`; tool schemas/RPC are unchanged.
+
+The first connection transfers the compressed archive over the existing strict SSH/SCP path. Remote stdlib code checks the archive checksum, rejects traversal, absolute paths, links and special members before extraction, verifies manifest contents/modes, and publishes under a per-content lock with atomic staging rename:
+
+```text
+~/.cache/omp-ssh-remote/language-packs/python/linux-<arch>/<pack-id>/
+```
+
+Later connections verify and reuse the complete cache without upload. Full file hashing on reuse is intentional in this prototype and adds local/remote I/O; it is not a sidecar-only fast path. Packs have **no automatic GC** and are independent of the two-worker retention window. Invalid existing final directories are refused, not overwritten or recursively removed; remove only the specifically diagnosed pack directory yourself after stopping its users if repair is needed.
+
+Native LSP discovery, root markers, lazy startup, diagnostics-on-edit and reload remain native. Project-local/PATH servers win; the private launcher is used only for missing default Pyright. Explicit Pyright `command`, `disabled`, file-type or root-marker configuration is not replaced. A configured semantic alternative (even missing) or an installed basedpyright/pylsp/other Python semantic server suppresses the extra Pyright; Ruff alone does not. Settings-only Pyright configuration can use the fallback. The worker build narrowly adapts SDK **18.13.1** configuration loading after native resolution; mismatched version/source anchors fail the build. Installed OMP source is never edited and native runtime exports are not monkeypatched.
+
+Use existing remote `pyrightconfig.json` / `pyproject.toml` for analysis paths and environments. If an explicit remote interpreter is needed, use native project `lsp.json` settings without a `command` override:
+
+```json
+{"servers":{"pyright":{"settings":{"python":{"pythonPath":"/srv/project/.venv/bin/python"}}}}}
+```
+
+That path is remote, project-owned and must already exist. The extension neither guesses arbitrary venvs nor writes this configuration. Inspect native `lsp` status/reload and exercise definition/references/diagnostics for the actual project; a running server is not proof of correct environment resolution.
 
 ## Deployment and Security
 

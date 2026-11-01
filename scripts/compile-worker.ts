@@ -1,5 +1,6 @@
 import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { adaptNativePythonLspConfig } from "../src/python-lsp-native-adapter.ts";
 import {
   resolveOmpBuildVersion,
   resolveOmpNativeBuildVersion,
@@ -102,9 +103,19 @@ await writeFile(
     `};\n`,
 );
 
+let adaptedLspConfigModules = 0;
 const buildPlugin: Bun.BunPlugin = {
   name: "omp-ssh-remote:worker-modules",
   setup(build) {
+    build.onLoad({ filter: /[/\\]lsp[/\\]config\.ts$/ }, async (args) => {
+      if (!args.path.includes("@oh-my-pi/pi-coding-agent/")) return undefined;
+      adaptedLspConfigModules++;
+      return {
+        contents: adaptNativePythonLspConfig(await readFile(args.path, "utf8"), hostVersion,
+          resolve(root, "src/python-lsp-fallback.ts")),
+        loader: "ts",
+      };
+    });
     build.onResolve({ filter: /^omp-legacy-pi-modules$/ }, () => ({
       path: "omp-legacy-pi-modules",
       namespace: "omp-ssh-remote",
@@ -154,6 +165,7 @@ const result = await Bun.build({
 });
 if (!result.success)
   throw new AggregateError(result.logs, `${target} worker compile failed`);
+if (adaptedLspConfigModules !== 1) throw new Error(`Expected exactly one native LSP config module, adapted ${adaptedLspConfigModules}`);
 await chmod(outfile, 0o755);
 const workerHash = new Bun.CryptoHasher("sha256")
   .update(await Bun.file(outfile).arrayBuffer())

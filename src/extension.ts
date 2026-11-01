@@ -248,6 +248,7 @@ export function remoteSessionNavigationBlockReason(
 type ExecutionTarget = "local" | "remote";
 type RemoteConnectOptions = Omit<RemoteConnectRequest, "cwd"> & {
   cwd: string;
+  pythonLspPack?: string;
 };
 type RemoteExtensionState = {
   binding: string;
@@ -984,7 +985,7 @@ async function reconnectRemoteRuntime(
   try {
     const signal = options.signal ? AbortSignal.any([options.signal, deployment.signal]) : deployment.signal;
     prepared = await prepareRemoteWorker({ ...family.connection, signal, onProgress: (stage) => ctx?.ui?.setWorkingMessage(stage) });
-    const connection = { ...family.connection, cwd: family.remoteCwd, workerPath: prepared.workerPath };
+    const connection = { ...family.connection, cwd: family.remoteCwd, workerPath: prepared.workerPath, pythonLspPack: prepared.pythonLspPack };
     const { client, ready, binding } = await openRemoteTransport(
       pi,
       connection,
@@ -1198,6 +1199,7 @@ export default async function remoteRuntimeExtension(
         const connection = {
           ...options,
           workerPath: prepared.workerPath,
+          pythonLspPack: prepared.pythonLspPack,
         };
         const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, prepared.signal);
         next = opened.client;
@@ -1388,6 +1390,7 @@ export default async function remoteRuntimeExtension(
         const connection = {
           ...options,
           workerPath: prepared.workerPath,
+          pythonLspPack: prepared.pythonLspPack,
         };
         const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, prepared.signal);
         next = opened.client;

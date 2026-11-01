@@ -68,7 +68,7 @@ flowchart LR
 - 远端为 glibc Linux `x86_64` 或 `aarch64`；
 - 公钥 SSH 可在 batch mode 下登录；
 - 远端项目目录已存在；
-- 远端需要安装项目所需的 language server 和 debug adapter，但不需要安装 Bun 或 OMP。
+- 远端需要项目所需的 language server 和 debug adapter；Python 可显式启用下述私有 pack，不需要安装 Bun 或 OMP。
 
 主机密钥使用严格校验。请通过正常的 OpenSSH `known_hosts` 信任主机，不要关闭 host checking。插件同时禁用 agent forwarding 和 SSH forwarding。
 
@@ -121,6 +121,46 @@ packages/omp/dist/worker-linux-arm64.sha256
 模型也可以通过 `remote_connect`、`remote_workspace_status`、`remote_reconnect` 和 `remote_exit` 执行相同生命周期。状态工具按需调用，报告进程内已知状态；它不会向每一轮注入 prompt，也不会主动 ping SSH。
 
 连接时普通文件路径远端执行，本机内部 URI 保持本机归属，显式远端资源引用按 binding 分发。混合本机 URI 和远端路径的操作会被拒绝。连接失效后继续 fail-closed；每个 session 可用 `/remote-reconnect` 恢复自己的独立 transport，只有 owner 能执行 `/remote-exit` 恢复本机并关闭 family。reconnect 使用初次解析后的规范远端目录，丢弃该 companion 的 AST proposal；`--force` 替换仍显示为已连接的 transport，非持久服务不会自动重启。owner 重连不重启其他子会话的内核；子会话可单独重连。family 被强制关闭后，仍活动的后代保留不可用绑定，不得通过新 task 回落本机。
+
+## 可选私有 Python LSP Pack（原型）
+
+Pack 固定为 **Node 22.22.0 + Pyright 1.1.407**，不修改全局 `PATH`，不在远端安装 npm、Node、Python 包或项目依赖。准备与启用部署都需要已有的 `python3`（仅标准库）；启动 server 使用 pack 内的 Node。支持 Linux glibc ARM64／x64 构建；产物构建通过不等于实际项目环境验收通过。
+
+在仓库根目录仅准备要部署的架构：
+
+```sh
+bun scripts/prepare-python-lsp.ts arm64  # 或 x64
+bun run build:omp
+bun run build:worker:all
+```
+
+脚本只下载固定的官方 Node 和 npm Pyright 压缩包到忽略的本地 `.cache/`，核对 [Node 官方 SHA-256](https://nodejs.org/dist/v22.22.0/SHASUMS256.txt) 与 [Pyright npm SRI](https://registry.npmjs.org/pyright/1.1.407)，不运行包管理器安装脚本。输出 `packages/omp/dist/python-lsp-linux-<arch>.tar.gz` 及 `.json` descriptor；发布启用版本时将两者保留在 `extension.js` 旁。Pack 包含 `manifest.json`、`bin/node`、按物理位置定位的 `bin/pyright-langserver`、完整发布的 `pyright/` 运行时／资源／许可证，以及包含第三方声明的 `licenses/node-LICENSE`。Manifest 记录上游来源和逐文件 SHA-256／mode，其精确字节定义独立 pack ID；descriptor 另记 archive SHA-256。
+
+仅在本机项目 `.omp/ssh.json` 或用户 `~/.omp/agent/ssh.json` 的指定 alias 显式启用，保留已有 SSH 字段：
+
+```json
+{"hosts":{"python-box":{"host":"example.com","lsp":{"python":true}}}}
+```
+
+通过该 alias 连接。未配置 opt-in 的连接及直接 `user@host` 保持原行为，不会为其他主机安装 server。本机产物缺失、远端缺少 Python 或最终缓存不完整／损坏时准备失败并报错，不静默降级为“已启用”。重连与子 worker 保留 opt-in，各自通过启动环境获得不可变路径，不改工具 schema／RPC 或全局 `PATH`。
+
+首次连接通过现有严格 SSH／SCP 上传压缩包。远端标准库先核对 archive checksum 并拒绝绝对路径、路径穿越、链接及特殊成员，再解包并核对 manifest 文件／mode，在同哈希锁下原子发布到：
+
+```text
+~/.cache/omp-ssh-remote/language-packs/python/linux-<arch>/<pack-id>/
+```
+
+后续连接完整校验并复用，不重复上传。原型每次复用仍计算本机 archive 和远端全部文件哈希，有额外 I/O，不宣称 sidecar 快速路径。Pack **暂不自动 GC**，不参与 worker 的“两代”回收。损坏最终目录只拒绝，不覆盖、不递归删除；需要修复时停止使用者后由操作者仅处理报错的具体目录。
+
+原生 LSP 的项目标记、惰性启动、定义／引用、编辑诊断与 reload 保持不变。项目本地／PATH server 优先；仅原生默认 Pyright 缺失时补充私有 launcher。显式 Pyright `command`、`disabled`、fileTypes／rootMarkers 不覆盖；显式选择的其他 Python 语义 server 即使命令缺失也不额外补 Pyright，已安装 basedpyright／pylsp／其他 Python 语义 server 同样优先，Ruff 单独存在不阻止补充。仅修改 Pyright settings 可使用 fallback。Worker 构建对 SDK **18.13.1** 的 config loader 做小范围编译期适配，版本或源码锚点变化即构建失败；不编辑安装的 OMP 源码、不 monkeypatch 运行时导出。
+
+分析环境由远端已有 `pyrightconfig.json`／`pyproject.toml` 决定。需要显式指定远端解释器时，可自行在项目原生 `lsp.json` 中配置 settings，不设置 `command`：
+
+```json
+{"servers":{"pyright":{"settings":{"python":{"pythonPath":"/srv/project/.venv/bin/python"}}}}}
+```
+
+解释器必须已存在，路径属于远端项目；插件不扫描任意 venv、不自动写配置。通过原生 `lsp` status／reload，并对实际项目验证定义、引用、诊断；仅 server 启动不代表解释器和依赖解析正确。
 
 ## 部署与安全
 
