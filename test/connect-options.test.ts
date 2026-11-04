@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  discoverSshConfigAliases,
+  loadConfiguredSshHosts,
   mergeConfiguredSshHosts,
   parseConnectArgs,
   parseConnectOptions,
@@ -15,6 +20,28 @@ const gpuBox: ConfiguredSshHost = {
 };
 
 describe("remote connection aliases", () => {
+  test("discovers concrete multi-pattern names without interpreting SSH directives", () => {
+    const aliases = discoverSshConfigAliases([
+      "Include conf.d/*.conf",
+      'Host "include-box" match-box *.example.com !excluded ?wild # ignored-name',
+      "  HostName wrong.example.com",
+      "  User wrong-user",
+      "  Port 9999",
+      "  IdentityFile /keys/wrong",
+      "Match host match-box",
+      "  HostName another.example.com",
+      "Host=equal-box",
+      "Host include-box 'quoted-box'",
+    ].join("\n"));
+    expect(aliases).toEqual([
+      { name: "include-box" }, { name: "match-box" },
+      { name: "equal-box" }, { name: "quoted-box" },
+    ]);
+    for (const { name } of aliases) {
+      expect(parseConnectArgs(name, aliases)).toEqual({ target: name, displayTarget: name });
+    }
+  });
+
   test("connects by OMP SSH host name and defaults cwd later", () => {
     expect(parseConnectArgs("gpu-box", [gpuBox])).toEqual({
       target: "developer@remote.example.com",
@@ -81,12 +108,29 @@ describe("remote connection aliases", () => {
 
   test("keeps the configured destination when an OMP alias overrides SSH config", () => {
     const project = { ...gpuBox, host: "project.example.com", username: "project-user" };
-    const sshConfig = { ...gpuBox, host: "ssh-config.example.com", username: "ssh-user" };
+    const sshConfig: ConfiguredSshHost = { name: "gpu-box" };
     const configured = mergeConfiguredSshHosts([project], [], [sshConfig]);
     expect(parseConnectArgs("gpu-box", configured)).toMatchObject({
       target: "project-user@project.example.com",
       sshAlias: "gpu-box",
     });
+  });
+
+  test("loads ssh.json records as explicit overrides rather than discovery-only aliases", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-project-alias-"));
+    try {
+      await mkdir(join(cwd, ".omp"));
+      await writeFile(join(cwd, ".omp/ssh.json"), JSON.stringify({ hosts: {
+        "project-fixture": { host: "project.example.com", username: "developer+ci", port: 2200, key: "/keys/project" },
+      } }));
+      const configured = await loadConfiguredSshHosts(cwd);
+      expect(parseConnectArgs("project-fixture", configured)).toEqual({
+        target: "developer+ci@project.example.com", displayTarget: "project-fixture", sshAlias: "project-fixture",
+        port: 2200, identityFile: "/keys/project",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   test("project aliases override same-name user aliases", () => {
@@ -100,6 +144,8 @@ describe("remote connection aliases", () => {
     expect(() => parseConnectArgs("host /a /b")).toThrow("Usage:");
     expect(() => parseConnectArgs("host --port 0")).toThrow("Invalid SSH port");
     expect(() => parseConnectArgs("host --identity")).toThrow("Missing value");
+    expect(() => parseConnectArgs("host --worker /remote/worker")).toThrow("Unknown option: --worker");
+    expect(() => parseConnectArgs("host --worker")).toThrow("Unknown option: --worker");
   });
 
   test("keeps slash-command parsing for quoted paths and explicit flags", () => {
@@ -132,7 +178,6 @@ describe("structured remote connection options", () => {
       cwd: `/srv/a "quoted" project/it's here`,
       identity: `/keys/my "private" key's file`,
       knownHosts: `/keys/known "hosts" file`,
-      worker: `/srv/worker's "entry" file`,
     };
     expect(parseConnectOptions(options, [gpuBox])).toEqual({
       target: "developer@remote.example.com",
@@ -142,7 +187,6 @@ describe("structured remote connection options", () => {
       port: 2222,
       identityFile: options.identity,
       knownHostsFile: options.knownHosts,
-      workerPath: options.worker,
     });
   });
 
@@ -150,18 +194,16 @@ describe("structured remote connection options", () => {
     expect(parseConnectOptions({
       target: "gpu-box",
       cwd: "--port 1 --identity /injected/key",
-      identity: "--port 2 --worker /injected/worker",
+      identity: "--port 2 --identity /injected/key",
       knownHosts: "--identity",
-      worker: "--known-hosts",
     }, [gpuBox])).toEqual({
       target: "developer@remote.example.com",
       displayTarget: "gpu-box",
       sshAlias: "gpu-box",
       cwd: "--port 1 --identity /injected/key",
       port: 2222,
-      identityFile: "--port 2 --worker /injected/worker",
+      identityFile: "--port 2 --identity /injected/key",
       knownHostsFile: "--identity",
-      workerPath: "--known-hosts",
     });
   });
 
@@ -243,7 +285,7 @@ describe("structured remote connection options", () => {
   });
 
   test("rejects non-string path fields", () => {
-    for (const field of ["cwd", "identity", "knownHosts", "worker"]) {
+    for (const field of ["cwd", "identity", "knownHosts"]) {
       expect(() => parseConnectOptions({ target: "host", [field]: 123 }))
         .toThrow("expected a string");
     }

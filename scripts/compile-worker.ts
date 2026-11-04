@@ -1,7 +1,8 @@
 import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { adaptNativeLspConfig } from "../src/native-lsp-config-adapter.ts";
-import { adaptNativeMutationSettlement, type NativeMutationModule } from "../src/omp/native-mutation-adapter.ts";
+import { adaptNativeMutationSettlement } from "../src/omp/native-mutation-adapter.ts";
+import { SDK_SOURCE_ADAPTATIONS, assertSdkBuildAdaptations, sdkAdaptationLabel } from "../src/omp/sdk-contract.ts";
 import {
   resolveOmpBuildVersion,
   resolveOmpNativeBuildVersion,
@@ -104,27 +105,28 @@ await writeFile(
     `};\n`,
 );
 
-let adaptedLspConfigModules = 0;
-const adaptedMutationModules = new Set<NativeMutationModule>();
+const adaptedModules = new Map<string, number>();
+const adaptationPaths = new Map(SDK_SOURCE_ADAPTATIONS.map(adaptation => {
+  try {
+    return [Bun.resolveSync(adaptation.sdkModule, root), adaptation] as const;
+  } catch (error) {
+    throw new Error(`${sdkAdaptationLabel(adaptation)} cannot resolve installed source; run bun run check:sdk before compiling`, { cause: error });
+  }
+}));
 const buildPlugin: Bun.BunPlugin = {
   name: "omp-ssh-remote:worker-modules",
   setup(build) {
-    build.onLoad({ filter: /[/\\](?:tools[/\\](?:write|ast-edit)|lsp[/\\]writethrough)\.ts$/ }, async args => {
-      if (!args.path.includes("@oh-my-pi/pi-coding-agent/")) return undefined;
-      const module = /writethrough\.ts$/.test(args.path) ? "writethrough" : /ast-edit\.ts$/.test(args.path) ? "ast-edit" : "write";
-      if (adaptedMutationModules.has(module)) throw new Error(`Duplicate native mutation module: ${module}`);
-      adaptedMutationModules.add(module);
-      return { contents: adaptNativeMutationSettlement(await readFile(args.path, "utf8"), hostVersion, module,
-        resolve(root, "src/omp/mutation-settlement.ts")), loader: "ts" };
-    });
-    build.onLoad({ filter: /[/\\]lsp[/\\]config\.ts$/ }, async (args) => {
-      if (!args.path.includes("@oh-my-pi/pi-coding-agent/")) return undefined;
-      adaptedLspConfigModules++;
-      return {
-        contents: adaptNativeLspConfig(await readFile(args.path, "utf8"), hostVersion,
-          resolve(root, "src/python-lsp-fallback.ts")),
-        loader: "ts",
-      };
+    build.onLoad({ filter: /\.ts$/ }, async args => {
+      const adaptation = adaptationPaths.get(args.path);
+      if (!adaptation) return undefined;
+      const count = (adaptedModules.get(adaptation.id) ?? 0) + 1;
+      if (count > adaptation.expectedBuildCount) throw new Error(`Duplicate SDK adaptation: ${sdkAdaptationLabel(adaptation)}`);
+      const source = await readFile(args.path, "utf8");
+      const contents = adaptation.kind === "lsp-config"
+        ? adaptNativeLspConfig(source, hostVersion, resolve(root, "src/python-lsp-fallback.ts"))
+        : adaptNativeMutationSettlement(source, hostVersion, adaptation.module, resolve(root, "src/omp/mutation-settlement.ts"));
+      adaptedModules.set(adaptation.id, count);
+      return { contents, loader: "ts" };
     });
     build.onResolve({ filter: /^omp-legacy-pi-modules$/ }, () => ({
       path: "omp-legacy-pi-modules",
@@ -175,8 +177,7 @@ const result = await Bun.build({
 });
 if (!result.success)
   throw new AggregateError(result.logs, `${target} worker compile failed`);
-if (adaptedLspConfigModules !== 1) throw new Error(`Expected exactly one native LSP config module, adapted ${adaptedLspConfigModules}`);
-if (adaptedMutationModules.size !== 3) throw new Error(`Expected three native mutation modules, adapted ${[...adaptedMutationModules].join(", ")}`);
+assertSdkBuildAdaptations(adaptedModules);
 await chmod(outfile, 0o755);
 const workerHash = new Bun.CryptoHasher("sha256")
   .update(await Bun.file(outfile).arrayBuffer())

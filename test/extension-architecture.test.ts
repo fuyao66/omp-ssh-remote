@@ -7,6 +7,7 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { nestedDispatchScope } from "../src/nested-dispatch.ts";
 import remoteRuntimeExtension, {
   closeRemoteFamily,
   consumedResolution,
@@ -277,6 +278,46 @@ describe("extension workspace architecture", () => {
       await harness.executeTool("read", { path: "proc://web;proc://bg_1" });
       expect(localPaths.at(-1)).toBe("proc://web;proc://bg_1");
       expect(remotePaths).toHaveLength(2);
+    } finally {
+      registry.mockRestore();
+      await harness.emit("session_shutdown");
+      broker.delete(ownerFile);
+    }
+  });
+
+  test("registered nested reply writes use native local fallback without opening other host resources", async () => {
+    const ownerFile = `/tmp/reply-owner-${crypto.randomUUID()}.jsonl`;
+    const root = ownerFile.slice(0, -".jsonl".length);
+    const childFile = `${root}/subagent/child.jsonl`;
+    const family: Family = {
+      ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: "/remote/workspace",
+      connection: { target: "test@example.invalid", displayTarget: "test-remote", cwd: "/remote/workspace", workerPath: "/remote/worker.mjs" },
+      members: new Set(), closing: true,
+    };
+    const localPaths: unknown[] = [];
+    const harness = await extensionHarness(childFile, undefined, ["write"], async input => {
+      localPaths.push(input.path);
+      return { content: [{ type: "text", text: "Shown to the user." }] };
+    });
+    const broker = (globalThis as unknown as Record<symbol, Map<string, Family>>)[Symbol.for("omp-ssh-remote/session-families")]!;
+    broker.set(ownerFile, family);
+    const registry = spyOn(AgentRegistry, "global").mockReturnValue({ list: () => [{
+      id: "Main", sessionFile: childFile, session: {
+        settings: Settings.isolated(), sessionManager: harness.ctx.sessionManager,
+        getToolByName: () => undefined,
+        runToolRegistryMutation: async <T>(mutation: () => Promise<T>): Promise<T> => await mutation(),
+      },
+    }] } as never);
+    try {
+      await harness.emit("session_start");
+      const state = [...family.members][0]!;
+      state.connectionError = undefined;
+      state.client = { isClosed: false, async close() {}, execute() { throw new Error("Reply reached remote filesystem"); } } as unknown as Member["client"];
+      await nestedDispatchScope.run({ assertCurrent() {} }, () => harness.executeTool("write", { path: "out://", content: "reply" }));
+      expect(localPaths).toEqual(["out://"]);
+      await expect(nestedDispatchScope.run({ assertCurrent() {} }, () => harness.executeTool("write", { path: "local://private.txt", content: "no" })))
+        .rejects.toThrow("host resource unavailable from the remote runtime");
+      expect(localPaths).toEqual(["out://"]);
     } finally {
       registry.mockRestore();
       await harness.emit("session_shutdown");

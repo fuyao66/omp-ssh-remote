@@ -3,8 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TYPESCRIPT_LSP_PINS } from "../src/typescript-lsp-pack.ts";
-import { typescriptLspCacheCommand, deployTypescriptLspPack } from "../src/typescript-lsp-deploy.ts";
-import { pythonLspCacheCommand } from "../src/python-lsp-deploy.ts";
+import { languagePackCacheCommand, deployLanguagePack } from "../src/language-pack-deploy.ts";
 import { sha256, type LanguagePackDescriptor } from "../src/language-pack.ts";
 import { applyTypescriptLspFallback, type TypescriptServerCandidate } from "../src/typescript-lsp-fallback.ts";
 import { buildSshWorkerCommand } from "../src/ssh.ts";
@@ -39,26 +38,32 @@ describe("TypeScript shared pack consumer", () => {
   });
   test("same-hash publishers converge; verified hit preserves inode and refuses corruption", async () => {
     const f = await fixture();
-    const command = typescriptLspCacheCommand(f.root, f.descriptor, f.archive);
+    const command = languagePackCacheCommand("typescript", f.root, f.descriptor, f.archive);
     const results = await Promise.all([execute(command), execute(command)]);
     for (const result of results) expect(result.code, result.stderr).toBe(0);
     const final = join(f.root, f.descriptor.id);
     const inode = (await stat(final)).ino;
-    expect((await execute(typescriptLspCacheCommand(f.root, f.descriptor))).stdout).toBe(final);
+    expect((await execute(languagePackCacheCommand("typescript", f.root, f.descriptor))).stdout).toBe(final);
     expect((await stat(final)).ino).toBe(inode);
     await writeFile(join(final, "typescript-language-server/lib/cli.mjs"), "corrupt");
     expect((await execute(command)).code).not.toBe(0);
   });
   test("profiles reject wrong language, missing runtime/license and partial caches", async () => {
     const valid = await fixture();
-    expect((await execute(pythonLspCacheCommand(valid.root, valid.descriptor, valid.archive))).code).not.toBe(0);
+    const wrongProfile = await execute(languagePackCacheCommand("python", valid.root, valid.descriptor, valid.archive));
+    expect(wrongProfile.code).not.toBe(0);
+    expect(wrongProfile.stderr).toContain("invalid manifest");
+    expect((await execute(languagePackCacheCommand("typescript", valid.root, valid.descriptor, valid.archive))).code).toBe(0);
+    const wrongCachedProfile = await execute(languagePackCacheCommand("python", valid.root, valid.descriptor));
+    expect(wrongCachedProfile.code).not.toBe(0);
+    expect(wrongCachedProfile.stderr).toContain("invalid manifest");
     for (const missing of ["typescript-language-server/LICENSE", "typescript-language-server/node_modules/typescript/lib/tsserver.js"]) {
       const f = await fixture(missing);
-      expect((await execute(typescriptLspCacheCommand(f.root, f.descriptor, f.archive))).code).not.toBe(0);
+      expect((await execute(languagePackCacheCommand("typescript", f.root, f.descriptor, f.archive))).code).not.toBe(0);
     }
     const partial = await fixture();
     await mkdir(join(partial.root, partial.descriptor.id), { recursive: true });
-    expect((await execute(typescriptLspCacheCommand(partial.root, partial.descriptor, partial.archive))).code).not.toBe(0);
+    expect((await execute(languagePackCacheCommand("typescript", partial.root, partial.descriptor, partial.archive))).code).not.toBe(0);
   });
   test("deployer validates local archive, hits without SCP and reports missing artifact", async () => {
     const f = await fixture();
@@ -66,11 +71,11 @@ describe("TypeScript shared pack consumer", () => {
     await writeFile(join(f.dir, "typescript-lsp-linux-arm64.tar.gz"), await readFile(f.archive));
     const expected = `/home/test/.cache/omp-ssh-remote/language-packs/typescript/linux-arm64/${f.descriptor.id}`;
     const commands: string[][] = [];
-    expect(await deployTypescriptLspPack({ target: "example.com" }, "/home/test", "arm64", f.dir, async command => { commands.push(command); return expected; })).toBe(expected);
+    expect(await deployLanguagePack("typescript", { target: "example.com" }, "/home/test", "arm64", f.dir, async command => { commands.push(command); return expected; })).toBe(expected);
     expect(commands).toHaveLength(1); expect(commands[0]![0]).toBe("ssh");
     await writeFile(join(f.dir, "typescript-lsp-linux-arm64.tar.gz"), "corrupt");
-    await expect(deployTypescriptLspPack({ target: "example.com" }, "/home/test", "arm64", f.dir, async () => expected)).rejects.toThrow("checksum");
-    await expect(deployTypescriptLspPack({ target: "example.com" }, "/home/test", "x64", work, async () => "")).rejects.toThrow("prepare-typescript-lsp.ts x64");
+    await expect(deployLanguagePack("typescript", { target: "example.com" }, "/home/test", "arm64", f.dir, async () => expected)).rejects.toThrow("checksum");
+    await expect(deployLanguagePack("typescript", { target: "example.com" }, "/home/test", "x64", work, async () => "")).rejects.toThrow("prepare-typescript-lsp.ts x64");
   });
   test("host-only opt-ins are independent booleans and reject unknown fields", async () => {
     const dir = await mkdtemp(join(work, "hosts ")); await mkdir(join(dir, ".omp"));

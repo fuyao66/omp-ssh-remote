@@ -1,9 +1,8 @@
-import { PYTHON_LSP_PINS } from "./python-lsp-pack.ts";
-import { parseLanguagePackDescriptor, type LanguagePackArchitecture, type LanguagePackDescriptor } from "./language-pack.ts";
+import { LANGUAGE_PACK_NODE_PIN, type LanguagePackArchitecture, type LanguagePackDescriptor } from "./language-pack.ts";
 
 // Published TLS cli.mjs bundles all dependencies. Both npm packages have no runtime dependency edges.
 export const TYPESCRIPT_LSP_PINS = {
-  node: PYTHON_LSP_PINS.node,
+  node: LANGUAGE_PACK_NODE_PIN,
   server: {
     version: "4.3.4",
     url: "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-4.3.4.tgz",
@@ -17,6 +16,3 @@ export const TYPESCRIPT_LSP_PINS = {
 } as const;
 export type TypescriptLspArchitecture = LanguagePackArchitecture;
 export type TypescriptLspPackDescriptor = LanguagePackDescriptor;
-export function parseTypescriptLspPackDescriptor(value: unknown, arch: TypescriptLspArchitecture): TypescriptLspPackDescriptor {
-  return parseLanguagePackDescriptor(value, arch, "TypeScript");
-}

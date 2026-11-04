@@ -8,6 +8,7 @@ await mkdir(ompOutdir, { recursive: true });
   for (const entry of await readdir(ompOutdir)) {
     if (
       entry === "worker.js" ||
+      /^(cache|lifecycle|capture|rich-output|lsp|cpp-lsp)-smoke\.js$/.test(entry) ||
       entry.startsWith("CHANGELOG-") ||
       entry.startsWith("template-") ||
       entry.startsWith("tool-views.generated-")

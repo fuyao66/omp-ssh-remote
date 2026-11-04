@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { adaptNativeLspConfig } from "../src/native-lsp-config-adapter.ts";
+import { SDK_ADAPTATIONS, SUPPORTED_SDK_VERSION } from "../src/omp/sdk-contract.ts";
 
 const root = resolve(import.meta.dir, "..");
 let work: string;
@@ -19,7 +20,7 @@ beforeAll(async () => {
         contents: "export const BUNDLED_PI_MODULE_LOADERS = {};", loader: "js",
       }));
       build.onLoad({ filter: /[/\\]lsp[/\\]config\.ts$/ }, async args => ({
-        contents: adaptNativeLspConfig(await readFile(args.path, "utf8"), "18.15.0", join(root, "src/python-lsp-fallback.ts")), loader: "ts",
+        contents: adaptNativeLspConfig(await readFile(args.path, "utf8"), SUPPORTED_SDK_VERSION, join(root, "src/python-lsp-fallback.ts")), loader: "ts",
       }));
     } }],
   });
@@ -112,9 +113,17 @@ describe("production-adapted native LSP configuration", () => {
     expect(first.servers.pyright).toBeDefined();
     expect(second.servers.pyright).toBeUndefined();
   });
-  test("adapter refuses SDK and source drift", async () => {
-    expect(() => adaptNativeLspConfig("", "18.14.0", "fallback.ts")).toThrow("requires SDK");
-    expect(() => adaptNativeLspConfig("", "18.15.0", "fallback.ts")).toThrow("anchor drift");
+  test("adapter refuses unsupported SDKs and every missing or duplicate registered anchor", async () => {
+    const adaptation = SDK_ADAPTATIONS.lspConfig;
+    const source = await readFile(Bun.resolveSync(adaptation.sdkModule, root), "utf8");
+    const apply = (input: string, version: string = SUPPORTED_SDK_VERSION) => adaptNativeLspConfig(input, version, "fallback.ts");
+    const errorContext = `${adaptation.id} (${adaptation.sdkModule}; upstream ${adaptation.upstreamPath})`;
+    expect(apply(source)).not.toBe(source);
+    expect(() => apply(source, "unsupported-sdk")).toThrow(`${errorContext} requires SDK ${SUPPORTED_SDK_VERSION}`);
+    for (const [anchorId, anchor] of Object.entries(adaptation.anchors)) {
+      expect(() => apply(source.replace(anchor.text, ""))).toThrow(`${errorContext} anchor drift at ${anchorId}: expected ${anchor.expectedCount}, got 0`);
+      expect(() => apply(`${source}\n${anchor.text}`)).toThrow(`${errorContext} anchor drift at ${anchorId}: expected ${anchor.expectedCount}, got 2`);
+    }
   });
 });
 

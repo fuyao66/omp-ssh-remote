@@ -1,4 +1,4 @@
-import { resolve as resolvePath } from "node:path";
+import { isAbsolute, win32, resolve as resolvePath } from "node:path";
 import type { AgentToolResult, ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { z } from "@oh-my-pi/omptype/zod";
 import type {
@@ -51,7 +51,7 @@ import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { getRemoteFamilyBroker, sessionFamilyRoot } from "./family-broker.ts";
 export { sessionBelongsToFamily } from "./family-broker.ts";
-import { assertNestedRemoteTool, nestedDispatchScope } from "./nested-dispatch.ts";
+import { assertNestedRemoteTool, isOutReplyWrite, nestedDispatchScope } from "./nested-dispatch.ts";
 import type { HostToolInvoker } from "./client.ts";
 import { validateAgentToolArguments } from "@oh-my-pi/pi-agent-core";
 import { resourceOwnershipTarget } from "./resource-ownership.ts";
@@ -71,6 +71,15 @@ export function captureLocalExecutionSettings(): RemoteExecutionSettings {
   } catch {
     return {};
   }
+}
+
+/** Probe the bound native write gate: it owns the actual host ToolSession's
+ * settings and tuiTranscript flag, neither of which extension UI mode implies. */
+export function captureOutReplyCapability(approval: ToolApproval | undefined, taskDepth = 0): boolean {
+  if (taskDepth > 0 || approval === undefined) return false;
+  const decision = typeof approval === "function"
+    ? approval({ path: "out://", content: "Remote reply capability probe." }) : approval;
+  return decision === "read" || (typeof decision === "object" && decision.tier === "read" && decision.policy !== "deny");
 }
 
 const REMOTE_TOOL_SET = new Set<string>(REMOTE_TOOL_NAMES);
@@ -341,6 +350,13 @@ export function remoteControlPlaneBlockReason(
   const params = asRecord(input);
   if (toolName === "task" && taskRequestsIsolation(params)) {
     return "Remote runtime does not support OMP local isolated worktrees. Use isolated:false or disconnect first.";
+  }
+  if (toolName === "task") {
+    const tasks = [params, ...(Array.isArray(params.tasks) ? params.tasks.map(asRecord) : [])];
+    if (tasks.some(task => typeof task.taskFile === "string" &&
+        (isAbsolute(task.taskFile) || win32.isAbsolute(task.taskFile)))) {
+      return "taskFile absolute paths are ambiguous while remote is selected. Use local:// for a host task file; remote task files are not read by the local task tool.";
+    }
   }
   if (toolName === "bash" && params.async === true && !resolveLocalAsyncJobManager(sessionFile)) {
     return "Remote async bash requires the local OMP background job manager, which is unavailable in this session.";
@@ -714,7 +730,7 @@ function registerWrapper(
       };
       const target = await executionTarget(name, params, state, ctx, signal);
       ensureCurrent();
-      if (nested && target !== "remote") throw new Error(`Eval tool.${name} cannot access local host resources from the remote runtime`);
+      if (nested && target !== "remote" && !isOutReplyWrite(name, params)) throw new Error(`Eval tool.${name}: host resource unavailable from the remote runtime`);
       const serviceName = name === "bash" && target === "remote" && typeof params.name === "string" ? params.name.trim() || undefined : undefined;
       if (name === "bash" && target === "remote" && params.async === true && !serviceName) {
         return startRemoteAsyncBashJob(remoteBashJobOptions(toolCallId, params, state, ctx, rawOnUpdate));
@@ -930,14 +946,17 @@ async function openRemoteTransport(
     command: buildSshWorkerCommand(connection),
   });
   try {
+    const owner = hostSessionFor(state, ctx);
+    const taskDepth = ctx?.agent?.depth ?? 0;
     const ready = await client.initialize(cwd, handshake, undefined, {
       sessionId: launchOwnerId(ctx),
-      settings: hostSessionFor(state, ctx) ? captureExecutionSettings(hostSessionFor(state, ctx)!.settings) : captureLocalExecutionSettings(),
+      settings: owner ? captureExecutionSettings(owner.settings) : captureLocalExecutionSettings(),
+      outReplies: captureOutReplyCapability(owner?.getToolByName("write")?.approval, taskDepth),
+      taskDepth,
       signal,
       resourceBinding: binding,
     });
     bindLaunchCompletionDelivery(pi, client);
-    const owner = hostSessionFor(state, ctx);
     const sessionId = launchOwnerId(ctx);
     if (owner && sessionId) {
       const diagnostics = new RemoteLspDiagnostics(owner, sessionId, binding, () =>
@@ -1113,6 +1132,92 @@ async function attachFamilyMember(
   }
 }
 
+type OwnerConnectInput = {
+  sessionFile: string | undefined;
+  localCwd: string;
+  parseRequest: (hosts: Awaited<ReturnType<typeof loadConfiguredSshHosts>>) => RemoteConnectRequest;
+  signal?: AbortSignal;
+  onProgress: (stage: string) => void;
+  inProgressHint: string;
+  alreadySelectedHint: string;
+};
+
+/** The single owner-connection transaction shared by the tool and slash command:
+ * admission preconditions → deploy lease → transport admission → usage commit → family publication. */
+async function connectOwner(
+  pi: ExtensionAPI,
+  state: RemoteExtensionState,
+  ctx: ExtensionContext | undefined,
+  input: OwnerConnectInput,
+): Promise<{ request: RemoteConnectRequest; ready: ReadyMessage; remoteCwd: string; cacheAudit: RemoteWorkerCacheAudit }> {
+  if (state.deployment) throw new Error(`Remote connection is already in progress${input.inProgressHint}`);
+  if (state.selected) throw new Error(`A remote runtime is already selected; ${input.alreadySelectedHint}`);
+  if (!input.sessionFile) {
+    throw new Error("Remote runtime requires a persisted OMP session so subagents can inherit safely");
+  }
+  const normalizedSessionFile = resolvePath(input.sessionFile);
+  if (remoteFamilyBroker.hasOwner(normalizedSessionFile)) {
+    throw new Error("This session already owns a remote runtime family");
+  }
+  const request = input.parseRequest(await loadConfiguredSshHosts(input.localCwd));
+  let next: RemoteRuntimeClient | undefined;
+  let prepared: PreparedRemoteWorker | undefined;
+  const deployment = new AbortController();
+  state.deployment = deployment;
+  try {
+    const signal = input.signal ? AbortSignal.any([input.signal, deployment.signal]) : deployment.signal;
+    prepared = await prepareRemoteWorker({ ...request, signal, onProgress: input.onProgress });
+    const remoteCwd = request.cwd ?? prepared.home ?? (await resolveRemoteHome(request));
+    const connection = {
+      ...request,
+      cwd: remoteCwd,
+      workerPath: prepared.workerPath,
+      pythonLspPack: prepared.pythonLspPack,
+      typescriptLspPack: prepared.typescriptLspPack,
+      cppLspPack: prepared.cppLspPack,
+    };
+    const opened = await openRemoteTransport(pi, connection, remoteCwd, state, ctx, prepared.signal);
+    next = opened.client;
+    signal.throwIfAborted();
+    await prepared.commitUsage();
+    const ready = opened.ready;
+    const resolvedRemoteCwd = ready.cwd ?? remoteCwd;
+    const family: RemoteFamily = {
+      ownerSessionFile: normalizedSessionFile,
+      root: sessionFamilyRoot(normalizedSessionFile),
+      localCwd: input.localCwd,
+      remoteCwd: resolvedRemoteCwd,
+      connection: { ...connection, cwd: resolvedRemoteCwd },
+      cacheAudit: prepared.cacheAudit,
+      members: new Set([state]),
+      closing: false,
+    };
+    state.client = next;
+    state.binding = opened.binding;
+    state.remoteCwd = resolvedRemoteCwd;
+    state.localCwd = input.localCwd;
+    state.sessionFile = normalizedSessionFile;
+    state.selected = true;
+    state.owner = true;
+    state.family = family;
+    state.connectionError = undefined;
+    state.editMode = ready.editMode;
+    remoteFamilyBroker.register(family);
+    ctx?.ui?.setStatus?.("remote-runtime", `ssh ${request.displayTarget}:${ready.cwd}`);
+    ctx?.ui?.notify?.(
+      `Remote runtime connected: ${request.displayTarget}:${ready.cwd}\n${describeRemoteWorkerCacheAudit(prepared.cacheAudit)}`,
+      prepared.cacheAudit.available ? "info" : "warning",
+    );
+    return { request, ready, remoteCwd: resolvedRemoteCwd, cacheAudit: prepared.cacheAudit };
+  } catch (error) {
+    next?.kill();
+    throw error;
+  } finally {
+    await prepared?.dispose();
+    state.deployment = undefined;
+  }
+}
+
 export default async function remoteRuntimeExtension(
   pi: ExtensionAPI,
 ): Promise<void> {
@@ -1185,12 +1290,6 @@ export default async function remoteRuntimeExtension(
     loadMode: "essential",
     approval: "exec",
     async execute(_id, params: unknown, _signal, _onUpdate, ctx) {
-      if (state.deployment) throw new Error("Remote connection is already in progress");
-      if (state.selected) {
-        throw new Error(
-          "A remote runtime is already selected; call remote_exit first",
-        );
-      }
       const p = asRecord(params);
       const target = typeof p.target === "string" ? p.target : "";
       if (!target) {
@@ -1198,93 +1297,27 @@ export default async function remoteRuntimeExtension(
           "Missing required 'target' parameter (SSH alias or user@host)",
         );
       }
-      const sessionFile = ctx?.sessionManager?.getSessionFile?.();
-      if (!sessionFile) {
-        throw new Error(
-          "Remote runtime requires a persisted OMP session so subagents can inherit safely",
-        );
-      }
-      const normalizedSessionFile = resolvePath(sessionFile);
-      if (remoteFamilyBroker.hasOwner(normalizedSessionFile)) {
-        throw new Error("This session already owns a remote runtime family");
-      }
-      const localCwd = ctx?.cwd ?? process.cwd();
-      const configuredHosts = await loadConfiguredSshHosts(localCwd);
-
-      const request = parseConnectOptions({
-        target, cwd: p.cwd, identity: p.identity, port: p.port,
-      }, configuredHosts);
-      let next: RemoteRuntimeClient | undefined;
-      let prepared: PreparedRemoteWorker | undefined;
-      state.deployment = new AbortController();
-      try {
-        const signal = _signal ? AbortSignal.any([_signal, state.deployment.signal]) : state.deployment.signal;
-        prepared = await prepareRemoteWorker({ ...request, signal, onProgress: (stage) => _onUpdate?.({ content: [{ type: "text", text: stage }] }) });
-        const remoteCwd: string =
-          request.cwd ?? prepared.home ?? (await resolveRemoteHome(request));
-        const options: RemoteConnectOptions = { ...request, cwd: remoteCwd };
-        const connection = {
-          ...options,
-          workerPath: prepared.workerPath,
-          pythonLspPack: prepared.pythonLspPack,
-          typescriptLspPack: prepared.typescriptLspPack,
-          cppLspPack: prepared.cppLspPack,
-        };
-        const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, prepared.signal);
-        next = opened.client;
-        state.deployment.signal.throwIfAborted();
-        _signal?.throwIfAborted();
-        await prepared.commitUsage();
-        const ready = opened.ready;
-        const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
-        const family: RemoteFamily = {
-          ownerSessionFile: normalizedSessionFile,
-          root: sessionFamilyRoot(normalizedSessionFile),
-          localCwd,
-          remoteCwd: resolvedRemoteCwd,
-          connection: { ...connection, cwd: resolvedRemoteCwd },
-          cacheAudit: prepared.cacheAudit,
-          members: new Set([state]),
-          closing: false,
-        };
-        state.client = next;
-        state.binding = opened.binding;
-        state.remoteCwd = resolvedRemoteCwd;
-        state.localCwd = localCwd;
-        state.sessionFile = normalizedSessionFile;
-        state.selected = true;
-        state.owner = true;
-        state.family = family;
-        state.connectionError = undefined;
-        state.editMode = ready.editMode;
-        remoteFamilyBroker.register(family);
-        ctx?.ui?.setStatus?.(
-          "remote-runtime",
-          `ssh ${request.displayTarget}:${ready.cwd}`,
-        );
-        ctx?.ui?.notify?.(
-          `Remote runtime connected: ${request.displayTarget}:${ready.cwd}\n${describeRemoteWorkerCacheAudit(prepared.cacheAudit)}`,
-          prepared.cacheAudit.available ? "info" : "warning",
-        );
-        const details = {
-          success: true,
-          mode: "remote",
-          target: request.displayTarget,
-          remoteCwd: resolvedRemoteCwd,
-          wrappedTools: [...state.wrappedTools],
-          cacheAudit: prepared.cacheAudit,
-        };
-        return {
-          content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
-          details,
-        };
-      } catch (error) {
-        next?.kill();
-        throw error;
-      } finally {
-        await prepared?.dispose();
-        state.deployment = undefined;
-      }
+      const outcome = await connectOwner(pi, state, ctx, {
+        sessionFile: ctx?.sessionManager?.getSessionFile?.(),
+        localCwd: ctx?.cwd ?? process.cwd(),
+        parseRequest: hosts => parseConnectOptions({ target, cwd: p.cwd, identity: p.identity, port: p.port }, hosts),
+        signal: _signal,
+        onProgress: stage => _onUpdate?.({ content: [{ type: "text", text: stage }] }),
+        inProgressHint: "",
+        alreadySelectedHint: "call remote_exit first",
+      });
+      const details = {
+        success: true,
+        mode: "remote",
+        target: outcome.request.displayTarget,
+        remoteCwd: outcome.remoteCwd,
+        wrappedTools: [...state.wrappedTools],
+        cacheAudit: outcome.cacheAudit,
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
+        details,
+      };
     },
   });
 
@@ -1391,79 +1424,17 @@ export default async function remoteRuntimeExtension(
   pi.registerCommand("remote-connect", {
     description: "Connect native workspace tools to a remote OMP runtime",
     async handler(args, ctx) {
-      if (state.deployment) throw new Error("Remote connection is already in progress; /remote-exit cancels deployment");
-      if (state.selected)
-        throw new Error(
-          "A remote runtime is already selected; run /remote-exit first",
-        );
-      const sessionFile = ctx.sessionManager.getSessionFile();
-      if (!sessionFile)
-        throw new Error(
-          "Remote runtime requires a persisted OMP session so subagents can inherit safely",
-        );
-      const normalizedSessionFile = resolvePath(sessionFile);
-      if (remoteFamilyBroker.hasOwner(normalizedSessionFile))
-        throw new Error("This session already owns a remote runtime family");
-      const configuredHosts = await loadConfiguredSshHosts(ctx.cwd);
-
-      const request = parseConnectArgs(args, configuredHosts);
       ctx.ui.setWorkingMessage("Deploying remote OMP runtime");
-      let next: RemoteRuntimeClient | undefined;
-      let prepared: PreparedRemoteWorker | undefined;
-      state.deployment = new AbortController();
       try {
-        prepared = await prepareRemoteWorker({ ...request, signal: state.deployment.signal, onProgress: (stage) => ctx.ui.setWorkingMessage(stage) });
-        const remoteCwd: string =
-          request.cwd ?? prepared.home ?? (await resolveRemoteHome(request));
-        const options: RemoteConnectOptions = { ...request, cwd: remoteCwd };
-        const connection = {
-          ...options,
-          workerPath: prepared.workerPath,
-          pythonLspPack: prepared.pythonLspPack,
-          typescriptLspPack: prepared.typescriptLspPack,
-          cppLspPack: prepared.cppLspPack,
-        };
-        const opened = await openRemoteTransport(pi, connection, options.cwd, state, ctx, prepared.signal);
-        next = opened.client;
-        state.deployment.signal.throwIfAborted();
-        await prepared.commitUsage();
-        const ready = opened.ready;
-        const resolvedRemoteCwd: string = ready.cwd ?? options.cwd;
-        const family: RemoteFamily = {
-          ownerSessionFile: normalizedSessionFile,
-          root: sessionFamilyRoot(normalizedSessionFile),
+        await connectOwner(pi, state, ctx, {
+          sessionFile: ctx.sessionManager.getSessionFile(),
           localCwd: ctx.cwd,
-          remoteCwd: resolvedRemoteCwd,
-          connection: { ...connection, cwd: resolvedRemoteCwd },
-          cacheAudit: prepared.cacheAudit,
-          members: new Set([state]),
-          closing: false,
-        };
-        state.client = next;
-        state.binding = opened.binding;
-        state.remoteCwd = resolvedRemoteCwd;
-        state.localCwd = ctx.cwd;
-        state.sessionFile = normalizedSessionFile;
-        state.selected = true;
-        state.owner = true;
-        state.family = family;
-        state.connectionError = undefined;
-        state.editMode = ready.editMode;
-        remoteFamilyBroker.register(family);
-        ctx.ui.setStatus(
-          "remote-runtime",
-          `ssh ${request.displayTarget}:${ready.cwd}`,
-        );
-        ctx.ui.notify(
-          `Remote runtime connected: ${request.displayTarget}:${ready.cwd}\n${describeRemoteWorkerCacheAudit(prepared.cacheAudit)}`,
-          prepared.cacheAudit.available ? "info" : "warning",
-        );
-      } catch (error) {
-        next?.kill();
-        throw error;
+          parseRequest: hosts => parseConnectArgs(args, hosts),
+          onProgress: stage => ctx.ui.setWorkingMessage(stage),
+          inProgressHint: "; /remote-exit cancels deployment",
+          alreadySelectedHint: "run /remote-exit first",
+        });
       } finally {
-        await prepared?.dispose();
-        state.deployment = undefined;
         ctx.ui.setWorkingMessage();
       }
     },

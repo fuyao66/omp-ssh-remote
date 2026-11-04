@@ -148,6 +148,9 @@ export type NativeWorkerRuntimeOptions = {
   onLspOperation?: (operation: LspOperation, phase: "begin" | "end") => void;
   /** Execution-domain settings forwarded by the local host; structural pins win. */
   settings?: RemoteExecutionSettings;
+  /** Effective host reply capability, not a synthetic remote UI. */
+  outReplies?: boolean;
+  taskDepth?: number;
   /** Negotiated effective edit mode; shared by read's anchors and edit's parser. */
   editMode?: OmpEditMode;
   /** Service capability negotiated from the real host bash schema. */
@@ -183,6 +186,7 @@ export async function createNativeWorkerRuntime(
     ...(options.settings ?? {}),
     ...WORKER_OVERRIDES,
     "launch.enabled": options.bashServices ?? true,
+    "out.enabled": options.outReplies ?? false,
     ...(options.editMode === undefined ? {} : { "edit.mode": options.editMode }),
   });
   const mutationVersions = new Map<string, number>();
@@ -215,6 +219,7 @@ export async function createNativeWorkerRuntime(
     hasEditTool: true,
     restrictToolNames: true,
     settings,
+    taskDepth: options.taskDepth ?? 0,
     conflictHistory,
     getSessionFile: () => null,
     getSessionSpawns: () => "",
@@ -401,6 +406,7 @@ export async function createNativeWorkerRuntime(
       const jobSettings = Settings.isolated({
         ...(options.settings ?? {}), ...WORKER_OVERRIDES, "edit.mode": editMode, "async.enabled": true,
         "launch.enabled": options.bashServices ?? true,
+        "out.enabled": options.outReplies ?? false,
       });
       // Native managed bash isolates shells by the capture job's UUID, not owner identity.
       return publishTool(createCapturedBashTool({ ...session, settings: jobSettings }, onCapture, foreground));

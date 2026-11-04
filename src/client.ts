@@ -132,7 +132,7 @@ export class RemoteRuntimeClient {
     cwd: string,
     handshake: RemoteRuntimeHandshake,
     timeoutMs = 15_000,
-    options: { sessionId?: string; settings?: RemoteExecutionSettings; signal?: AbortSignal; resourceBinding?: string } = {},
+    options: { sessionId?: string; settings?: RemoteExecutionSettings; outReplies?: boolean; taskDepth?: number; signal?: AbortSignal; resourceBinding?: string } = {},
   ): Promise<ReadyMessage> {
     const abort = () => {
       const error = options.signal?.reason instanceof Error
@@ -159,6 +159,8 @@ export class RemoteRuntimeClient {
         tools: [...handshake.requestedTools],
         ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
         ...(options.resourceBinding !== undefined ? { resourceBinding: options.resourceBinding } : {}),
+        ...(options.outReplies !== undefined ? { outReplies: options.outReplies } : {}),
+        ...(options.taskDepth !== undefined ? { taskDepth: options.taskDepth } : {}),
         ...(options.settings && Object.keys(options.settings).length > 0
           ? { settings: options.settings }
           : {}),

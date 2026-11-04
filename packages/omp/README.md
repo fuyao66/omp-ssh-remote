@@ -18,9 +18,9 @@ Background execution is split by ownership rather than by tool name:
 - Named `bash` calls launch remote services. Service `proc://<name>` reads and writes (including `/kill` and `/mode`) execute remotely. Native process-root forms `proc://` and `proc:///` combine local and remote listings. Local jobs and agents take precedence over service names; conflicting names are rejected at launch. A local coordination job makes remote service exits visible to native `wait`; transport loss fails that job without moving execution locally.
 - On `/remote-exit`, session shutdown, or transport loss the companion stops the supervised processes this session started unless they were launched with `persist` or `detached`; those survive by explicit request, like native OMP.
 
-Ordinary non-isolated subagents inherit connection configuration but receive independent companions. Admission compares the remote execution contract and native tool schemas. `task isolated:true` remains rejected. Native host approval rules are preserved; wrappers are installed at session initialization, before the first model request, not when connecting.
+Ordinary non-isolated subagents inherit connection configuration but receive independent companions. Admission compares the remote execution contract and native tool schemas. `task isolated:true` remains rejected. Absolute `taskFile` paths are rejected at both top-level and batch entrypoints; use `local://` for host task files, because `task` does not read remote files. Native host approval rules are preserved; wrappers are installed at session initialization, before the first model request, not when connecting.
 
-Eval workspace callbacks use the same host invocation path as top-level tools: the companion requests an invocation, local OMP applies its native approval and tool hooks, and the registered remote wrapper dispatches execution back to the companion. Service startup and explicit stops therefore use the same local coordination jobs from either entrypoint. Each callback belongs to one active Eval request and workspace binding; cancellation or connection replacement invalidates it. Nested callbacks cannot select local resources, recursively invoke Eval, or stage AST edits. The companion does not run a second approval engine.
+Eval workspace callbacks use the same host invocation path as top-level tools: the companion requests an invocation, local OMP applies its native approval and tool hooks, and the registered remote wrapper dispatches execution back to the companion. Service startup and explicit stops therefore use the same local coordination jobs from either entrypoint. Each callback belongs to one active Eval request and workspace binding; cancellation or connection replacement invalidates it. Except for the `out://` reply device, nested callbacks cannot select local resources, recursively invoke Eval, or stage AST edits. The companion does not run a second approval engine.
 
 Service coordination reserves a local job before remote startup; a full job manager cannot leave an untracked service running. Completion during startup is retained. Cancellation during readiness or after startup waits for cleanup of the launched instance; an incoming steer only ends the readiness wait and does not stop the service. Worker startup chooses one effective owner for both native execution and shutdown cleanup; an omitted session ID receives a unique worker identity.
 
@@ -41,6 +41,8 @@ Widgets use the host's normal `async.widgets` and `widget` model-role behavior. 
 Remote eval follows native 18.12.3: use `print` or JavaScript `console.log`, not the removed `display`. Larger or multiline plain objects produce JSON views; small objects remain text. Native tables, Markdown and image content are forwarded to the local renderer without requiring a remote UI. Libraries such as pandas must already be installed remotely. JSON values, table cells/headers, Markdown, output anchors and echoed code remain literal application data; artifact publication adapts only owned output metadata and exact native-generated footers. Recovery links distinguish full outputs from capped head/tail samples. URI resolution is limited to read/grep resource operands and the established Bash operand shorthand, not write bodies, eval source or search patterns.
 
 `lsp.requestTimeout` is also forwarded in seconds, preserving per-call timeout overrides.
+
+Remote Bash `> out://` and foreground Eval's `tool.write({path:"out://", ...})` / `tool.bash` replies use the native transcript reply channel. Connection setup captures the host's effective reply gate, including explicit `out.enabled` and the actual native session's TUI capability; subagents remain refused. Reply text is carried in native `details.replies`, never written to the remote filesystem. Other host resources such as `local://` and `skill://` are not bridged into remote execution. Extension/MCP tools not supplied by the remote runtime continue to execute on the local host; they are not blanket-blocked.
 
 While connected, direct user shell (`!`/`!!`) and Python shortcuts are explicitly refused rather than silently executed locally. Use remote `bash`/`eval`, or disconnect before using local shortcuts. `find`, `security_scan`, and `ida` are not remote-adapted and remain blocked, including xdev entrypoints. Native `checkpoint` and `rewind` stay local and are allowed: they change conversation history, not remote project files or kernel state. Remote eval supports computation and remote workspace callbacks only: local agent/workpool, judge/completion, archive, browser, and todo helpers are not bridged. The fixed workspace contract explains this distinction; use top-level local orchestration tools instead.
 
@@ -105,7 +107,9 @@ Connection UI reports probe/check/upload/activation stages. Both `remote_connect
 
 Use a standard `~/.ssh/config` alias or an OMP `/ssh add` entry:
 
-Configured aliases remain the SSH/SCP destination names for `Host` matching; the resolved hostname, user, port and identity still select the actual destination. Alias-only `ProxyCommand`, `ProxyJump` and other OpenSSH settings therefore apply to probes, upload and worker connections without adding duplicate IP-address `Host` entries.
+For `~/.ssh/config`, the plugin discovers concrete names from `Host` lines only, including multiple names per line; wildcard and negated patterns are not listed. It passes the alias directly to OpenSSH without copying `HostName`, `User`, `Port`, or `IdentityFile` into command-line overrides. OpenSSH resolves `Include`, `Match`, `ProxyCommand`, `ProxyJump`, and all other connection settings. Aliases declared only in included files can also be entered directly.
+
+OMP `ssh.json` entries are explicit plugin overrides: their hostname, user, port, and identity take precedence while the original alias remains the destination for native `Host` matching. Explicit `--port` and `--identity` flags override saved values.
 
 ```text
 /remote-connect gpu-box /srv/project
@@ -119,6 +123,8 @@ Explicit form:
 ```text
 /remote-connect user@example.com /srv/project --port 22 --identity ~/.ssh/id_ed25519
 ```
+
+Targets also accept IPv4, bare or bracketed IPv6, and usernames containing `+`, for example `developer+ci@[2001:db8::1]`. Omit the directory to use the remote home. The worker is selected and deployed automatically; `--worker` is not supported.
 
 The model can invoke the same lifecycle through `remote_connect`, `remote_workspace_status`, `remote_reconnect`, and `remote_exit`. Status is on-demand and reports in-process state; it is not a per-turn prompt and does not actively ping SSH.
 
@@ -245,13 +251,13 @@ Connect, disconnect and reconnect change the execution binding, not the tool ros
 
 Binding changes enter native message history through the next `before_agent_start`, before MC or other context transforms. They do not start an extra model turn, append after `context`, or replay private message anchors. The current native branch, including persisted `custom_message` entries, determines which binding has actually been announced; returning a hook result does not consume an announcement. Fresh local sessions add no environment message, unchanged accepted state is not repeated, and cancelled preparation can retry its announcement. Cold restore, resume and branch navigation correct remote history to the current local environment without automatically connecting SSH. After compaction the next user turn may reannounce the selected remote binding. Calls overlapping a binding change are not retried in the new workspace; stale results and updates are rejected or suppressed.
 
-`scripts/smoke-cache.ts` runs native OMP against a local HTTP endpoint returning synthetic replies. It compares the actual serialized tools, system messages and complete previous request prefix across local/remote/reconnect/local transitions, and executes real workspace commands over SSH. It measures prefix equality, **not provider cache-hit tokens or savings**. Run from the repository root (the bundle is placed beside the workers):
+`scripts/smoke-cache.ts` runs native OMP against a local HTTP endpoint returning synthetic replies. It compares the actual serialized tools, system messages and complete previous request prefix across local/remote/reconnect/local transitions, and executes real workspace commands over SSH. It measures prefix equality, **not provider cache-hit tokens or savings**. Run from the repository root. Smoke bundles live in gitignored `.cache/smoke/`, outside the shipped package; they load the release extension from `packages/omp/dist/` so worker resolution stays unchanged:
 
 ```sh
 bun run build
 bun scripts/build-smoke.ts cache
 REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts cache
-rm packages/omp/dist/cache-smoke.js
+rm .cache/smoke/cache-smoke.js
 ```
 
 For the installed MC compatibility extension, use the separate combined mode. It keeps MC's context transform and dispatch fence enabled, loads MC before remote, and requires exactly one HTTP request for each of the seven state transitions. MC retagging is not treated as a remote prefix-equality failure. Auxiliary MC model consumers are disabled, and configuration, session, database and logs are isolated in a temporary directory:
@@ -260,7 +266,7 @@ For the installed MC compatibility extension, use the separate combined mode. It
 bun scripts/build-smoke.ts cache-mc
 CACHE_SMOKE_MC_COMPAT=/path/to/omp-mc-compat/index.js \
   REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts cache-mc
-rm packages/omp/dist/cache-smoke.js
+rm .cache/smoke/cache-smoke.js
 ```
 
 The default mock uses native Chat Completions. Set `CACHE_SMOKE_API=openai-responses` for the native Responses endpoint and parser; this mode emits numbered assistant messages with opaque reasoning, then verifies replay order, phase, encrypted payload and removal of old numbers. Output IDs remain in persisted native history but may be removed from HTTP input by OMP's native replay sanitization.
@@ -275,10 +281,10 @@ Set `SMOKE_KEEP_ARTIFACTS=1` to retain `mc.log`, `wire-requests.json` and the is
 ```sh
 bun scripts/build-smoke.ts capture
 REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts capture
-rm packages/omp/dist/capture-smoke.js
+rm .cache/smoke/capture-smoke.js
 ```
 
-`scripts/smoke-rich-output.ts` compares actual native-local and SSH results for JSON, tables, Markdown, valid PNG bytes, literal artifact-like strings, write/read/search/query round trips, and view anchors. Build with `bun scripts/build-smoke.ts rich-output`, then run `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts rich-output`. Neither acceptance script needs a provider request or extra Python packages. Remove its generated bundle afterward. `bun scripts/build-smoke.ts` builds all four acceptance helpers beside the workers.
+`scripts/smoke-rich-output.ts` compares actual native-local and SSH results for JSON, tables, Markdown, valid PNG bytes, literal artifact-like strings, write/read/search/query round trips, and view anchors. Build with `bun scripts/build-smoke.ts rich-output`, then run `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts rich-output`. Neither acceptance script needs a provider request or extra Python packages. Remove its generated bundle afterward. `bun scripts/build-smoke.ts` builds all six acceptance helpers in `.cache/smoke/`.
 
 The runner verifies extension command registration through RPC `get_available_commands` and submits the smoke prompt in the same session only after admission. Missing commands fail before a prompt is sent. The deadline includes the native first-upload budget; cache-hit acceptance avoids deployment timing. Successful temporary sessions are removed; failed sessions are retained for diagnosis.
 

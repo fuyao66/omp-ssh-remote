@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto";
 
+export const LANGUAGE_PACK_NODE_PIN = {
+  version: "22.22.0",
+  checksums: "https://nodejs.org/dist/v22.22.0/SHASUMS256.txt",
+  sha256: {
+    arm64: "1bf1eb9ee63ffc4e5d324c0b9b62cf4a289f44332dfef9607cea1a0d9596ba6f",
+    x64: "9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37",
+  },
+} as const;
+
 export type LanguagePackArchitecture = "arm64" | "x64";
 export interface LanguagePackDescriptor {
   format: 1;

@@ -3,13 +3,12 @@
 // Real-project overrides: REMOTE_CPP_PROJECT_FILE, REMOTE_CPP_PROJECT_SYMBOL, REMOTE_CPP_PROJECT_API,
 // REMOTE_CPP_SDK_ROOT. Paths and source locations are discovered remotely; no personal host data belongs here.
 import assert from "node:assert/strict";
-import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { lookup, type AnySetting } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { resolveHostSessionRef } from "../src/omp/host-session.ts";
 import { parseConnectArgs } from "../src/connect-options.ts";
-// @ts-expect-error Generated production extension has no declarations.
-import extension from "../packages/omp/dist/extension.js";
+import { bootstrapSmokeHost } from "./smoke-host.ts";
 
 const text = (result: any): string => result.content?.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n") ?? "";
 const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
@@ -28,12 +27,7 @@ const sources: Record<string, string> = {
 export default async function cppLspSmoke(pi: ExtensionAPI) {
   const args = process.env.REMOTE_CONNECT_ARGS;
   if (!args) throw new Error("REMOTE_CONNECT_ARGS must select an SSH alias with lsp.cpp:true");
-  const commands = new Map<string, { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
-  await extension(new Proxy(pi, { get(target, key) {
-    if (key === "registerCommand") return (name: string, command: any) => { commands.set(name, command); target.registerCommand(name, command); };
-    const value = Reflect.get(target, key);
-    return typeof value === "function" ? value.bind(target) : value;
-  }}));
+  const commands = await bootstrapSmokeHost(pi);
   pi.registerCommand("remote-cpp-lsp-smoke", { description: "Native packaged clangd acceptance (scratch plus optional read-only project)", async handler(_, ctx) {
     const session = resolveHostSessionRef(ctx.sessionManager.getSessionFile(), ctx)?.session;
     assert(session, "Native session not registered");
@@ -66,8 +60,7 @@ export default async function cppLspSmoke(pi: ExtensionAPI) {
       const request = parseConnectArgs(args);
       return [quote(request.displayTarget), quote(cwd), ...(request.port ? ["--port", String(request.port)] : []),
         ...(request.identityFile ? ["--identity", quote(request.identityFile)] : []),
-        ...(request.knownHostsFile ? ["--known-hosts", quote(request.knownHostsFile)] : []),
-        ...(request.workerPath ? ["--worker", quote(request.workerPath)] : [])].join(" ");
+        ...(request.knownHostsFile ? ["--known-hosts", quote(request.knownHostsFile)] : [])].join(" ");
     };
     const connect = async (value: string) => { await commands.get("remote-connect")!.handler(value, ctx); connected = true; };
     const exit = async () => { await commands.get("remote-exit")!.handler("", ctx); connected = false; };

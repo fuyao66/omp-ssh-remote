@@ -1,16 +1,16 @@
 import { dirname, resolve } from "node:path";
+import { SDK_ADAPTATIONS, assertSdkAdaptationVersion, replaceSdkAnchor } from "./omp/sdk-contract.ts";
 
-/** Worker-only, fail-closed adaptation of SDK 18.15.0. No installed SDK files are modified. */
+/** Worker-only, fail-closed adaptation. No installed SDK files are modified. */
 export function adaptNativeLspConfig(source: string, sdkVersion: string, fallbackModule: string): string {
-  if (sdkVersion !== "18.15.0") throw new Error(`Native LSP configuration adapter requires SDK 18.15.0, got ${sdkVersion}`);
-  const replaceOnce = (anchor: string, replacement: string) => {
-    if (source.split(anchor).length !== 2) throw new Error("Native LSP configuration adapter anchor drift");
-    source = source.replace(anchor, replacement);
+  const adaptation = SDK_ADAPTATIONS.lspConfig;
+  assertSdkAdaptationVersion(adaptation, sdkVersion);
+  const replace = (anchorId: keyof typeof adaptation.anchors, replacement: string) => {
+    source = replaceSdkAnchor(adaptation, source, anchorId, replacement);
   };
-  replaceOnce('import * as fs from "node:fs";', `import { applyPythonLspFallback } from ${JSON.stringify(resolve(fallbackModule))};\nimport { applyTypescriptLspFallback } from ${JSON.stringify(resolve(dirname(fallbackModule), "typescript-lsp-fallback.ts"))};\nimport * as fs from "node:fs";`);
-  replaceOnce('import * as fs from "node:fs";', `import { applyCppLspFallback } from ${JSON.stringify(resolve(dirname(fallbackModule), "cpp-lsp-fallback.ts"))};\nimport * as fs from "node:fs";`);
-  replaceOnce("\tlet mergedServers = coerceServerConfigs(DEFAULTS);", "\tlet mergedServers = coerceServerConfigs(DEFAULTS);\n\tconst explicitServerFields = new Map<string, Set<string>>();");
-  replaceOnce("\t\tmergedServers = mergeServers(mergedServers, parsed.servers);", `\t\tfor (const [name, raw] of Object.entries(parsed.servers)) {
+  replace("imports", `import { applyPythonLspFallback } from ${JSON.stringify(resolve(fallbackModule))};\nimport { applyTypescriptLspFallback } from ${JSON.stringify(resolve(dirname(fallbackModule), "typescript-lsp-fallback.ts"))};\nimport { applyCppLspFallback } from ${JSON.stringify(resolve(dirname(fallbackModule), "cpp-lsp-fallback.ts"))};\nimport * as fs from "node:fs";`);
+  replace("explicitFields", "\tlet mergedServers = coerceServerConfigs(DEFAULTS);\n\tconst explicitServerFields = new Map<string, Set<string>>();");
+  replace("merge", `\t\tfor (const [name, raw] of Object.entries(parsed.servers)) {
       if (raw && typeof raw === "object") {
         const keys = explicitServerFields.get(name) ?? new Set<string>();
         for (const key of Object.keys(raw)) keys.add(key);
@@ -18,7 +18,7 @@ export function adaptNativeLspConfig(source: string, sdkVersion: string, fallbac
       }
     }
 \t\tmergedServers = mergeServers(mergedServers, parsed.servers);`);
-  replaceOnce("\tselectTypescriptServer(servers, cwd);", `\tconst privatePythonPack = process.env.OMP_REMOTE_PYTHON_LSP_PACK;
+  replace("fallback", `\tconst privatePythonPack = process.env.OMP_REMOTE_PYTHON_LSP_PACK;
     let privatePythonLauncher: string | undefined;
     if (privatePythonPack) {
       if (!path.isAbsolute(privatePythonPack)) throw new Error("Python LSP pack path must be absolute");

@@ -10,12 +10,16 @@ if (requested !== "all" && !names.some(name => name === requested)) {
 for (const name of names.filter(name => requested === "all" || name === requested)) {
   const result = await Bun.build({
     entrypoints: [resolve(root, `scripts/smoke-${name}.ts`)],
-    outdir: resolve(root, "packages/omp/dist"),
+    outdir: resolve(root, ".cache/smoke"),
     naming: `${name}-smoke.js`,
     target: "bun",
     minify: true,
     external: ["@oh-my-pi/pi-coding-agent", "@oh-my-pi/pi-agent-core", "@oh-my-pi/pi-natives"],
     plugins: [{ name: "native-smoke-modules", setup(build) {
+      // Keep the release extension beside its workers; this path is relative to .cache/smoke.
+      build.onResolve({ filter: /^\.\.\/packages\/omp\/dist\/extension\.js$/ }, () => ({
+        path: "../../packages/omp/dist/extension.js", external: true,
+      }));
       build.onResolve({ filter: /^omp-legacy-pi-modules$/ }, () => ({
         path: "omp-legacy-pi-modules", namespace: "native-smoke-modules",
       }));

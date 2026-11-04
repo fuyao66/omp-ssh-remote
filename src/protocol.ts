@@ -62,6 +62,10 @@ export type InitializeRequest = {
   sessionId?: string;
   /** Forwarded execution-domain settings (see omp/execution-settings.ts). */
   settings?: RemoteExecutionSettings;
+  /** Effective native host reply gate; independent of tool wire schemas. */
+  outReplies?: boolean;
+  /** Host task depth preserves native subagent refusal text. */
+  taskDepth?: number;
   /** Effective host edit language, after model/env overrides. */
   editMode?: OmpEditMode;
   /** Whether the actual host bash schema exposes remote service operations. */
@@ -188,6 +192,10 @@ export function parseRequest(raw: unknown): Request {
       throw new Error("Protocol field sessionId must be a non-empty string");
     if (bashServices !== undefined && typeof bashServices !== "boolean")
       throw new Error("Protocol field bashServices must be a boolean");
+    if (value.outReplies !== undefined && typeof value.outReplies !== "boolean")
+      throw new Error("Protocol field outReplies must be a boolean");
+    if (value.taskDepth !== undefined && (!Number.isSafeInteger(value.taskDepth) || (value.taskDepth as number) < 0))
+      throw new Error("Protocol field taskDepth must be a non-negative safe integer");
     return {
       type,
       protocolVersion: numberField(value, "protocolVersion"),
@@ -207,6 +215,8 @@ export function parseRequest(raw: unknown): Request {
       ...(bashServices === undefined ? {} : { bashServices }),
       ...(value.resourceBinding === undefined ? {} : { resourceBinding: parseResourceBinding(value.resourceBinding) }),
       ...(value.sessionId === undefined ? {} : { sessionId: value.sessionId as string }),
+      ...(value.outReplies === undefined ? {} : { outReplies: value.outReplies as boolean }),
+      ...(value.taskDepth === undefined ? {} : { taskDepth: value.taskDepth as number }),
       ...(value.settings === undefined
         ? {}
         : { settings: parseExecutionSettings(value.settings) }),

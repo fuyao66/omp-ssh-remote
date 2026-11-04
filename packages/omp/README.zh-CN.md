@@ -18,9 +18,9 @@ OMP SSH Remote 将 Oh My Pi 控制面保留在本机，同时通过 SSH 在远�
 - 带 `name` 的 `bash` 启动远端服务。服务 `proc://<name>` 的读写（包括 `/kill`、`/mode`）路由远端；原生进程根路径 `proc://` 和 `proc:///` 都合并两端列表。本机 job/agent 名称优先，启动时拒绝冲突名称。远端服务通过本机协调 job 接入原生 `wait`；断连令 job 失败，不回落到本机执行。
 - `/remote-exit`、session 关闭或传输丢失时，companion 会停止本 session 启动的受监管进程；以 `persist` 或 `detached` 启动的进程按显式要求存活，与原生 OMP 一致。
 
-普通非隔离子代理继承连接配置，但各自使用独立 companion。准入比较远端执行契约和原生工具 schema。`task isolated:true` 继续明确拒绝。保留宿主原生审批规则；wrapper 在 session 初始化、首个模型请求前安装，不在连接时临时注册。
+普通非隔离子代理继承连接配置，但各自使用独立 companion。准入比较远端执行契约和原生工具 schema。`task isolated:true` 继续明确拒绝。顶层及批量条目的绝对 `taskFile` 路径均拒绝；本机任务文件请用 `local://`，因为 `task` 不读取远端文件。保留宿主原生审批规则；wrapper 在 session 初始化、首个模型请求前安装，不在连接时临时注册。
 
-Eval 的远端工具回调与顶层工具共用宿主调用路径：companion 发起调用请求，本机 OMP 执行原生审批及工具 hook，再由已注册的 remote wrapper 派发回远端。两个入口共用服务启动、显式停止和本机协调任务。每个回调只属于当前有效的 Eval 请求及工作区绑定，取消或更换连接后失效。嵌套调用不能访问本机资源、递归调用 Eval 或暂存 AST 编辑；companion 不另建审批引擎。
+Eval 的远端工具回调与顶层工具共用宿主调用路径：companion 发起调用请求，本机 OMP 执行原生审批及工具 hook，再由已注册的 remote wrapper 派发回远端。两个入口共用服务启动、显式停止和本机协调任务。每个回调只属于当前有效的 Eval 请求及工作区绑定，取消或更换连接后失效。除 `out://` 回复设备外，嵌套调用不能访问本机资源、递归调用 Eval 或暂存 AST 编辑；companion 不另建审批引擎。
 
 服务在远端启动前先预留本机 job；本机容量满时不会先启动一个无人追踪的服务。启动期间的提前完成通知会保留。在等待就绪期间或成功启动后取消，都会等待本次服务实例清理；插话只结束就绪等待，不停止服务。worker 启动时确定唯一有效 owner，原生执行与退出清理共用；省略 session ID 时生成该 worker 独有的身份。
 
@@ -41,6 +41,8 @@ OMP 18.12.3 审批保留本机原生文件／目录授权。远端使用哈希�
 远端 eval 跟随原生 18.12.3，使用 `print` 或 JS `console.log`，不再使用已移除的 `display`。较大或多行的普通对象生成 JSON 视图，小对象仍是文本。表格、Markdown 和图像数据交给本机原生 renderer，不需要远端 UI；pandas 等库须已安装在远端。JSON 值、表头／单元格、Markdown、输出锚点和回显代码都是应用数据，原样保留；artifact 发布只适配原生拥有的输出元数据及精确生成的尾注，区分完整输出与有上限的首尾样本。URI 解析只针对 read／grep 的资源路径及已有 Bash 路径简写，不插值 write 正文、eval 源码或搜索模式。
 
 `lsp.requestTimeout` 同样按秒转发，保留每次调用单独设置 timeout 的能力。
+
+远端 Bash 的 `> out://`，以及前台 Eval 内的 `tool.write({path:"out://", ...})`／`tool.bash` 回复，使用原生 transcript 回复通道。连接时读取宿主的有效回复权限，包含显式 `out.enabled` 和原生 session 的实际 TUI 能力；子代理仍被拒绝。回复通过原生 `details.replies` 传输，不写入远端文件系统。`local://`、`skill://` 等其他本机资源不桥接到远端执行环境。远端 runtime 未提供的 extension／MCP 工具仍在本机执行，不作一刀切拦截。
 
 连接期间明确拒绝用户直接 shell（`!`/`!!`）和 Python 快捷入口，避免静默执行本机命令；请使用远端 `bash`/`eval`，或退出连接后使用本机快捷入口。未适配的 `find`、`security_scan`、`ida`（包括 xdev 入口）仍明确拒绝。原生 `checkpoint`、`rewind` 留在本机并允许使用：只修改对话历史，不回滚远端项目文件或内核状态。远端 eval 只支持计算和远端工作区工具回调，不桥接本机 agent/workpool、judge/completion、archive、browser、todo；固定工作区说明解释此边界，本机编排请用顶层工具。
 
@@ -103,7 +105,9 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 可以使用标准 `~/.ssh/config` alias 或 OMP `/ssh add` 记录：
 
-已配置的别名会保留为 SSH／SCP 的目标名称以匹配 `Host`，实际主机地址、用户、端口和密钥仍按解析后的连接配置选择。因此仅写在别名下的 `ProxyCommand`、`ProxyJump` 等 OpenSSH 设置会应用到探测、上传和 worker 连接，不必额外添加 IP 地址的 `Host` 条目。
+对于 `~/.ssh/config`，插件只从 `Host` 行发现具体别名，支持一行多个名称，不列出通配符和否定模式。连接时直接把别名交给 OpenSSH，不把 `HostName`、`User`、`Port` 或 `IdentityFile` 复制为命令行覆盖项。`Include`、`Match`、`ProxyCommand`、`ProxyJump` 等设置均由 OpenSSH 解析；只在 Include 文件中声明的别名也可以直接输入。
+
+OMP `ssh.json` 中的主机记录是用户显式声明的插件覆盖配置：主机地址、用户、端口和密钥优先于 OpenSSH 配置，同时保留原别名用于原生 `Host` 匹配。显式 `--port` 和 `--identity` 参数优先于已保存的值。
 
 ```text
 /remote-connect gpu-box /srv/project
@@ -117,6 +121,8 @@ packages/omp/dist/worker-linux-arm64.sha256
 ```text
 /remote-connect user@example.com /srv/project --port 22 --identity ~/.ssh/id_ed25519
 ```
+
+目标也支持 IPv4、带或不带方括号的 IPv6，以及含 `+` 的用户名，例如 `developer+ci@[2001:db8::1]`。省略目录时使用远端 home。worker 自动选择并部署，不支持 `--worker`。
 
 模型也可以通过 `remote_connect`、`remote_workspace_status`、`remote_reconnect` 和 `remote_exit` 执行相同生命周期。状态工具按需调用，报告进程内已知状态；它不会向每一轮注入 prompt，也不会主动 ping SSH。
 
@@ -255,7 +261,7 @@ MC 组合验收另用 `cache-mc`：先加载实际安装的 MC 兼容扩展，�
 
 `scripts/smoke-capture.ts` 验证 `tail` 前的真实字节、原生组件的数值及渲染、自动后台化不重启命令、session／隔离 shell、取消，以及断连后的本机留存数据。只替换模型边界为固定 author，规格校验、数据摄取和渲染均使用原生实现；不会调用供应商。用 `bun scripts/build-smoke.ts capture` 构建，再执行 `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts capture`。runner 自动创建短阈值的临时配置，不修改用户配置。
 
-`scripts/smoke-rich-output.ts` 对照真实本机与 SSH 原生结果，验证 JSON、表格、Markdown、有效 PNG、字面 URI、写读／搜索／查询及输出锚点。用 `bun scripts/build-smoke.ts rich-output` 构建，再执行 `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts rich-output`；不需要模型请求或额外 Python 包。结束后删除生成的 bundle。直接运行 `bun scripts/build-smoke.ts` 可将四个验收 helper 一起构建到 worker 旁。
+`scripts/smoke-rich-output.ts` 对照真实本机与 SSH 原生结果，验证 JSON、表格、Markdown、有效 PNG、字面 URI、写读／搜索／查询及输出锚点。用 `bun scripts/build-smoke.ts rich-output` 构建，再执行 `REMOTE_CONNECT_ARGS='gpu-box /tmp' bun scripts/run-smoke.ts rich-output`；不需要模型请求或额外 Python 包。结束后删除生成的 bundle。直接运行 `bun scripts/build-smoke.ts` 可将六个验收 helper 一起构建到已被 git 忽略的 `.cache/smoke/`，不进入发布包；helper 加载 `packages/omp/dist/` 中的扩展，worker 路径解析保持不变。
 
 runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在同一 session 中提交验收命令；命令缺失时不会发送 prompt。超时预算包含首次上传，缓存命中后可排除部署耗时。成功时删除临时 session，失败时保留供定位。
 

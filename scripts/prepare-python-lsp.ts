@@ -2,7 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { downloadPinned } from "./prepare-language-pack.ts";
 import { PYTHON_LSP_PINS, type PythonLspArchitecture } from "../src/python-lsp-pack.ts";
-import { PYTHON_LSP_ARCHIVE_SCRIPT } from "../src/python-lsp-archive.ts";
+import { LANGUAGE_PACK_ARCHIVE_SCRIPT } from "../src/language-pack-archive.ts";
 
 const arch = process.argv[2] as PythonLspArchitecture;
 if (arch !== "arm64" && arch !== "x64") throw new Error("Usage: bun scripts/prepare-python-lsp.ts arm64|x64");
@@ -21,6 +21,6 @@ const provenance = {
   node: { version: PYTHON_LSP_PINS.node.version, url: nodeUrl, sha256: PYTHON_LSP_PINS.node.sha256[arch], checksums: PYTHON_LSP_PINS.node.checksums },
   pyright: PYTHON_LSP_PINS.pyright,
 };
-const result = Bun.spawnSync(["python3", "-c", PYTHON_LSP_ARCHIVE_SCRIPT, "prepare", node, pyright,
+const result = Bun.spawnSync(["python3", "-c", LANGUAGE_PACK_ARCHIVE_SCRIPT, "prepare", node, pyright,
   resolve(dist, `python-lsp-linux-${arch}`), arch, JSON.stringify(provenance)], { stdout: "inherit", stderr: "inherit" });
 if (result.exitCode !== 0) throw new Error("Python LSP pack preparation failed");

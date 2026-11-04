@@ -1,17 +1,11 @@
 // Native-local versus SSH output comparison, without model calls or extra packages.
 import assert from "node:assert/strict";
-import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-// @ts-expect-error Generated release bundle has no declaration file.
-import extension from "../packages/omp/dist/extension.js";
+import { bootstrapSmokeHost } from "./smoke-host.ts";
 
 export default async function(pi: ExtensionAPI) {
-  const commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<unknown> }>();
-  const proxy = new Proxy(pi, { get(target, key) {
-    if (key === "registerCommand") return (name: string, command: any) => { commands.set(name, command); return target.registerCommand(name, command); };
-    const value = Reflect.get(target, key); return typeof value === "function" ? value.bind(target) : value;
-  } });
-  await extension(proxy);
+  const commands = await bootstrapSmokeHost(pi);
   pi.registerCommand("remote-rich-output-smoke", { description: "Compare native print views and literal data across SSH", async handler(_, ctx) {
     const connectArgs = Bun.env.REMOTE_CONNECT_ARGS;
     assert(typeof connectArgs === "string" && connectArgs.trim().length > 0, "Set REMOTE_CONNECT_ARGS to an SSH target and remote scratch directory");

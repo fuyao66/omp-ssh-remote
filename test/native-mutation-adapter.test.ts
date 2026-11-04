@@ -2,13 +2,37 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { adaptNativeMutationSettlement } from "../src/omp/native-mutation-adapter.ts";
+import { SDK_SOURCE_ADAPTATIONS, SUPPORTED_SDK_VERSION, assertSdkBuildAdaptations } from "../src/omp/sdk-contract.ts";
 import { lspFixtureSource } from "../scripts/fixtures/lsp-server.ts";
 
 const root = resolve(import.meta.dir, "..");
 
-test("mutation adapters reject SDK and exact-source drift", () => {
-  expect(() => adaptNativeMutationSettlement("", "18.14.0", "write", "fence.ts")).toThrow("requires SDK");
-  expect(() => adaptNativeMutationSettlement("", "18.15.0", "write", "fence.ts")).toThrow("anchor drift");
+test("mutation adapters reject unsupported SDKs and every missing or duplicate registered anchor", async () => {
+  for (const adaptation of SDK_SOURCE_ADAPTATIONS) {
+    if (adaptation.kind !== "mutation") continue;
+    const source = await readFile(Bun.resolveSync(adaptation.sdkModule, root), "utf8");
+    const apply = (input: string, version: string = SUPPORTED_SDK_VERSION) =>
+      adaptNativeMutationSettlement(input, version, adaptation.module, "fence.ts");
+    const errorContext = `${adaptation.id} (${adaptation.sdkModule}; upstream ${adaptation.upstreamPath})`;
+    expect(apply(source)).not.toBe(source);
+    expect(() => apply(source, "unsupported-sdk")).toThrow(`${errorContext} requires SDK ${SUPPORTED_SDK_VERSION}`);
+    for (const [anchorId, anchor] of Object.entries(adaptation.anchors)) {
+      expect(() => apply(source.replace(anchor.text, ""))).toThrow(`${errorContext} anchor drift at ${anchorId}: expected ${anchor.expectedCount}, got 0`);
+      expect(() => apply(`${source}\n${anchor.text}`)).toThrow(`${errorContext} anchor drift at ${anchorId}: expected ${anchor.expectedCount}, got 2`);
+    }
+  }
+});
+
+test("worker coverage requires every registered SDK adaptation exactly once", () => {
+  const counts = new Map<string, number>(SDK_SOURCE_ADAPTATIONS.map(adaptation => [adaptation.id, adaptation.expectedBuildCount]));
+  expect(() => assertSdkBuildAdaptations(counts)).not.toThrow();
+  for (const adaptation of SDK_SOURCE_ADAPTATIONS) {
+    for (const count of [0, 2]) {
+      const invalid = new Map(counts);
+      invalid.set(adaptation.id, count);
+      expect(() => assertSdkBuildAdaptations(invalid)).toThrow(`${adaptation.id} (${adaptation.sdkModule}; upstream ${adaptation.upstreamPath}) build coverage`);
+    }
+  }
 });
 
 test("actual adapted native WriteTool waits for an aborted filesystem primitive before operation end", async () => {
@@ -28,7 +52,7 @@ test("actual adapted native WriteTool waits for an aborted filesystem primitive 
         build.onLoad({ filter: /[/\\](?:tools[/\\](?:write|ast-edit)|lsp[/\\]writethrough)\.ts$/ }, async args => {
           if (!args.path.includes("@oh-my-pi/pi-coding-agent/")) return;
           const module = args.path.endsWith("writethrough.ts") ? "writethrough" : args.path.endsWith("ast-edit.ts") ? "ast-edit" : "write";
-          return { loader: "ts", contents: adaptNativeMutationSettlement(await readFile(args.path, "utf8"), "18.15.0", module,
+          return { loader: "ts", contents: adaptNativeMutationSettlement(await readFile(args.path, "utf8"), SUPPORTED_SDK_VERSION, module,
             join(root, "src/omp/mutation-settlement.ts")) };
         });
       } }],
@@ -38,7 +62,7 @@ test("actual adapted native WriteTool waits for an aborted filesystem primitive 
     // A static import would instead load the unadapted SDK and cannot test this boundary.
     const { createNativeWorkerRuntime, createLspWritethrough, shutdownAll } = await import(outfile);
     const operations: string[] = [];
-    const runtime = await createNativeWorkerRuntime(cwd, "18.15.0", {
+    const runtime = await createNativeWorkerRuntime(cwd, SUPPORTED_SDK_VERSION, {
       settings: { "lsp.diagnosticsOnWrite": false, "lsp.formatOnWrite": false },
       onLspOperation: (_event: unknown, phase: string) => operations.push(phase),
     });
@@ -68,7 +92,7 @@ test("actual adapted native WriteTool waits for an aborted filesystem primitive 
     await writeFile(join(cwd, "lsp.json"), JSON.stringify({ servers: { fixture: {
       command: "python3", args: [fixture, log], fileTypes: [".smoke"], rootMarkers: ["lsp.json"],
     } } }));
-    const queryRuntime = await createNativeWorkerRuntime(cwd, "18.15.0");
+    const queryRuntime = await createNativeWorkerRuntime(cwd, SUPPORTED_SDK_VERSION);
     try {
       const late = Promise.withResolvers<unknown>();
       const controller = new AbortController();

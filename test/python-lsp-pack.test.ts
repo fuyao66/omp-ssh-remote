@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pythonLspCacheCommand, deployPythonLspPack } from "../src/python-lsp-deploy.ts";
+import { languagePackCacheCommand, deployLanguagePack } from "../src/language-pack-deploy.ts";
 import { sha256, type PythonLspPackDescriptor } from "../src/python-lsp-pack.ts";
 import { buildSshWorkerCommand } from "../src/ssh.ts";
 import { parseConnectArgs, parseConnectOptions, loadConfiguredSshHosts } from "../src/connect-options.ts";
@@ -25,7 +25,7 @@ async function fixture(kind = "valid"): Promise<PackFixture> {
   return {dir,descriptor,archive,root:join(dir,"cache with spaces")};
 }
 async function activate(f: PackFixture, archive = f.archive) {
-  const command = pythonLspCacheCommand(f.root,f.descriptor,archive);
+  const command = languagePackCacheCommand("python", f.root,f.descriptor,archive);
   const proc=Bun.spawn(["sh","-c",command],{stdout:"pipe",stderr:"pipe"});
   const stdout=await new Response(proc.stdout).text(); const stderr=await new Response(proc.stderr).text();
   return {code:await proc.exited,stdout:stdout.trim(),stderr};
@@ -75,7 +75,7 @@ describe("private Python pack cache", () => {
     const f=await fixture(); const prefix=join(f.dir,'python-lsp-linux-arm64');
     await writeFile(prefix+'.json',JSON.stringify(f.descriptor));await writeFile(prefix+'.tar.gz',await readFile(f.archive));
     const commands:string[][]=[];
-    const path=await deployPythonLspPack({target:'example.com'},'/home/test user','arm64',f.dir,async command=>{
+    const path=await deployLanguagePack("python", {target:'example.com'},'/home/test user','arm64',f.dir,async command=>{
       commands.push(command);return `/home/test user/.cache/omp-ssh-remote/language-packs/python/linux-arm64/${f.descriptor.id}`;
     });
     expect(path).toContain('/home/test user/');expect(commands).toHaveLength(1);expect(commands[0]![0]).toBe('ssh');
@@ -86,13 +86,13 @@ describe("private Python pack cache", () => {
     await writeFile(prefix+'.json',JSON.stringify(f.descriptor));
     await writeFile(prefix+'.tar.gz','corrupt archive');
     const commands:string[][]=[];
-    await expect(deployPythonLspPack({target:'example.com'},'/home/test','arm64',f.dir,async command=>{
+    await expect(deployLanguagePack("python", {target:'example.com'},'/home/test','arm64',f.dir,async command=>{
       commands.push(command);return '';
     })).rejects.toThrow('Local Python LSP pack archive checksum mismatch');
     expect(commands).toHaveLength(0);
   });
   test("missing pack gives actionable opt-in error",async()=>{
-    await expect(deployPythonLspPack({target:'example.com'},'/home/test','arm64',work,async()=>'' )).rejects.toThrow('prepare-python-lsp.ts arm64');
+    await expect(deployLanguagePack("python", {target:'example.com'},'/home/test','arm64',work,async()=>'')).rejects.toThrow('prepare-python-lsp.ts arm64');
   });
 });
 

@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import { join } from "node:path";
+import { validateSshTarget } from "./ssh.ts";
 
 function getSSHConfigPath(scope: "project" | "user", cwd = process.cwd()): string {
   const home = process.env.HOME || "/root";
@@ -16,7 +17,6 @@ export type RemoteConnectRequest = {
   port?: number;
   identityFile?: string;
   knownHostsFile?: string;
-  workerPath?: string;
   pythonLsp?: boolean;
   typescriptLsp?: boolean;
   cppLsp?: boolean;
@@ -28,12 +28,12 @@ export type RemoteConnectInput = {
   identity?: unknown;
   port?: unknown;
   knownHosts?: unknown;
-  worker?: unknown;
 };
 
 export type ConfiguredSshHost = {
   name: string;
-  host: string;
+  // Absent for names discovered in ~/.ssh/config: OpenSSH owns their resolution.
+  host?: string;
   username?: string;
   port?: number;
   keyPath?: string;
@@ -50,7 +50,7 @@ type RawSshHost = {
 };
 
 const USAGE =
-  "Usage: /remote-connect <ssh-name|user@host> [remote-cwd] [--port N] [--identity path] [--known-hosts path] [--worker path]";
+  "Usage: /remote-connect <ssh-name|user@host> [remote-cwd] [--port N] [--identity path] [--known-hosts path]";
 
 function tokenize(args: string): string[] {
   return (
@@ -149,39 +149,23 @@ async function readHostFile(path: string): Promise<ConfiguredSshHost[]> {
     normalizeHost(name, value, path),
   );
 }
+export function discoverSshConfigAliases(text: string): ConfiguredSshHost[] {
+  const names = new Set<string>();
+  for (const line of text.split("\n")) {
+    const patterns = line.match(/^\s*Host(?:\s+|=)\s*(.*)$/i)?.[1];
+    if (patterns === undefined) continue;
+    for (const pattern of tokenize(patterns)) {
+      if (pattern.startsWith("#")) break;
+      // Discover concrete names only; never interpret connection directives.
+      if (/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(pattern)) names.add(pattern);
+    }
+  }
+  return [...names].map(name => ({ name }));
+}
+
 async function readSshConfigFile(configPath: string): Promise<ConfiguredSshHost[]> {
   try {
-    const text = await readFile(configPath, "utf8");
-    const hosts: ConfiguredSshHost[] = [];
-    let currentHost: Partial<ConfiguredSshHost> | null = null;
-
-    for (const rawLine of text.split("\n")) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith("#")) continue;
-      const parts = line.split(/\s+/);
-      const key = parts[0]?.toLowerCase();
-      const val = parts.slice(1).join(" ");
-
-      if (key === "host") {
-        if (currentHost?.name && currentHost.host) {
-          hosts.push(currentHost as ConfiguredSshHost);
-        }
-        if (val && !val.includes("*") && !val.includes("?")) {
-          currentHost = { name: val, host: val };
-        } else {
-          currentHost = null;
-        }
-      } else if (currentHost) {
-        if (key === "hostname") currentHost.host = val;
-        else if (key === "user") currentHost.username = val;
-        else if (key === "port") currentHost.port = parsePort(val);
-        else if (key === "identityfile") currentHost.keyPath = val.replace(/^~/, process.env.HOME || "");
-      }
-    }
-    if (currentHost?.name && currentHost.host) {
-      hosts.push(currentHost as ConfiguredSshHost);
-    }
-    return hosts;
+    return discoverSshConfigAliases(await readFile(configPath, "utf8"));
   } catch (error) {
     if (!(error instanceof Error && "code" in error && error.code === "ENOENT"))
       throw error;
@@ -213,31 +197,6 @@ export async function loadConfiguredSshHosts(
   return mergeConfiguredSshHosts(projectHosts, userHosts, sshConfigHosts);
 }
 
-function validateTarget(value: unknown): string {
-  if (
-    typeof value !== "string" ||
-    value.length === 0 ||
-    /[\s\x00-\x1f\x7f]/.test(value) ||
-    value.startsWith("-")
-  ) {
-    throw new Error(`Invalid SSH target: ${String(value)}`);
-  }
-  const parts = value.split("@");
-  const host = parts.at(-1)!;
-  const username = parts.length === 2 ? parts[0] : undefined;
-  const address = host.startsWith("[") && host.endsWith("]")
-    ? host.slice(1, -1)
-    : host;
-  if (
-    parts.length > 2 ||
-    (username !== undefined && !/^[A-Za-z0-9_.+-]+$/.test(username)) ||
-    (!isIP(address) && !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(host))
-  ) {
-    throw new Error(`Invalid SSH target: ${value}`);
-  }
-  return value;
-}
-
 function inputString(value: unknown, name: string): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string") {
@@ -250,19 +209,18 @@ export function parseConnectOptions(
   options: RemoteConnectInput,
   configuredHosts: readonly ConfiguredSshHost[] = [],
 ): RemoteConnectRequest {
-  const requestedTarget = validateTarget(options.target);
+  const requestedTarget = validateSshTarget(options.target);
   const cwd = inputString(options.cwd, "remote cwd");
   const identityFile = inputString(options.identity, "SSH identity");
   const knownHostsFile = inputString(options.knownHosts, "SSH known-hosts file");
-  const workerPath = inputString(options.worker, "remote worker path");
   const port = parsePort(options.port);
   if (options.port !== undefined && port === undefined) {
     throw new Error(`Invalid SSH port: ${String(options.port)}`);
   }
-  const configured = requestedTarget.includes("@") || isIP(requestedTarget)
+  const configured = requestedTarget.includes("@") || isIP(requestedTarget) || requestedTarget.startsWith("[")
     ? undefined
     : configuredHosts.find((host) => host.name === requestedTarget);
-  const target = validateTarget(configured
+  const target = validateSshTarget(configured?.host !== undefined
     ? `${configured.username ? `${configured.username}@` : ""}${configured.host}`
     : requestedTarget);
   const effectivePort = port ?? configured?.port;
@@ -273,14 +231,13 @@ export function parseConnectOptions(
   return {
     target,
     displayTarget: configured?.name ?? requestedTarget,
-    ...(configured ? { sshAlias: configured.name } : {}),
+    ...(configured?.host !== undefined ? { sshAlias: configured.name } : {}),
     ...(cwd ? { cwd } : {}),
     ...(effectivePort ? { port: effectivePort } : {}),
     ...(identityFile ?? configured?.keyPath
       ? { identityFile: identityFile ?? configured?.keyPath }
       : {}),
     ...(knownHostsFile ? { knownHostsFile } : {}),
-    ...(workerPath ? { workerPath } : {}),
     ...(configured?.lsp?.python ? { pythonLsp: true } : {}),
     ...(configured?.lsp?.typescript ? { typescriptLsp: true } : {}),
     ...(configured?.lsp?.cpp ? { cppLsp: true } : {}),
@@ -296,13 +253,15 @@ export function parseConnectArgs(
   let port: number | undefined;
   let identityFile: string | undefined;
   let knownHostsFile: string | undefined;
-  let workerPath: string | undefined;
 
   while (tokens.length > 0) {
     const token = tokens.shift()!;
     if (!token.startsWith("--")) {
       positionals.push(token);
       continue;
+    }
+    if (!["--port", "--identity", "--known-hosts"].includes(token)) {
+      throw new Error(`Unknown option: ${token}`);
     }
     const value = tokens.shift();
     if (value === undefined || value.startsWith("--")) {
@@ -313,8 +272,6 @@ export function parseConnectArgs(
       if (port === undefined) throw new Error(`Invalid SSH port: ${value}`);
     } else if (token === "--identity") identityFile = value;
     else if (token === "--known-hosts") knownHostsFile = value;
-    else if (token === "--worker") workerPath = value;
-    else throw new Error(`Unknown option: ${token}`);
   }
 
   if (positionals.length < 1 || positionals.length > 2) {
@@ -326,6 +283,5 @@ export function parseConnectArgs(
     port,
     identity: identityFile,
     knownHosts: knownHostsFile,
-    worker: workerPath,
   }, configuredHosts);
 }

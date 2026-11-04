@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { LANGUAGE_PACK_ARCHIVE_SCRIPT } from "./language-pack-archive.ts";
 import { parseLanguagePackDescriptor, type LanguagePackArchitecture, type LanguagePackDescriptor } from "./language-pack.ts";
 import { sha256File } from "./file-hash.ts";
-import { buildScpBaseCommand, buildSshBaseCommand, getSshDestination, quoteRemoteArgument, type SshConnectionOptions } from "./ssh.ts";
+import { buildScpBaseCommand, buildSshBaseCommand, getScpDestination, getSshDestination, quoteRemoteArgument, type SshConnectionOptions } from "./ssh.ts";
 
 export type PackRun = (command: string[], description: string, timeoutMs?: number) => Promise<string>;
 export type LanguagePackProfile = "python" | "typescript" | "cpp";
@@ -29,7 +29,7 @@ export async function deployLanguagePack(profile: LanguagePackProfile, options: 
   if (existing !== "missing") throw new Error(`Unexpected ${label} LSP pack cache response`);
   const upload = `${root}/.${descriptor.id}.upload-${crypto.randomUUID()}`;
   try {
-    await run([...buildScpBaseCommand(options), archive, `${getSshDestination(options)}:${quoteRemoteArgument(upload)}`], `${label} LSP pack upload (explicit opt-in; first deployment only)`, 600_000);
+    await run([...buildScpBaseCommand(options), archive, `${getScpDestination(options)}:${quoteRemoteArgument(upload)}`], `${label} LSP pack upload (explicit opt-in; first deployment only)`, 600_000);
     const result = await run(ssh(languagePackCacheCommand(profile, root, descriptor, upload)), `Verify and atomically publish ${label} LSP pack`, 120_000);
     if (result !== expected) throw new Error(`Unexpected ${label} LSP pack activation response`);
     return result;

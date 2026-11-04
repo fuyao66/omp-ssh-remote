@@ -63,6 +63,16 @@ test("a cancelled hook result is retried until the native manager accepts it", (
   expect(manager.getBranch().filter(entry => entry.type === "custom_message")).toHaveLength(1);
 });
 
+test("remote notice explains local extension/MCP execution once per accepted binding", () => {
+  const manager = SessionManager.inMemory("/project");
+  const sentence = "Tools not provided by the remote runtime (extension/MCP tools) execute on the local host.";
+  const notice = workspaceAnnouncement(remote, manager.getBranch())!;
+  expect(String(notice.content).split(sentence)).toHaveLength(2);
+  accept(manager, remote);
+  expect(workspaceAnnouncement(remote, manager.getBranch())).toBeUndefined();
+  expect(String(workspaceNotice(local).content)).not.toContain(sentence);
+});
+
 test("native branch navigation uses only the active branch, including returning to an accepted notice", () => {
   const manager = SessionManager.inMemory("/project");
   const remoteId = accept(manager, remote);

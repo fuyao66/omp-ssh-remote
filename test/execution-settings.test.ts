@@ -103,6 +103,17 @@ describe("protocol carries settings and tool names", () => {
     expect((message as { settings?: Record<string, unknown> }).settings).not.toHaveProperty("edit.mode");
   });
 
+  test("reply capability and task depth are typed initialize metadata, not execution settings", () => {
+    const initialize = { type: "initialize", protocolVersion: 1, runtimeVersion: "test", cwd: "/tmp", tools: ["bash"] };
+    expect(parseRequest({ ...initialize, outReplies: true, taskDepth: 2 })).toMatchObject({ outReplies: true, taskDepth: 2 });
+    expect(parseRequest({ ...initialize, outReplies: false, taskDepth: 0 })).toMatchObject({ outReplies: false, taskDepth: 0 });
+    for (const outReplies of ["true", 1, null]) expect(() => parseRequest({ ...initialize, outReplies })).toThrow(/outReplies/);
+    for (const taskDepth of [-1, 0.5, "1", null, Number.MAX_SAFE_INTEGER + 1])
+      expect(() => parseRequest({ ...initialize, taskDepth })).toThrow(/taskDepth/);
+    expect(FORWARDED_SETTING_KEYS).not.toContain("out.enabled");
+    expect(parseExecutionSettings({ "out.enabled": true })).toEqual({});
+  });
+
   test("initialize and ready validate effective edit mode and preserve the edit grammar", () => {
     const initialize = {
       type: "initialize", protocolVersion: 1, host: "omp", runtimeVersion: "test",

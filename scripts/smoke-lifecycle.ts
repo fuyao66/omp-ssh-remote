@@ -1,21 +1,14 @@
 // Bundle and run inside native OMP; no model requests are made.
 import assert from "node:assert/strict";
-import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { resolveHostSessionRef } from "../src/omp/host-session.ts";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
-// @ts-expect-error Generated release bundle has no declaration file.
-import extension from "../packages/omp/dist/extension.js";
+import { bootstrapSmokeHost } from "./smoke-host.ts";
 
 export default async function lifecycleSmoke(pi: ExtensionAPI) {
   const args = process.env.REMOTE_CONNECT_ARGS;
   if (!args) throw new Error("REMOTE_CONNECT_ARGS must specify a test host and scratch cwd");
-  const commands = new Map<string, { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
-  const api = new Proxy(pi, { get(target, key) {
-    if (key === "registerCommand") return (name: string, command: any) => { commands.set(name, command); target.registerCommand(name, command); };
-    const value = Reflect.get(target, key);
-    return typeof value === "function" ? value.bind(target) : value;
-  }});
-  await extension(api);
+  const commands = await bootstrapSmokeHost(pi);
   pi.registerCommand("remote-lifecycle-smoke", { description: "Verify upgrade lifecycle in native OMP", async handler(_, ctx) {
     const session = resolveHostSessionRef(ctx.sessionManager.getSessionFile(), ctx)?.session;
     if (!session) throw new Error("Native session not registered");

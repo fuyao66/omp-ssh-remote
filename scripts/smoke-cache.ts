@@ -2,10 +2,9 @@
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
 import assert from "node:assert/strict";
-import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-// @ts-expect-error Generated release bundle intentionally has no declaration file.
-import extension from "../packages/omp/dist/extension.js";
+import { bootstrapSmokeHost } from "./smoke-host.ts";
 
 export default async function cacheSmoke(pi: ExtensionAPI) {
   const args = process.env.REMOTE_CONNECT_ARGS;
@@ -27,13 +26,7 @@ export default async function cacheSmoke(pi: ExtensionAPI) {
     // The official loader supplies MC's legacy package aliases; raw import()
     // bypasses them. Per-turn wire/log assertions below prove MC actually ran.
   }
-  const commands = new Map<string, { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
-  const api = new Proxy(pi, { get(target, key) {
-    if (key === "registerCommand") return (name: string, command: any) => { commands.set(name, command); target.registerCommand(name, command); };
-    const value = Reflect.get(target, key);
-    return typeof value === "function" ? value.bind(target) : value;
-  }});
-  await extension(api);
+  const commands = await bootstrapSmokeHost(pi);
   const requests: any[] = [];
   const emittedItems: { tag: string; body: string; encryptedContent: string }[] = [];
   // Real HTTP serialization, synthetic answers. No provider credentials or paid

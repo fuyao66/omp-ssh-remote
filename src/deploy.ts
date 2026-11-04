@@ -5,8 +5,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { OMP_WORKER_BUNDLE } from "./omp/runtime-contract.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { deployPythonLspPack } from "./python-lsp-deploy.ts";
-import { deployTypescriptLspPack } from "./typescript-lsp-deploy.ts";
 import { deployLanguagePack } from "./language-pack-deploy.ts";
 import type {
   RemoteCompanionArtifact,
@@ -15,17 +13,14 @@ import type {
 import {
   buildScpBaseCommand,
   buildSshBaseCommand,
+  getScpDestination,
   getSshDestination,
   quoteRemoteArgument,
   type SshConnectionOptions,
 } from "./ssh.ts";
 import { buildCommitWorkerCacheCommand, buildWorkerDeploymentLeaseCommand, cacheRootSetup, validateWorkerCacheIdentity, NATIVE_WORKER_OWNER } from "./worker-cache.ts";
 
-export interface WorkerDeploymentOptions extends Omit<
-  SshConnectionOptions,
-  "workerPath"
-> {
-  workerPath?: string;
+export interface WorkerDeploymentOptions extends SshConnectionOptions {
   localWorkerPath?: string;
   localArtifactDir?: string;
   pythonLsp?: boolean;
@@ -272,10 +267,10 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
   try {
     return await deploymentContext.run({ ...options, signal: lease.signal }, async () => {
   const pythonLspPack = options.pythonLsp
-    ? await deployPythonLspPack(options, probe.home, arch, options.localArtifactDir ?? MODULE_DIR, run)
+    ? await deployLanguagePack("python", options, probe.home, arch, options.localArtifactDir ?? MODULE_DIR, run)
     : undefined;
   const typescriptLspPack = options.typescriptLsp
-    ? await deployTypescriptLspPack(options, probe.home, arch, options.localArtifactDir ?? MODULE_DIR, run)
+    ? await deployLanguagePack("typescript", options, probe.home, arch, options.localArtifactDir ?? MODULE_DIR, run)
     : undefined;
   const cppLspPack = options.cppLsp
     ? await deployLanguagePack("cpp", options, probe.home, arch, options.localArtifactDir ?? MODULE_DIR, run)
@@ -323,7 +318,7 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
   const scp = buildScpBaseCommand(options);
   // The worker is a ~200 MB uncompressed Bun executable; ssh-level compression
   // measured ~40% fewer bytes on the wire for the one-time upload per version.
-  scp.push("-C", localWorker, `${getSshDestination(options)}:${quoteRemoteArgument(temporary)}`);
+  scp.push("-C", localWorker, `${getScpDestination(options)}:${quoteRemoteArgument(temporary)}`);
   const quotedTemporary = quoteRemoteArgument(temporary);
   const quotedTemporaryMarker = quoteRemoteArgument(temporaryMarker);
   try {
@@ -491,7 +486,7 @@ async function deployCompanionArtifact(
     const scp = buildScpBaseCommand(options);
     scp.push(
       localArtifact,
-      `${getSshDestination(options)}:${quoteRemoteArgument(tempUpload)}`,
+      `${getScpDestination(options)}:${quoteRemoteArgument(tempUpload)}`,
     );
     await run(scp, `${artifact.id} companion artifact upload`);
     await run(
@@ -512,11 +507,4 @@ async function deployCompanionArtifact(
     ],
     `Link ${artifact.id} companion artifact to worker directory`,
   );
-}
-
-export async function ensureRemoteWorker(
-  options: WorkerDeploymentOptions,
-): Promise<string> {
-  const prepared = await prepareRemoteWorker(options);
-  try { return prepared.workerPath; } finally { await prepared.dispose(); }
 }

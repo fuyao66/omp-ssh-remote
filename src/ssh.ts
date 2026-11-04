@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { posix } from "node:path";
@@ -12,20 +13,39 @@ export type SshConnectionOptions = {
 
 export type SshWorkerOptions = SshConnectionOptions & { workerPath: string; pythonLspPack?: string; typescriptLspPack?: string; cppLspPack?: string };
 
-function validateTarget(target: string): void {
-  if (!/^[A-Za-z0-9_.@-]+$/.test(target) || target.startsWith("-")) {
-    throw new Error(`Unsafe SSH target: ${target}`);
+function parseSshTarget(value: unknown): { username?: string; host: string } {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_.+@:\[\]-]+$/.test(value) || value.startsWith("-")) {
+    throw new Error(`Invalid SSH target: ${String(value)}`);
   }
+  const parts = value.split("@");
+  const host = parts.at(-1)!;
+  const username = parts.length === 2 ? parts[0] : undefined;
+  const bracketed = host.startsWith("[") && host.endsWith("]");
+  const address = bracketed ? host.slice(1, -1) : host;
+  if (parts.length > 2 ||
+    (username !== undefined && !/^[A-Za-z0-9_.+][A-Za-z0-9_.+-]*$/.test(username)) ||
+    (bracketed ? isIP(address) !== 6 : !isIP(address) && !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(address))) {
+    throw new Error(`Invalid SSH target: ${value}`);
+  }
+  return { username, host: address };
+}
+
+export function validateSshTarget(value: unknown): string {
+  parseSshTarget(value);
+  return value as string;
 }
 
 export function getSshDestination(options: SshConnectionOptions): string {
-  validateTarget(options.target);
-  if (options.sshAlias === undefined) return options.target;
-  if (!/^[A-Za-z0-9_.-]+$/.test(options.sshAlias) || options.sshAlias.startsWith("-")) {
-    throw new Error("Unsafe SSH alias");
-  }
-  const userPrefix = options.target.slice(0, options.target.lastIndexOf("@") + 1);
-  return `${userPrefix}${options.sshAlias}`;
+  const { username, host } = parseSshTarget(options.target);
+  if (options.sshAlias === undefined) return `${username ? `${username}@` : ""}${host}`;
+  const alias = parseSshTarget(options.sshAlias);
+  if (alias.username !== undefined) throw new Error("Invalid SSH alias: username is not allowed");
+  return `${username ? `${username}@` : ""}${alias.host}`;
+}
+
+export function getScpDestination(options: SshConnectionOptions): string {
+  const { username, host } = parseSshTarget(getSshDestination(options));
+  return `${username ? `${username}@` : ""}${isIP(host) === 6 ? `[${host}]` : host}`;
 }
 
 function expandHome(path: string): string {
@@ -46,9 +66,8 @@ function appendCommonOptions(
 ): void {
   getSshDestination(options);
   if (options.sshAlias !== undefined) {
-    // Match the original Host alias without allowing its HostName to replace
-    // the resolved destination (including higher-priority OMP host settings).
-    command.push("-o", `HostName=${options.target.slice(options.target.lastIndexOf("@") + 1)}`);
+    // OMP hosts explicitly override HostName while retaining native alias matching.
+    command.push("-o", `HostName=${parseSshTarget(options.target).host}`);
   }
   command.push(
     "-o",

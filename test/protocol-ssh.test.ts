@@ -15,10 +15,11 @@ import {
   buildSshBaseCommand,
   buildScpBaseCommand,
   buildSshWorkerCommand,
+  getScpDestination,
   getSshDestination,
   quoteRemoteArgument,
 } from "../src/ssh.ts";
-import { parseConnectArgs } from "../src/connect-options.ts";
+import { discoverSshConfigAliases, parseConnectArgs, parseConnectOptions } from "../src/connect-options.ts";
 
 async function* chunks(...values: string[]): AsyncGenerator<Uint8Array> {
   for (const value of values) yield new TextEncoder().encode(value);
@@ -122,6 +123,91 @@ describe("SSH command safety", () => {
     expect(getSshDestination({ target: "resolved.example.com", sshAlias: "gpu-box" })).toBe("gpu-box");
   });
 
+  test.skipIf(!Bun.which("ssh"))("OpenSSH resolves Include, Match, and multi-pattern aliases without plugin overrides", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "omp-native-alias-"));
+    try {
+      const config = join(directory, "config");
+      const included = join(directory, "included.conf");
+      await writeFile(included, [
+        "Host include-box included-only",
+        "  HostName included.example.com",
+        "  User include-user",
+        "  Port 2201",
+        "  IdentityFile /keys/included",
+        "  ProxyJump relay.example.com",
+      ].join("\n"));
+      const text = [
+        `Include "${included}"`,
+        'Host include-box "match-box" multi-box *.example.com !excluded',
+        "  ProxyJump relay.example.com",
+        "Match originalhost match-box,multi-box",
+        "  HostName matched.example.com",
+        "  User match-user",
+        "  Port 2202",
+        "  IdentityFile /keys/matched",
+        "Host *",
+        "  HostName fallback.example.com",
+      ].join("\n");
+      await writeFile(config, text);
+      const aliases = discoverSshConfigAliases(text);
+      expect(aliases).toEqual([{ name: "include-box" }, { name: "match-box" }, { name: "multi-box" }]);
+      for (const name of ["include-box", "match-box", "multi-box", "included-only"]) {
+        const request = parseConnectArgs(name, aliases);
+        expect(request).toEqual({ target: name, displayTarget: name });
+        const ssh = buildSshWorkerCommand({ ...request, workerPath: "/srv/worker" });
+        const scp = buildScpBaseCommand(request);
+        expect(ssh.at(-2)).toBe(name);
+        expect(getScpDestination(request)).toBe(name);
+        for (const command of [ssh, scp]) {
+          expect(command.some(argument => /^(HostName|User|Port|IdentityFile)=/.test(argument))).toBe(false);
+          for (const flag of ["-p", "-P", "-i"]) expect(command).not.toContain(flag);
+        }
+        const result = spawnSync("ssh", ["-G", "-F", config, ...buildSshBaseCommand(request).slice(1), getSshDestination(request)], { encoding: "utf8" });
+        expect(result.status, result.stderr).toBe(0);
+        const isIncluded = name === "include-box" || name === "included-only";
+        expect(result.stdout).toContain(`hostname ${isIncluded ? "included" : "matched"}.example.com\n`);
+        expect(result.stdout).toContain(`user ${isIncluded ? "include" : "match"}-user\n`);
+        expect(result.stdout).toContain(`port ${isIncluded ? 2201 : 2202}\n`);
+        expect(result.stdout).toContain(`identityfile /keys/${isIncluded ? "included" : "matched"}\n`);
+        expect(result.stdout).toContain("proxyjump relay.example.com\n");
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("shares target grammar and formats IPv6 separately for SSH and SCP argv", () => {
+    for (const [target, sshDestination, scpDestination] of [
+      ["developer+ci@example.com", "developer+ci@example.com", "developer+ci@example.com"],
+      ["192.0.2.10", "192.0.2.10", "192.0.2.10"],
+      ["[2001:db8::1]", "2001:db8::1", "[2001:db8::1]"],
+      ["2001:db8::1", "2001:db8::1", "[2001:db8::1]"],
+      ["developer+ci@[2001:db8::1]", "developer+ci@2001:db8::1", "developer+ci@[2001:db8::1]"],
+      ["developer+ci@2001:db8::1", "developer+ci@2001:db8::1", "developer+ci@[2001:db8::1]"],
+    ] as const) {
+      const request = parseConnectOptions({ target });
+      expect(parseConnectArgs(target)).toEqual(request);
+      const ssh = buildSshWorkerCommand({ ...request, workerPath: "/srv/worker" });
+      const scp = [...buildScpBaseCommand(request), "/local/worker", `${getScpDestination(request)}:${quoteRemoteArgument("/remote/worker")}`];
+      expect(ssh.at(-2)).toBe(sshDestination);
+      expect(scp.at(-1)).toBe(`${scpDestination}:'/remote/worker'`);
+      expect(ssh.some(argument => argument.startsWith("HostName="))).toBe(false);
+    }
+    const request = parseConnectArgs("ipv6-box", [{ name: "ipv6-box", host: "[2001:db8::1]", username: "developer+ci" }]);
+    expect(buildSshWorkerCommand({ ...request, workerPath: "/srv/worker" })).toContain("HostName=2001:db8::1");
+    expect(getScpDestination(request)).toBe("developer+ci@ipv6-box");
+  });
+
+  test("rejects the same injection and malformed targets at parse and transport boundaries", () => {
+    for (const target of ["", "-host", "user@-host", "-user@host", "host --port 22", "host\nother", "host\0other", "host\x7fother", "host;command", "host|command", "$(command)", "`command`", "host/path", "host:22", "user@@host", "[example.com]", "[192.0.2.10]", "[::1", "::1]", "user@", "@host"]) {
+      const message = `Invalid SSH target: ${target}`;
+      expect(() => parseConnectOptions({ target })).toThrow(message);
+      expect(() => buildSshWorkerCommand({ target, workerPath: "/srv/worker" })).toThrow(message);
+      expect(() => buildScpBaseCommand({ target })).toThrow(message);
+      expect(() => getScpDestination({ target })).toThrow(message);
+    }
+  });
+
   test.skipIf(!Bun.which("ssh"))("retains native ProxyCommand and ProxyJump with configured destination precedence", async () => {
     const directory = await mkdtemp(join(tmpdir(), "omp-alias-config-"));
     try {
@@ -171,10 +257,10 @@ describe("SSH command safety", () => {
   test("rejects aliases that can change SSH destination or options", () => {
     for (const sshAlias of ["", "-oProxyCommand=evil", "other@host", "host;touch /tmp/pwn", "host\nHostName other"]) {
       const options = { target: "developer@resolved.example.com", sshAlias, workerPath: "/srv/worker" };
-      expect(() => buildSshWorkerCommand(options)).toThrow("Unsafe SSH alias");
-      expect(() => buildScpBaseCommand(options)).toThrow("Unsafe SSH alias");
+      expect(() => buildSshWorkerCommand(options)).toThrow("Invalid SSH");
+      expect(() => buildScpBaseCommand(options)).toThrow("Invalid SSH");
     }
-    expect(() => buildScpBaseCommand({ target: "host\nProxyCommand evil", sshAlias: "safe" })).toThrow("Unsafe SSH target");
+    expect(() => buildScpBaseCommand({ target: "host\nProxyCommand evil", sshAlias: "safe" })).toThrow("Invalid SSH target");
   });
 
   test("rejects unsafe targets and multiline remote arguments", () => {
@@ -183,7 +269,7 @@ describe("SSH command safety", () => {
         target: "host;touch /tmp/pwn",
         workerPath: "/tmp/worker",
       }),
-    ).toThrow("Unsafe SSH target");
+    ).toThrow("Invalid SSH target");
     expect(() => quoteRemoteArgument("/tmp/worker\ncommand")).toThrow(
       "cannot contain",
     );

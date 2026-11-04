@@ -22,7 +22,7 @@ const selected = Object.hasOwn(commands, name)
   ? { ...commands[name], ...(mcCompat ? { marker: "MC_CACHE_SMOKE_PASS" } : {}) } : undefined;
 if (!selected) throw new Error("Usage: bun scripts/run-smoke.ts [cache|cache-mc|lifecycle|capture|rich-output|lsp|cpp-lsp]");
 if (mcCompat && !await Bun.file(mcCompat).exists()) throw new Error(`Installed MC compat not found: ${mcCompat}`);
-const bundle = resolve(import.meta.dir, `../packages/omp/dist/${name}-smoke.js`);
+const bundle = resolve(import.meta.dir, `../.cache/smoke/${name}-smoke.js`);
 if (!await Bun.file(bundle).exists()) throw new Error(`Build the helper first: bun scripts/build-smoke.ts ${name}`);
 const directory = await mkdtemp(join(tmpdir(), `omp-${name}-accept-`));
 const config: string[] = [];

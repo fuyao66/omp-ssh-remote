@@ -1,24 +1,17 @@
 // Native OMP acceptance with deterministic widget authoring, not a paid model.
 import assert from "node:assert/strict";
 import { stripVTControlCharacters } from "node:util";
-import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 // build-smoke.ts bundles registry: the compiled host does not expose that subpath.
 import { JobWidgets } from "@oh-my-pi/pi-coding-agent/job-widgets/registry";
 import { renderJobWidgetLines } from "@oh-my-pi/pi-tui/tools/job-widget";
-// @ts-expect-error Generated release bundle has no declaration file.
-import extension from "../packages/omp/dist/extension.js";
+import { bootstrapSmokeHost } from "./smoke-host.ts";
 
 export default async function captureSmoke(pi: ExtensionAPI) {
   const args = process.env.REMOTE_CONNECT_ARGS;
   if (!args) throw new Error("REMOTE_CONNECT_ARGS must specify a host and scratch cwd");
-  const commands = new Map<string, { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
-  const api = new Proxy(pi, { get(target, key) {
-    if (key === "registerCommand") return (name: string, command: any) => { commands.set(name, command); target.registerCommand(name, command); };
-    const value = Reflect.get(target, key);
-    return typeof value === "function" ? value.bind(target) : value;
-  } });
-  await extension(api);
+  const commands = await bootstrapSmokeHost(pi);
   pi.registerCommand("remote-capture-smoke", { description: "Check real SSH capture, widgets and automatic backgrounding", async handler(_, ctx) {
     const session = AgentRegistry.global().list().find(ref => ref.sessionFile === ctx.sessionManager.getSessionFile())?.session;
     assert(session, "Native session is required");

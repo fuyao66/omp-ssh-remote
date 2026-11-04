@@ -4,6 +4,7 @@ import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-
 import { disposeAllKernelSessions } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import { shutdownAll as shutdownAllLspClients } from "@oh-my-pi/pi-coding-agent/lsp/client";
 import { closeDaemonClients } from "@oh-my-pi/pi-coding-agent/launch/client";
+import { ensureTheme } from "@oh-my-pi/pi-tui/theme";
 import { createNativeWorkerRuntime, type NativeWorkerRuntime } from "./runtime.ts";
 import { stopOwnedRemoteDaemons } from "./omp/hub-cleanup.ts";
 import { executeOwnedRemoteService, stopRemoteServiceInstance } from "./omp/service-lifecycle.ts";
@@ -101,9 +102,14 @@ async function initialize(request: InitializeRequest): Promise<void> {
   // One session per process: the negotiated edit language must override any
   // ambient remote PI_EDIT_VARIANT before native tools resolve their mode.
   if (request.editMode) process.env.PI_EDIT_VARIANT = request.editMode;
+  // Native LSP messages use the theme even without a UI. Preserve any existing
+  // theme and initialize the default without starting file watchers.
+  await ensureTheme();
   runtime = await createNativeWorkerRuntime(request.cwd, hostVersion, {
     sessionId: request.sessionId,
     settings: request.settings,
+    outReplies: request.outReplies,
+    taskDepth: request.taskDepth,
     editMode: request.editMode,
     bashServices: request.bashServices,
     resourceBinding: request.resourceBinding,
