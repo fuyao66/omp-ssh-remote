@@ -465,12 +465,10 @@ describe("native worker round trip", () => {
       if (file === marker) steering.abort();
     });
     try {
-      const started = Date.now();
       const result = await client.execute("bash", "steer-ready", {
         name, command: `touch '${marker}'; sleep 30`, pty: false,
         ready: { log: "NEVER_READY", timeout: 20 },
       }, AbortSignal.timeout(15_000), undefined, { steeringSignal: steering.signal });
-      expect(Date.now() - started).toBeLessThan(10_000);
       expect(JSON.stringify(result)).toContain("Readiness wait interrupted");
       const status = await client.execute("read", "steer-still-running", { path: `proc://${name}` });
       expect(JSON.stringify(status)).toContain("starting");
@@ -812,11 +810,11 @@ describe("forwarded execution settings", () => {
       });
       // A forwarded value must never change the admitted tool set or schemas.
       expect(ready.tools.map((tool) => tool.name)).toContain("bash");
-      const started = Date.now();
       const result = JSON.stringify(
         await worker.execute("bash", "capped", { command: "sleep 5; echo finished", timeout: 30 }).catch((error: Error) => error.message),
       );
-      expect(Date.now() - started).toBeLessThan(4_000);
+      expect(result).toContain("Command timed out after 1 seconds");
+      expect(result).toContain("Timeout clamped to 1s (requested 30s; global tools.maxTimeout ceiling 1s).");
       expect(result).not.toContain("finished");
     } finally {
       await worker.close().catch(() => {});

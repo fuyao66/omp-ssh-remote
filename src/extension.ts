@@ -1,5 +1,5 @@
 import { isAbsolute, win32, resolve as resolvePath } from "node:path";
-import type { AgentToolResult, ToolApproval } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolResult, ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { z } from "@oh-my-pi/omptype/zod";
 import type {
   ExtensionAPI,
@@ -266,7 +266,7 @@ type RemoteExtensionState = {
   binding: string;
   client?: RemoteRuntimeClient;
   lspDiagnostics?: RemoteLspDiagnostics;
-  deployment?: AbortController;
+  transaction?: ConnectionTransaction;
   remoteCwd?: string;
   localCwd?: string;
   sessionFile?: string;
@@ -295,6 +295,40 @@ type RemoteFamily = {
 const remoteFamilyBroker = getRemoteFamilyBroker<RemoteFamily>();
 
 const SESSION_SHUTDOWN_REMOTE_CLOSE_TIMEOUT_MS = 1_000;
+
+/**
+ * One in-flight connect, reconnect, or subagent attach. It is registered before
+ * its first await and revalidated after every await, so exit, shutdown,
+ * navigation, and family revocation always win a race with a late SSH result.
+ */
+type ConnectionTransaction = { controller: AbortController; signal: AbortSignal };
+
+function beginConnectionTransaction(state: RemoteExtensionState, callerSignal?: AbortSignal): ConnectionTransaction {
+  cancelConnectionTransaction(state, "Remote connection was superseded");
+  const controller = new AbortController();
+  const signal = callerSignal ? AbortSignal.any([callerSignal, controller.signal]) : controller.signal;
+  const transaction = { controller, signal };
+  state.transaction = transaction;
+  return transaction;
+}
+
+/** Cancellation frees the slot at once; the cancelled flow still disposes what it holds. */
+function cancelConnectionTransaction(state: RemoteExtensionState, reason: string): boolean {
+  const transaction = state.transaction;
+  if (!transaction) return false;
+  state.transaction = undefined;
+  transaction.controller.abort(new Error(reason));
+  return true;
+}
+
+function assertConnectionTransaction(state: RemoteExtensionState, transaction: ConnectionTransaction): void {
+  transaction.signal.throwIfAborted();
+  if (state.transaction !== transaction) throw new Error("Remote connection was cancelled");
+}
+
+function endConnectionTransaction(state: RemoteExtensionState, transaction: ConnectionTransaction): void {
+  if (state.transaction === transaction) state.transaction = undefined;
+}
 
 function hostSessionFor(state: RemoteExtensionState, ctx?: ExtensionContext) {
   return resolveHostSessionRef(state.sessionFile, ctx ?? state.hostContext)?.session;
@@ -702,8 +736,11 @@ function registerWrapper(
     typeof original?.approval === "function" ? original.approval.bind(original) : original?.approval ?? approvalFor(name),
     original?.approvalCacheTargets?.bind(original),
     () => ({ ...state, editMode: effectiveHostEditMode(state) }),
+    original?.formatApprovalDetails?.bind(original),
   );
-  pi.registerTool({
+  // ToolDefinition does not declare formatApprovalDetails, yet OMP's registered-tool
+  // adapter forwards every definition key to its approval prompt; a test pins this.
+  const definition: ToolDefinition & Pick<AgentTool, "formatApprovalDetails"> = {
     name,
     label: original?.label ?? TOOL_LABELS[name],
     get description() { return original?.description ?? native.description; },
@@ -717,6 +754,7 @@ function registerWrapper(
     get customFormat() { return original?.customFormat; },
     approval: approval.approval,
     approvalCacheTargets: approval.approvalCacheTargets,
+    formatApprovalDetails: approval.formatApprovalDetails,
     async execute(toolCallId, rawParams, signal, rawOnUpdate, ctx) {
       const nested = nestedDispatchScope.getStore();
       nested?.assertCurrent();
@@ -791,7 +829,8 @@ function registerWrapper(
         state.proposalSources.pop();
       return result;
     },
-  });
+  };
+  pi.registerTool(definition);
   state.wrappedTools.add(name);
 }
 export async function captureOmpHandshake(pi: ExtensionAPI, state: RemoteExtensionState, ctx?: ExtensionContext) {
@@ -846,6 +885,7 @@ function detachRemoteState(
   state: RemoteExtensionState,
   restoreLocal: boolean,
 ): RemoteRuntimeClient | undefined {
+  cancelConnectionTransaction(state, "Remote runtime was disconnected");
   const current = state.client;
   state.client = undefined;
   state.binding = crypto.randomUUID();
@@ -931,7 +971,11 @@ function launchOwnerId(ctx: ExtensionContext | undefined): string | undefined {
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
-/** Spawn the SSH worker, run the admission handshake, and bind event delivery. */
+type OpenedTransport = { client: RemoteRuntimeClient; ready: ReadyMessage; binding: string; diagnostics?: RemoteLspDiagnostics };
+
+/** Spawn the SSH worker, run the admission handshake, and bind event delivery.
+ * Never mutates session state: only the caller's still-current transaction
+ * may publish the result. */
 async function openRemoteTransport(
   pi: ExtensionAPI,
   connection: RemoteConnectOptions & { workerPath: string },
@@ -939,8 +983,9 @@ async function openRemoteTransport(
   state: RemoteExtensionState,
   ctx?: ExtensionContext,
   signal?: AbortSignal,
-): Promise<{ client: RemoteRuntimeClient; ready: ReadyMessage; binding: string }> {
+): Promise<OpenedTransport> {
   const handshake = await captureOmpHandshake(pi, state, ctx);
+  signal?.throwIfAborted();
   const binding = crypto.randomUUID();
   const client = new RemoteRuntimeClient({
     command: buildSshWorkerCommand(connection),
@@ -958,27 +1003,38 @@ async function openRemoteTransport(
     });
     bindLaunchCompletionDelivery(pi, client);
     const sessionId = launchOwnerId(ctx);
+    let diagnostics: RemoteLspDiagnostics | undefined;
     if (owner && sessionId) {
-      const diagnostics = new RemoteLspDiagnostics(owner, sessionId, binding, () =>
+      const created = new RemoteLspDiagnostics(owner, sessionId, binding, () =>
         state.client === client && !client.isClosed && state.binding === binding &&
         hostSessionFor(state, ctx) === owner && owner.sessionManager.getSessionId() === sessionId);
-      state.lspDiagnostics = diagnostics;
-      client.onClose(() => diagnostics.close());
+      diagnostics = created;
+      client.onClose(() => created.close());
       client.onEvent(event => {
-        if (event.event === "lsp-mutation") diagnostics.mutation(parseLspEvent(event.payload, false));
-        else if (event.event === "lsp-diagnostics") diagnostics.diagnostics(parseLspEvent(event.payload, true) as LspDiagnostics);
+        if (event.event === "lsp-mutation") created.mutation(parseLspEvent(event.payload, false));
+        else if (event.event === "lsp-diagnostics") created.diagnostics(parseLspEvent(event.payload, true) as LspDiagnostics);
         else if (event.event === "lsp-operation-begin" || event.event === "lsp-operation-end") {
           const { sessionId, resourceBinding, id } = event.payload;
           if (typeof sessionId !== "string" || typeof resourceBinding !== "string" || typeof id !== "number") throw new Error("Invalid remote LSP operation event");
-          diagnostics.operation({ sessionId, resourceBinding, id }, event.event === "lsp-operation-begin" ? "begin" : "end");
+          created.operation({ sessionId, resourceBinding, id }, event.event === "lsp-operation-begin" ? "begin" : "end");
         }
       });
     }
-    return { client, ready, binding };
+    return { client, ready, binding, diagnostics };
   } catch (error) {
     client.kill();
     throw error;
   }
+}
+
+/** The only step that makes a transport live; callers run it synchronously after their final revalidation. */
+function publishTransport(state: RemoteExtensionState, opened: OpenedTransport, remoteCwd: string): void {
+  state.client = opened.client;
+  state.binding = opened.binding;
+  state.lspDiagnostics = opened.diagnostics;
+  state.remoteCwd = remoteCwd;
+  state.connectionError = undefined;
+  state.editMode = opened.ready.editMode;
 }
 
 export type RemoteReconnectOutcome = {
@@ -988,6 +1044,14 @@ export type RemoteReconnectOutcome = {
   replacedLiveTransport: boolean;
   cacheAudit: RemoteWorkerCacheAudit;
 };
+
+/** Revalidate a member transaction after an await: exit, shutdown and family revocation all cancel it. */
+function assertFamilyTransaction(state: RemoteExtensionState, family: RemoteFamily, transaction: ConnectionTransaction): void {
+  assertConnectionTransaction(state, transaction);
+  if (family.closing || state.family !== family || !family.members.has(state)) {
+    throw new Error("Remote session family was closed during connection");
+  }
+}
 
 /**
  * Re-establish the owner's transport for an already-selected remote family
@@ -1004,7 +1068,7 @@ async function reconnectRemoteRuntime(
   ctx: ExtensionContext | undefined,
   options: { force: boolean; signal?: AbortSignal },
 ): Promise<RemoteReconnectOutcome> {
-  if (state.deployment) throw new Error("Remote connection is already in progress");
+  if (state.transaction) throw new Error("Remote connection is already in progress");
   if (!state.selected) {
     throw new Error("No remote runtime is selected; use /remote-connect <target> [cwd]");
   }
@@ -1023,42 +1087,25 @@ async function reconnectRemoteRuntime(
   state.proposalSources = state.proposalSources.filter((source) => source === "local");
   state.connectionError = "Remote runtime reconnect in progress";
   family.cacheAudit = undefined;
-  const deployment = new AbortController();
-  state.deployment = deployment;
+  const transaction = beginConnectionTransaction(state, options.signal);
   let prepared: PreparedRemoteWorker | undefined;
-  let next: RemoteRuntimeClient | undefined;
+  let opened: OpenedTransport | undefined;
   try {
-    const signal = options.signal ? AbortSignal.any([options.signal, deployment.signal]) : deployment.signal;
-    prepared = await prepareRemoteWorker({ ...family.connection, signal, onProgress: (stage) => ctx?.ui?.setWorkingMessage(stage) });
+    prepared = await prepareRemoteWorker({ ...family.connection, signal: transaction.signal, onProgress: (stage) => ctx?.ui?.setWorkingMessage(stage) });
+    assertFamilyTransaction(state, family, transaction);
     const connection = { ...family.connection, cwd: family.remoteCwd, workerPath: prepared.workerPath,
       pythonLspPack: prepared.pythonLspPack, typescriptLspPack: prepared.typescriptLspPack, cppLspPack: prepared.cppLspPack };
-    const { client, ready, binding } = await openRemoteTransport(
-      pi,
-      connection,
-      family.remoteCwd,
-      state,
-      ctx,
-      prepared.signal,
-    );
-    next = client;
-    if (family.closing || signal.aborted) {
-      client.kill();
-      signal.throwIfAborted();
-      throw new Error("Remote session family was closed during reconnect");
-    }
-    const remoteCwd: string = ready.cwd ?? family.remoteCwd;
+    opened = await openRemoteTransport(pi, connection, family.remoteCwd, state, ctx, prepared.signal);
+    assertFamilyTransaction(state, family, transaction);
+    const remoteCwd: string = opened.ready.cwd ?? family.remoteCwd;
     if (remoteCwd !== family.remoteCwd) {
-      client.kill();
       throw new Error("Remote workspace canonical directory changed during reconnect");
     }
     await prepared.commitUsage();
+    assertFamilyTransaction(state, family, transaction);
     if (state.owner) family.connection = connection;
-    state.client = client;
-    state.binding = binding;
-    state.remoteCwd = remoteCwd;
-    state.connectionError = undefined;
+    publishTransport(state, opened, remoteCwd);
     family.cacheAudit = prepared.cacheAudit;
-    state.editMode = ready.editMode;
     return {
       target: family.connection.displayTarget,
       remoteCwd,
@@ -1067,12 +1114,15 @@ async function reconnectRemoteRuntime(
       cacheAudit: prepared.cacheAudit,
     };
   } catch (error) {
-    next?.kill();
-    state.connectionError = `Remote runtime reconnect failed: ${error instanceof Error ? error.message : String(error)}`;
+    opened?.client.kill();
+    // A cancelling owner (exit, shutdown, revocation) already set the session's final state.
+    if (state.transaction === transaction) {
+      state.connectionError = `Remote runtime reconnect failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
     throw error;
   } finally {
+    endConnectionTransaction(state, transaction);
     await prepared?.dispose();
-    if (state.deployment === deployment) state.deployment = undefined;
   }
 }
 
@@ -1112,23 +1162,20 @@ async function attachFamilyMember(
     return;
   }
 
-  let next: RemoteRuntimeClient | undefined;
+  const transaction = beginConnectionTransaction(state);
+  let opened: OpenedTransport | undefined;
   try {
-    const opened = await openRemoteTransport(pi, family.connection, family.remoteCwd, state, ctx);
-    next = opened.client;
-    if (family.closing)
-      throw new Error(
-        "Remote session family disconnected during subagent initialization",
-      );
-    state.client = next;
-    state.binding = opened.binding;
-    state.remoteCwd = opened.ready.cwd;
-    state.connectionError = undefined;
-    state.editMode = opened.ready.editMode;
+    opened = await openRemoteTransport(pi, family.connection, family.remoteCwd, state, ctx, transaction.signal);
+    assertFamilyTransaction(state, family, transaction);
+    publishTransport(state, opened, opened.ready.cwd ?? family.remoteCwd);
   } catch (error) {
-    next?.kill();
-    state.connectionError = `Remote subagent runtime failed: ${error instanceof Error ? error.message : String(error)}`;
+    opened?.client.kill();
+    if (state.transaction === transaction) {
+      state.connectionError = `Remote subagent runtime failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
     throw error;
+  } finally {
+    endConnectionTransaction(state, transaction);
   }
 }
 
@@ -1150,7 +1197,7 @@ async function connectOwner(
   ctx: ExtensionContext | undefined,
   input: OwnerConnectInput,
 ): Promise<{ request: RemoteConnectRequest; ready: ReadyMessage; remoteCwd: string; cacheAudit: RemoteWorkerCacheAudit }> {
-  if (state.deployment) throw new Error(`Remote connection is already in progress${input.inProgressHint}`);
+  if (state.transaction) throw new Error(`Remote connection is already in progress${input.inProgressHint}`);
   if (state.selected) throw new Error(`A remote runtime is already selected; ${input.alreadySelectedHint}`);
   if (!input.sessionFile) {
     throw new Error("Remote runtime requires a persisted OMP session so subagents can inherit safely");
@@ -1159,15 +1206,17 @@ async function connectOwner(
   if (remoteFamilyBroker.hasOwner(normalizedSessionFile)) {
     throw new Error("This session already owns a remote runtime family");
   }
-  const request = input.parseRequest(await loadConfiguredSshHosts(input.localCwd));
-  let next: RemoteRuntimeClient | undefined;
+  const transaction = beginConnectionTransaction(state, input.signal);
   let prepared: PreparedRemoteWorker | undefined;
-  const deployment = new AbortController();
-  state.deployment = deployment;
+  let opened: OpenedTransport | undefined;
   try {
-    const signal = input.signal ? AbortSignal.any([input.signal, deployment.signal]) : deployment.signal;
-    prepared = await prepareRemoteWorker({ ...request, signal, onProgress: input.onProgress });
-    const remoteCwd = request.cwd ?? prepared.home ?? (await resolveRemoteHome(request));
+    const hosts = await loadConfiguredSshHosts(input.localCwd);
+    assertConnectionTransaction(state, transaction);
+    const request = input.parseRequest(hosts);
+    prepared = await prepareRemoteWorker({ ...request, signal: transaction.signal, onProgress: input.onProgress });
+    assertConnectionTransaction(state, transaction);
+    const remoteCwd = request.cwd ?? prepared.home ?? (await resolveRemoteHome({ ...request, signal: transaction.signal }));
+    assertConnectionTransaction(state, transaction);
     const connection = {
       ...request,
       cwd: remoteCwd,
@@ -1176,10 +1225,14 @@ async function connectOwner(
       typescriptLspPack: prepared.typescriptLspPack,
       cppLspPack: prepared.cppLspPack,
     };
-    const opened = await openRemoteTransport(pi, connection, remoteCwd, state, ctx, prepared.signal);
-    next = opened.client;
-    signal.throwIfAborted();
+    opened = await openRemoteTransport(pi, connection, remoteCwd, state, ctx, prepared.signal);
+    assertConnectionTransaction(state, transaction);
     await prepared.commitUsage();
+    assertConnectionTransaction(state, transaction);
+    // The broker is process-wide; another extension instance may have claimed this session.
+    if (remoteFamilyBroker.hasOwner(normalizedSessionFile)) {
+      throw new Error("This session already owns a remote runtime family");
+    }
     const ready = opened.ready;
     const resolvedRemoteCwd = ready.cwd ?? remoteCwd;
     const family: RemoteFamily = {
@@ -1192,16 +1245,12 @@ async function connectOwner(
       members: new Set([state]),
       closing: false,
     };
-    state.client = next;
-    state.binding = opened.binding;
-    state.remoteCwd = resolvedRemoteCwd;
+    publishTransport(state, opened, resolvedRemoteCwd);
     state.localCwd = input.localCwd;
     state.sessionFile = normalizedSessionFile;
     state.selected = true;
     state.owner = true;
     state.family = family;
-    state.connectionError = undefined;
-    state.editMode = ready.editMode;
     remoteFamilyBroker.register(family);
     ctx?.ui?.setStatus?.("remote-runtime", `ssh ${request.displayTarget}:${ready.cwd}`);
     ctx?.ui?.notify?.(
@@ -1210,11 +1259,11 @@ async function connectOwner(
     );
     return { request, ready, remoteCwd: resolvedRemoteCwd, cacheAudit: prepared.cacheAudit };
   } catch (error) {
-    next?.kill();
+    opened?.client.kill();
     throw error;
   } finally {
+    endConnectionTransaction(state, transaction);
     await prepared?.dispose();
-    state.deployment = undefined;
   }
 }
 
@@ -1337,15 +1386,17 @@ export default async function remoteRuntimeExtension(
     loadMode: "essential",
     approval: "exec",
     async execute(_id, params: unknown, _signal, _onUpdate, ctx) {
-      state.deployment?.abort(new Error("Remote connection cancelled by remote_exit"));
       const p = asRecord(params);
       const force = p.force === true;
       if (!state.selected) {
+        const cancelled = cancelConnectionTransaction(state, "Remote connection cancelled by remote_exit");
         return {
           content: [
             {
               type: "text",
-              text: "Remote runtime is already disconnected; workspace tools are local.",
+              text: cancelled
+                ? "Cancelled the pending remote connection; workspace tools are local."
+                : "Remote runtime is already disconnected; workspace tools are local.",
             },
           ],
           details: { success: true, mode: "local" },
@@ -1477,11 +1528,13 @@ export default async function remoteRuntimeExtension(
   pi.registerCommand("remote-exit", {
     description: "Disconnect the remote runtime and restore local native tools",
     async handler(args, ctx) {
-      state.deployment?.abort(new Error("Remote connection cancelled by /remote-exit"));
       const force = args.trim() === "--force";
       if (!state.selected) {
+        const cancelled = cancelConnectionTransaction(state, "Remote connection cancelled by /remote-exit");
         ctx.ui.notify(
-          "Remote runtime is already disconnected; workspace tools are local",
+          cancelled
+            ? "Cancelled the pending remote connection; workspace tools are local"
+            : "Remote runtime is already disconnected; workspace tools are local",
           "info",
         );
         return;
@@ -1541,7 +1594,10 @@ export default async function remoteRuntimeExtension(
   const closeBeforeSessionNavigation = async (
     ctx: ExtensionContext,
   ): Promise<{ cancel: true } | undefined> => {
-    if (!state.selected) return;
+    if (!state.selected) {
+      cancelConnectionTransaction(state, "Remote connection cancelled by session navigation");
+      return;
+    }
     const family = state.family;
     const blockReason = remoteSessionNavigationBlockReason({
       selected: state.selected,
@@ -1631,7 +1687,7 @@ export default async function remoteRuntimeExtension(
   });
 
   pi.on("session_shutdown", async () => {
-    state.deployment?.abort(new Error("Session shutdown"));
+    cancelConnectionTransaction(state, "Remote connection cancelled by session shutdown");
     state.sessionFile = undefined;
     state.hostContext = undefined;
     if (state.owner && state.family) {

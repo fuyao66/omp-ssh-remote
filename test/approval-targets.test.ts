@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { approvalFolderCandidate, recordApprovalGrant, requestApproval, resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { ApprovalCache, ApprovalGrants, SessionApprovals, approvalGrantKey } from "@oh-my-pi/pi-coding-agent/tools/approval-cache";
 import { remoteWrapperApproval, type ApprovalTargetState } from "../src/omp/approval-targets.ts";
+import { wrapRegisteredTool } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 
 describe("workspace approval targets", () => {
@@ -221,5 +222,27 @@ describe("workspace approval targets", () => {
       expect(() => metadata.approvalCacheTargets(args)).toThrow("cannot mix");
       expect(() => metadata.assertBinding(args)).toThrow("cannot mix");
     }
+  });
+
+  test("keeps native approval details and names the remote workspace a routed call runs in", () => {
+    const state = { selected: false, binding: "local", proposalSources: [], remoteCwd: "/srv/app",
+      family: { connection: { displayTarget: "user@example.invalid" } } } as unknown as ApprovalTargetState;
+    const native = (args: unknown) => [`Command: ${(args as { command: string }).command}`];
+    const metadata = remoteWrapperApproval("bash", "exec", undefined, () => state, native);
+    expect(metadata.formatApprovalDetails({ command: "make test" })).toEqual(["Command: make test"]);
+    state.selected = true;
+    expect(metadata.formatApprovalDetails({ command: "make test" }))
+      .toEqual(["Command: make test", "Remote: user@example.invalid:/srv/app"]);
+    const read = remoteWrapperApproval("read", "read", undefined, () => state, () => "Path: x");
+    expect(read.formatApprovalDetails({ path: "local://notes.md" })).toBe("Path: x");
+    expect(read.formatApprovalDetails({ path: "notes.md" })).toEqual(["Path: x", "Remote: user@example.invalid:/srv/app"]);
+  });
+
+  test("OMP's registered-tool adapter forwards formatApprovalDetails to the approval prompt", () => {
+    const formatApprovalDetails = (args: unknown) => [`Detail: ${JSON.stringify(args)}`];
+    const definition = { name: "bash", label: "bash", description: "bash", parameters: { type: "object" },
+      approval: "exec", formatApprovalDetails, execute: async () => ({ content: [] }) };
+    const tool = wrapRegisteredTool({ definition, extensionPath: "fixture" } as never, {} as never);
+    expect(tool.formatApprovalDetails?.({ command: "ls" })).toEqual(['Detail: {"command":"ls"}']);
   });
 });

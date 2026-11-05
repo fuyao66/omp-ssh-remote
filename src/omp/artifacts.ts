@@ -2,6 +2,7 @@ import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
+import { InternalUrlRouter, type ProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import {
   formatFullOutputReference,
   formatOutputNotice,
@@ -12,6 +13,66 @@ import {
 const root = () => join(homedir(), ".cache/omp-ssh-remote/artifacts");
 const references = /remote-artifact:\/\/([a-f0-9-]{36})\/(\d+)/g;
 const NAMESPACE_NAME = /^[a-f0-9-]{36}$/;
+const ARTIFACT_NAME = /^(\d+)\.[A-Za-z0-9_+,:@%=-]+(?:\.[A-Za-z0-9_+,:@%=-]+)*$/;
+/** Mirrors the native artifact:// gate: path consumers locate, only materialization reads bytes. */
+const MAX_INLINE_ARTIFACT_BYTES = 8 * 1024 * 1024;
+
+async function resolveArtifactPath(namespace: string, id: string): Promise<string> {
+  const dir = join(root(), namespace);
+  const name = (await readdir(dir)).find(entry => ARTIFACT_NAME.exec(entry)?.[1] === id);
+  if (!name) throw new Error(`Remote artifact not found: remote-artifact://${namespace}/${id}`);
+  return join(dir, name);
+}
+
+const ARTIFACT_URL = /^remote-artifact:\/\/([a-f0-9-]{36})(?:\/(\d+))?\/?$/;
+
+function parseArtifactUrl(href: string): { namespace: string; id?: string } {
+  const match = ARTIFACT_URL.exec(href);
+  if (!match) throw new Error(`Invalid remote artifact URL: ${href}; expected remote-artifact://<namespace>/<id>`);
+  return { namespace: match[1]!, id: match[2] };
+}
+
+/**
+ * The embedded shell resolves operands through this read-only filesystem mount, never shell source.
+ * A namespace is a virtual directory, not its physical one: ids map to `<id>.<suffix>` files,
+ * and no-follow metadata (`ls -l`) walks the parent before locating the leaf.
+ */
+const remoteArtifactHandler: ProtocolHandler = {
+  scheme: "remote-artifact",
+  spec: { backing: "file", selectors: "lines", immutable: true, artifactStore: true },
+  async locate(url) {
+    const { namespace, id } = parseArtifactUrl(url.href);
+    return id === undefined ? null : resolveArtifactPath(namespace, id);
+  },
+  async resolve(url) {
+    const { namespace, id } = parseArtifactUrl(url.href);
+    if (id === undefined) {
+      if (!(await stat(join(root(), namespace)).then(entry => entry.isDirectory(), () => false))) {
+        throw new Error(`Remote artifact namespace not found: ${url.href}`);
+      }
+      return { url: url.href, content: "", contentType: "text/plain", isDirectory: true };
+    }
+    const path = await resolveArtifactPath(namespace, id);
+    const { size } = await stat(path);
+    if (size > MAX_INLINE_ARTIFACT_BYTES) {
+      throw new Error(`Remote artifact is ${size} bytes; full internal resolution is blocked. Use read selectors such as ${url.href}:1-3000`);
+    }
+    const content = await readFile(path, "utf8");
+    return { url: url.href, content, contentType: "text/plain", sourcePath: path, size };
+  },
+};
+
+/**
+ * Mount remote-artifact:// in this process's embedded shell. Only the worker
+ * calls this: the scheme names files on the remote host, so a host process
+ * (which also builds a runtime for metadata fallback) must never resolve it.
+ */
+export function mountRemoteArtifactScheme(): void {
+  const router = InternalUrlRouter.instance();
+  const existing = router.getHandler(remoteArtifactHandler.scheme);
+  if (existing && existing !== remoteArtifactHandler) throw new Error("The remote-artifact URL scheme is already registered");
+  if (!existing) router.register(remoteArtifactHandler);
+}
 /** Records which process owns a namespace so a later sweep can prove it is gone. */
 export const ARTIFACT_OWNER_FILE = ".owner.json";
 /** Namespaces younger than this are never swept, even without an owner record. */
@@ -107,10 +168,7 @@ export async function resolveRemoteArtifacts(value: unknown): Promise<unknown> {
   if (typeof value === "string") {
     let result = value;
     for (const match of value.matchAll(references)) {
-      const dir = join(root(), match[1]!);
-      const name = (await readdir(dir)).find((name) => name.startsWith(`${match[2]}.`));
-      if (!name) throw new Error(`Remote artifact not found: ${match[0]}`);
-      result = result.replaceAll(match[0], join(dir, name));
+      result = result.replaceAll(match[0], await resolveArtifactPath(match[1]!, match[2]!));
     }
     return result;
   }

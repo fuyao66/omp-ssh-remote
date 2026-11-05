@@ -7,6 +7,7 @@ import { closeDaemonClients } from "@oh-my-pi/pi-coding-agent/launch/client";
 import { ensureTheme } from "@oh-my-pi/pi-tui/theme";
 import { createNativeWorkerRuntime, type NativeWorkerRuntime } from "./runtime.ts";
 import { stopOwnedRemoteDaemons } from "./omp/hub-cleanup.ts";
+import { mountRemoteArtifactScheme } from "./omp/artifacts.ts";
 import { executeOwnedRemoteService, stopRemoteServiceInstance } from "./omp/service-lifecycle.ts";
 import {
   PROTOCOL_VERSION,
@@ -105,6 +106,8 @@ async function initialize(request: InitializeRequest): Promise<void> {
   // Native LSP messages use the theme even without a UI. Preserve any existing
   // theme and initialize the default without starting file watchers.
   await ensureTheme();
+  // remote-artifact:// names files on this host; only the worker process mounts it.
+  mountRemoteArtifactScheme();
   runtime = await createNativeWorkerRuntime(request.cwd, hostVersion, {
     sessionId: request.sessionId,
     settings: request.settings,

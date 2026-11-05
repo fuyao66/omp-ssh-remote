@@ -28,7 +28,7 @@ OMP 18.11 兼容：远端异步 Bash 转发实时和终态卡片更新，日志�
 
 显式停止服务成功后，根据原生 stop 回执结束本机协调任务。不会把主动停止当成自然退出：broker 对显式 stop 不发送 `daemon-completed`。停止失败时继续保留追踪。
 
-OMP 18.12.3 审批保留本机原生文件／目录授权。远端使用哈希化的精确请求授权，按当前 binding、主机／用户／端口／密钥、目录和工具隔离，不能复用本机目录权限或另一台服务器的权限。重连／切换环境后失效；等待审批期间切换环境，会拒绝记录授权和执行旧请求。暂不提供远端整目录或跨 session 授权。
+OMP 18.12.3 审批保留本机原生文件／目录授权。远端使用哈希化的精确请求授权，按当前 binding、主机／用户／端口／密钥、目录和工具隔离，不能复用本机目录权限或另一台服务器的权限。重连／切换环境后失效；等待审批期间切换环境，会拒绝记录授权和执行旧请求。暂不提供远端整目录或跨 session 授权。审批提示保留原生工具给出的详情（命令、路径、内容）；路由到远端的调用另加一行 `Remote: <target>:<cwd>`，标明实际执行位置。
 
 显式远端异步命令使用每个 job 独立的原生 shell。符合条件的前台调用按宿主的自动后台化阈值和插话规则切到后台，继续同一个请求及采集源，不重启命令。前台转后台保留 session shell 状态；立即后台启动则使用隔离的 job shell。本机 manager 不可用或满额时，普通命令保持前台执行。进程列表保留原生渲染元数据，多 URI 查询不允许混合本机和远端。
 
@@ -48,7 +48,7 @@ OMP 18.12.3 审批保留本机原生文件／目录授权。远端使用哈希�
 
 GitHub 仅保留明确的 API 查询操作；非搜索查询必须显式给出 `repo`，不从本机目录推断仓库。`pr_create`、`pr_checkout`、`pr_push` 和未知操作在远端模式下拒绝。
 
-截断输出保存在远端 `~/.cache/omp-ssh-remote/artifacts/<namespace>`。连接到同一主机后，可用 `read` selector 或 `grep` 读取返回的 `remote-artifact://<namespace>/<id>`。companion 正常退出时删除自己的 namespace，启动时清扫超过一小时且所属 worker 已不存在的 namespace；因此 transport 丢失遗留的 artifact 会过期，但永远不会复制到本机。本机 `artifact://` 仍保持本机语义。`xd://debug` 与直接 debug 一样在远端执行。
+截断输出保存在远端 `~/.cache/omp-ssh-remote/artifacts/<namespace>`。连接到同一主机后，可用 `read` selector 或 `grep` 读取返回的 `remote-artifact://<namespace>/<id>`。远端 `bash` 与原生 `artifact://` 一样，经内嵌 shell 的只读 URL 文件系统解析这些引用：已审批的命令文本从不改写，外部程序拿到真实路径，写入会被拒绝。只有 worker 挂载该 scheme，宿主从不解析它。companion 正常退出时删除自己的 namespace，启动时清扫超过一小时且所属 worker 已不存在的 namespace；因此 transport 丢失遗留的 artifact 会过期，但永远不会复制到本机。本机 `artifact://` 仍保持本机语义。`xd://debug` 与直接 debug 一样在远端执行。
 
 远端 read 登记的 Git 冲突返回 `remote-conflict://<binding>/<id>` 引用，可读取 `/ours`、`/theirs`、`/base`，或写入该引用解决远端冲突；批量写使用同一 binding 下的 `*`。裸 `conflict://` 仍属于本机会话。重连或退出后旧远端引用失效，须重新读取文件。edit 的执行域检查包含移动目的路径，跨域 `MV` 同样拒绝。
 

@@ -11,10 +11,6 @@ async function resolveTarget(target: string): Promise<string> {
 
 /** Resolve artifact operands without traversing opaque tool data. */
 export async function resolveRemoteArtifactArgs(toolName: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
-  if (toolName === "bash" && typeof args.command === "string" && args.command.includes("remote-artifact://")) {
-    // Retain the established shell shorthand for artifact operands.
-    return { ...args, command: await resolveRemoteArtifacts(args.command) };
-  }
   if ((toolName === "read" || toolName === "grep") && typeof args.path === "string") {
     const path = toolName === "grep"
       ? (await Promise.all(args.path.split(";").map(resolveTarget))).join(";")

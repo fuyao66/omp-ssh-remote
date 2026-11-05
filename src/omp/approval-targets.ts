@@ -18,6 +18,7 @@ export type ApprovalTargetState = {
 };
 
 type CacheTargets = (args: unknown) => readonly string[] | undefined;
+type ApprovalDetails = (args: unknown) => string | string[] | undefined;
 
 function localTargets(name: RemoteToolName, args: Record<string, unknown>, state: ApprovalTargetState): boolean {
   const owner = resourceOwnershipTarget(name, args, {
@@ -65,7 +66,8 @@ export function remoteWrapperApproval(
   nativeApproval: ToolApproval,
   nativeTargets: CacheTargets | undefined,
   getState: () => ApprovalTargetState,
-): { approval: ToolApproval; approvalCacheTargets: CacheTargets; assertBinding: (args: unknown) => void } {
+  nativeDetails?: ApprovalDetails,
+): { approval: ToolApproval; approvalCacheTargets: CacheTargets; formatApprovalDetails: ApprovalDetails; assertBinding: (args: unknown) => void } {
   const bindings = new WeakMap<object, string>();
   const assertBinding = (args: unknown): void => {
     if (args === null || typeof args !== "object") throw new Error("Workspace tool approval requires object arguments");
@@ -79,6 +81,18 @@ export function remoteWrapperApproval(
   };
   return {
     assertBinding,
+    /** Native rows (command, path, content) plus the remote workspace a routed call executes in. */
+    formatApprovalDetails(args) {
+      const native = nativeDetails?.(args);
+      const rows = native === undefined ? [] : typeof native === "string" ? [native] : [...native];
+      const state = getState();
+      if (!state.selected || args === null || typeof args !== "object") return native;
+      let local: boolean;
+      try { local = localTargets(name, args as Record<string, unknown>, state); } catch { return native; }
+      if (local) return native;
+      const target = state.family?.connection.displayTarget ?? "unknown";
+      return [...rows, `Remote: ${target}:${state.remoteCwd ?? "(unknown cwd)"}`];
+    },
     approval(args) {
       assertBinding(args);
       return typeof nativeApproval === "function" ? nativeApproval(args) : nativeApproval;

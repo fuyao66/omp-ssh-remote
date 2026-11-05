@@ -156,6 +156,11 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       const output = text(await invoke("bash", { command: "seq 1 20000" }));
       const uri = output.match(/remote-artifact:\/\/[a-f0-9-]+\/\d+/)?.[0]; assert(uri);
       assert(text(await invoke("read", { path: `${uri}:19999-20000` })).includes("20000"));
+      // The worker's read-only mount resolves the operand; the approved command text is never rewritten.
+      assert.match(text(await invoke("bash", { command: `wc -l < ${uri}` })), /^\s*20000\s*$/m);
+      assert.match(text(await invoke("bash", { command: `/usr/bin/tail -n 1 '${uri}'` })), /^20000$/m);
+      assert.match(text(await invoke("bash", { command: `ls -l '${uri}'` })), /remote-artifact:\/\/[a-f0-9-]+\/\d+/);
+      assert.match(text(await invoke("bash", { command: `printf x > ${uri}` })), /read.only|EROFS/i);
       console.log("CORE_EVAL_ARTIFACT_PASS");
 
       const patterns = lookup("bash.patterns"); assert(patterns);

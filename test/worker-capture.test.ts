@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdtemp, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
@@ -64,8 +65,20 @@ describe("real worker capture through native local consumers", () => {
       const view = job && widgets.view(job);
       if (view?.state === "live") live.resolve(view);
     });
+    const fifo = join(cwd, "pipeline-release.fifo");
+    let gate: Awaited<ReturnType<typeof open>> | undefined;
+    let released = false;
+    const release = async () => {
+      if (gate && !released) {
+        await gate.write("release\n");
+        released = true;
+      }
+    };
     try {
-      const command = '{ for n in 1 2 3; do printf "step=%s\\n" "$n"; sleep 0.2; done; sleep 1.5; } | tail -1';
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+      // RDWR keeps release nonblocking even if the worker fails before opening the FIFO.
+      gate = await open(fifo, constants.O_RDWR | constants.O_NONBLOCK);
+      const command = '{ for n in 1 2 3; do printf "step=%s\\n" "$n"; done; read -r _ < pipeline-release.fifo; } | tail -1';
       const started = startRemoteAsyncBashJob({
         manager, ownerId: "Main", command, remoteCwd: cwd,
         params: { command, async: true, timeout: 0 },
@@ -85,6 +98,7 @@ describe("real worker capture through native local consumers", () => {
       expect(text(await reader.execute("pipe", { path: `proc://${id}/streams/1` }))).toContain("step=1");
       const view = await Promise.race([live.promise, job.promise.then(() => { throw new Error(`No native live widget before settlement: ${JSON.stringify({ status: job.status, error: job.errorText, authorCalls, authorRequests, pipe: job.process?.streams?.read(1)?.data.toString(), view: widgets.view(job) })}`); })]);
       expect(view.state).toBe("live");
+      await release();
       await job.promise;
       expect(job.status).toBe("completed");
       expect(job.resultText).toContain("step=3");
@@ -98,7 +112,12 @@ describe("real worker capture through native local consumers", () => {
       expect(stat?.kind === "stat" && stat.items[0]?.text).toBe("3");
       expect(authorCalls).toBe(1);
       expect(widgets.view(job)).toEqual(finalView);
-    } finally { unsubscribe(); await manager.dispose({ timeoutMs: 2000 }); }
+    } finally {
+      try { await release(); } finally {
+        unsubscribe();
+        try { await manager.dispose({ timeoutMs: 2000 }); } finally { await gate?.close(); }
+      }
+    }
   }, 15_000);
 
   test("native proc kill cancels the remote request and freezes the retained sources", async () => {

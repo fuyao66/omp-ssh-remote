@@ -53,6 +53,14 @@ async function withTimeout<T>(
   }
 }
 
+/** A signal after output EOF is usually the client's own stop of a worker that lost its channel. */
+function exitError(code: number | null, signal: NodeJS.Signals | null, outputEnded: boolean): Error {
+  if (code !== null || !signal) return new Error(`Remote runtime exited with code ${code}`);
+  return new Error(outputEnded
+    ? `Remote runtime output stream ended; worker stopped by ${signal}`
+    : `Remote runtime exited on signal ${signal}`);
+}
+
 export class RemoteRuntimeClient {
   readonly #process: ChildProcess;
   readonly #pending = new Map<string, PendingCall>();
@@ -62,6 +70,7 @@ export class RemoteRuntimeClient {
   #closed = false;
   #exited = false;
   #killSent = false;
+  #outputEnded = false;
   #closePromise?: Promise<void>;
   #nextId = 1;
   readonly #exitPromise: Promise<number | null>;
@@ -103,9 +112,14 @@ export class RemoteRuntimeClient {
     void this.#ready.catch(() => {});
     const exit = Promise.withResolvers<number | null>();
     this.#exitPromise = exit.promise;
-    this.#process.once("exit", (code) => {
+    this.#process.once("exit", (code, signal) => {
       this.#exited = true;
       exit.resolve(code);
+      // Descendants that inherited stdio (an SSH mux master, a detached child) can
+      // delay 'close' indefinitely. A worker writes nothing after exit, and what it
+      // wrote earlier but the host has not read is bounded by the pipe's capacity,
+      // which one read pass drains: after one turn, fail what is still pending.
+      setImmediate(() => this.#close(exitError(code, signal, this.#outputEnded)));
     });
     // Failed spawns have no process and do not emit an exit event.
     this.#process.once("error", (error) => {
@@ -115,8 +129,8 @@ export class RemoteRuntimeClient {
       }
       this.#terminate(error);
     });
-    this.#process.once("close", (code) => {
-      this.#close(new Error(`Remote runtime exited with code ${code}`));
+    this.#process.once("close", (code, signal) => {
+      this.#close(exitError(code, signal, this.#outputEnded));
     });
     this.#process.stdin?.on("error", (error) => this.#terminate(error));
     void this.#readStdout().catch((error) => this.#terminate(error));
@@ -299,6 +313,14 @@ export class RemoteRuntimeClient {
     if (!this.#process.stdout) return;
     for await (const line of decodeFrames(this.#process.stdout)) {
       if (line.trim()) this.#handle(parseMessage(line));
+    }
+    // No result can follow EOF. A dying worker reports its own exit status; one
+    // still running without its output channel cannot serve the session, so stop
+    // it and let the exit handler fail what is pending.
+    this.#outputEnded = true;
+    if (!this.#closed && !this.#exited && !this.#killSent) {
+      this.#killSent = true;
+      this.#process.kill();
     }
   }
 

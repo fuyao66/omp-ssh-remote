@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { writeFile } from "node:fs/promises";
-import { createRemoteArtifacts, type RemoteArtifacts } from "../src/omp/artifacts.ts";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { fileURLToPath } from "node:url";
+import { createRemoteArtifacts, mountRemoteArtifactScheme, type RemoteArtifacts } from "../src/omp/artifacts.ts";
 import { resolveRemoteArtifactArgs } from "../src/omp/artifact-input.ts";
 
 const namespaces: RemoteArtifacts[] = [];
@@ -43,10 +47,103 @@ describe("artifact input boundaries", () => {
     }
   });
 
-  test("preserves the established bash artifact-operand shorthand", async () => {
+  test("bash commands remain opaque, including artifact operands and printed URI literals", async () => {
     const file = await artifact();
-    expect(await resolveRemoteArtifactArgs("bash", { command: `cat '${file.uri}'`, i: file.uri })).toEqual({ command: `cat '${file.path}'`, i: file.uri });
+    for (const command of [`cat ${file.uri}`, `cat '${file.uri}'`, `cat "${file.uri}"`, `printf '%s' '${file.uri}'`]) {
+      const input = { command, i: file.uri };
+      expect(await resolveRemoteArtifactArgs("bash", input)).toBe(input);
+    }
     const plain = { command: "printf plain" };
     expect(await resolveRemoteArtifactArgs("bash", plain)).toBe(plain);
+  });
+});
+
+describe("native remote artifact shell filesystem", () => {
+  for (const homeName of ["inert-home", "it's; touch MARKER; # home"]) {
+    test(`reads unchanged approved commands with HOME=${JSON.stringify(homeName)}`, async () => {
+      const temporary = await mkdtemp(join(tmpdir(), "omp-artifact-shell-"));
+      const home = join(temporary, homeName);
+      try {
+        // Bun caches os.homedir(): HOME must be set before the worker process starts.
+        const child = Bun.spawn([process.execPath, "--eval", `
+          import assert from "node:assert/strict";
+          import { mkdir, readFile, writeFile } from "node:fs/promises";
+          import { dirname } from "node:path";
+          import { createNativeWorkerRuntime } from ${JSON.stringify(fileURLToPath(new URL("../src/runtime.ts", import.meta.url)))};
+          import { mountRemoteArtifactScheme } from ${JSON.stringify(fileURLToPath(new URL("../src/omp/artifacts.ts", import.meta.url)))};
+          import { resolveRemoteArtifactArgs } from ${JSON.stringify(fileURLToPath(new URL("../src/omp/artifact-input.ts", import.meta.url)))};
+          await mkdir(process.env.HOME, { recursive: true });
+          mountRemoteArtifactScheme();
+          const runtime = await createNativeWorkerRuntime(${JSON.stringify(temporary)}, "18.15.0");
+          try {
+            const file = await runtime.session.getArtifactManager().allocatePath("bash");
+            assert(file.path.startsWith(process.env.HOME + "/"), file.path);
+            await writeFile(file.path, "real artifact bytes\\n");
+            const namespace = dirname(file.path).split("/").at(-1);
+            const uri = "remote-artifact://" + namespace + "/" + file.id;
+            const text = value => value.content.filter(block => block.type === "text").map(block => block.text ?? "").join("\\n");
+            for (const operand of [uri, "'" + uri + "'", '"' + uri + '"']) {
+              const input = { command: "cat " + operand, timeout: 10 };
+              assert.equal(await resolveRemoteArtifactArgs("bash", input), input);
+              const result = text(await runtime.tools.bash.execute("read-" + operand, input));
+              assert.match(result, /real artifact bytes/);
+              assert.doesNotMatch(result, /unterminated/);
+            }
+            // No-follow metadata walks the namespace parent before the leaf (native ls -l).
+            const listed = text(await runtime.tools.bash.execute("ls-l", { command: "ls -l '" + uri + "'", timeout: 10 }));
+            assert.doesNotMatch(listed, /Invalid remote artifact URL|No such file/);
+            assert.match(listed, /20/);
+            const counted = text(await runtime.tools.bash.execute("external", { command: "/usr/bin/wc -c '" + uri + "'", timeout: 10 }));
+            assert.match(counted, /^20 /m);
+            const missing = text(await runtime.tools.bash.execute("missing", { command: "cat 'remote-artifact://" + namespace + "/999999'", timeout: 10 }));
+            assert.doesNotMatch(missing, /real artifact bytes/);
+            const literal = text(await runtime.tools.bash.execute("literal", { command: "printf '%s' '" + uri + "'", timeout: 10 }));
+            assert(literal.includes(uri));
+            assert(!literal.includes(file.path));
+            const denied = text(await runtime.tools.bash.execute("read-only", { command: "printf changed > '" + uri + "'", timeout: 10 }));
+            assert.match(denied, /read.only|EROFS/i);
+            assert.equal(await readFile(file.path, "utf8"), "real artifact bytes\\n");
+            assert.equal(await Bun.file(${JSON.stringify(join(temporary, "MARKER"))}).exists(), false);
+          } finally { await runtime.dispose(); }
+          console.log("artifact-shell-ok");
+        `], { cwd: temporary, env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe" });
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+        ]);
+        expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+        expect(stdout).toContain("artifact-shell-ok");
+      } finally {
+        await rm(temporary, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("a host process building a runtime for metadata fallback never mounts the remote scheme", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "omp-artifact-host-"));
+    try {
+      const child = Bun.spawn([process.execPath, "--eval", `
+        import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
+        import { createNativeWorkerRuntime } from ${JSON.stringify(fileURLToPath(new URL("../src/runtime.ts", import.meta.url)))};
+        const runtime = await createNativeWorkerRuntime(${JSON.stringify(temporary)}, "18.15.0");
+        try { console.log(InternalUrlRouter.instance().getHandler("remote-artifact") === undefined ? "unmounted" : "mounted"); }
+        finally { await runtime.dispose(); }
+      `], { cwd: join(import.meta.dir, ".."), env: { ...process.env, HOME: temporary }, stdout: "pipe", stderr: "pipe" });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+      ]);
+      expect({ exitCode, stderr, stdout: stdout.trim() }).toEqual({ exitCode: 0, stderr: "", stdout: "unmounted" });
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+  });
+
+  test("does not resolve unsafe artifact filenames sharing an id prefix", async () => {
+    mountRemoteArtifactScheme();
+    const file = await artifact();
+    const unsafe = join(dirname(file.path), `${file.id}.log'; touch MARKER; #`);
+    await rm(file.path);
+    await writeFile(unsafe, "not an artifact filename");
+    await expect(resolveRemoteArtifactArgs("read", { path: file.uri })).rejects.toThrow("Remote artifact not found");
+    await expect(InternalUrlRouter.instance().locate(file.uri)).rejects.toThrow("Remote artifact not found");
   });
 });

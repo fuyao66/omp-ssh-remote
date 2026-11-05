@@ -197,10 +197,10 @@ export type PreparedRemoteWorker = {
 export async function resolveRemoteHome(
   options: WorkerDeploymentOptions,
 ): Promise<string> {
-  const output = await run(
+  const output = await deploymentContext.run(options, () => run(
     [...buildSshBaseCommand(options), getSshDestination(options), `printf '%s\\n' "$HOME"`],
     "Remote home probe",
-  );
+  ));
   if (!output.startsWith("/") || output.includes("\n")) {
     throw new Error(`Invalid remote home response: ${JSON.stringify(output)}`);
   }

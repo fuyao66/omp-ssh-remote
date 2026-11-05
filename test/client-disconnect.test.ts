@@ -20,9 +20,11 @@ async function deadline<T>(promise: Promise<T>, label: string, timeoutMs = 5_000
   }
 }
 
-async function withClient(fixture: string, run: (client: RemoteRuntimeClient) => Promise<void>, mode?: string): Promise<void> {
+async function withClient(fixture: string | readonly string[], run: (client: RemoteRuntimeClient) => Promise<void>, mode?: string): Promise<void> {
   const client = new RemoteRuntimeClient({
-    command: [process.execPath, join(import.meta.dir, "fixtures", fixture), ...(mode ? [mode] : [])],
+    command: typeof fixture === "string"
+      ? [process.execPath, join(import.meta.dir, "fixtures", fixture), ...(mode ? [mode] : [])]
+      : [...fixture],
   });
   try {
     await run(client);
@@ -294,4 +296,131 @@ describe("native worker fatal lifecycle", () => {
     expect(result.stdinOpen).toBe(true);
     expect(result.output).toBe("");
   }, 20_000);
+});
+
+
+describe("transport settlement before inherited pipe closure", () => {
+  async function withTransportWorker(
+    mode: "stdout-eof" | "exit-pending" | "exit-result",
+    run: (client: RemoteRuntimeClient, descendant: Promise<number>) => Promise<void>,
+  ): Promise<void> {
+    const { writeFile } = await import("node:fs/promises");
+    const root = await mkdtemp(join(tmpdir(), "omp-transport-settlement-"));
+    const worker = join(root, "worker.ts");
+    const descendantFile = join(root, "descendant.pid");
+    const descendant = Promise.withResolvers<number>();
+    let descendantPid: number | undefined;
+    // The descendant announces readiness over IPC and then holds both inherited
+    // output descriptors until the test releases it with SIGKILL in finally.
+    const holder = String.raw`import { writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
+const server = createServer();
+server.listen(process.argv[1] + ".sock", async () => {
+  await writeFile(process.argv[1], String(process.pid));
+  process.send?.({ ready: true });
+  process.disconnect?.();
+});`;
+    await writeFile(worker, String.raw`import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { closeSync, writeSync } from "node:fs";
+import { createInterface } from "node:readline";
+import { encodeMessage, PROTOCOL_VERSION, REMOTE_TOOL_NAMES, TOOL_RUNTIME_VERSION } from ` + JSON.stringify(join(import.meta.dir, "../src/protocol.ts")) + String.raw`;
+const mode = ` + JSON.stringify(mode) + String.raw`;
+// Bun keeps fd 1 open after stdout.end(), so the EOF mode speaks the protocol on
+// fd 3, the pipe's only reference, which it can genuinely close while staying alive.
+const send = mode === "stdout-eof"
+  ? async message => { writeSync(3, encodeMessage(message)); }
+  : message => new Promise((resolve, reject) => {
+    process.stdout.write(encodeMessage(message), error => error ? reject(error) : resolve());
+  });
+for await (const line of createInterface({ input: process.stdin })) {
+  const request = JSON.parse(line);
+  if (request.type === "initialize") {
+    await send({ type: "ready", protocolVersion: PROTOCOL_VERSION, host: "omp",
+      hostVersion: request.hostVersion, runtimeVersion: TOOL_RUNTIME_VERSION,
+      editMode: request.editMode, cwd: request.cwd,
+      tools: REMOTE_TOOL_NAMES.map(name => ({ name, description: name, parameters: { type: "object" } })) });
+  }
+  if (request.type !== "execute") continue;
+  if (mode === "stdout-eof") {
+    closeSync(3);
+    continue;
+  }
+  const child = spawn(process.execPath, ["-e", ` + JSON.stringify(holder) + ", " + JSON.stringify(descendantFile) + String.raw`], {
+    stdio: ["ignore", process.stdout, process.stderr, "ipc"],
+  });
+  await once(child, "message");
+  await send({ type: "event", event: "launch-completion", payload: { descendantPid: child.pid } });
+  if (mode === "exit-result") {
+    await send({ type: "result", id: request.id, result: { completedBeforeExit: true } });
+  }
+  process.exit(27);
+}`);
+    try {
+      const command = mode === "stdout-eof"
+        ? ["/bin/sh", "-c", 'exec "$0" "$1" 3>&1 1>/dev/null', process.execPath, worker]
+        : [process.execPath, worker];
+      await withClient(command, async client => {
+        client.onEvent(event => {
+          const pid = event.payload.descendantPid;
+          if (typeof pid === "number") {
+            descendantPid = pid;
+            descendant.resolve(pid);
+          }
+        });
+        await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+        await run(client, descendant.promise);
+      });
+    } finally {
+      try {
+        // The marker also covers a failure before the ready event reaches the host.
+        descendantPid ??= Number(await readFile(descendantFile, "utf8").catch(() => "")) || undefined;
+        if (descendantPid !== undefined) {
+          try { process.kill(descendantPid, "SIGKILL"); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+        }
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  }
+
+  test("stdout EOF rejects pending execution, notifies close once, and stops the still-running worker", async () => {
+    await withTransportWorker("stdout-eof", async client => {
+      const closed = Promise.withResolvers<Error>();
+      let closeCalls = 0;
+      client.onClose(error => { closeCalls++; closed.resolve(error); });
+      const pending = client.execute("read", "stdout-eof", { path: "pending.txt" });
+      void pending.catch(() => {});
+      await deadline(closed.promise, "stdout EOF session closure");
+      await expect(pending).rejects.toThrow("output stream ended");
+      expect(client.isClosed).toBe(true);
+      expect(closeCalls).toBe(1);
+      // The fixture never exits on its own; only the client's stop ends it.
+      expect(await deadline(client.waitForExit(), "client stop of the output-less worker")).toBeNull();
+    });
+  }, 15_000);
+
+  test("worker exit rejects pending execution before its descendant releases inherited pipes", async () => {
+    await withTransportWorker("exit-pending", async (client, descendant) => {
+      const pending = client.execute("read", "exit-pending", { path: "pending.txt" });
+      void pending.catch(() => {});
+      const pid = await deadline(descendant, "inherited-pipe descendant readiness");
+      expect(await deadline(client.waitForExit(), "worker exit with inherited pipes")).toBe(27);
+      await expect(deadline(pending, "pending execution rejection after worker exit")).rejects.toThrow("exited with code 27");
+      expect(client.isClosed).toBe(true);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    });
+  }, 15_000);
+
+  test("a result written before exit resolves before inherited pipes close", async () => {
+    await withTransportWorker("exit-result", async (client, descendant) => {
+      const pending = client.execute("read", "exit-result", { path: "completed.txt" });
+      void pending.catch(() => {});
+      const pid = await deadline(descendant, "result-holding descendant readiness");
+      expect(await deadline(client.waitForExit(), "worker exit after result")).toBe(27);
+      expect(await deadline(pending, "result written before worker exit")).toEqual({ completedBeforeExit: true });
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    });
+  }, 15_000);
 });
