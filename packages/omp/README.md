@@ -12,6 +12,8 @@ Remote native tools:
 
 `read`, `write`, `edit`, `bash`, `grep`, `glob`, `lsp`, `ast_grep`, `ast_edit`, constrained `eval`, and `debug`.
 
+Remote `read <image>?q=<question>` and PDF page-screenshot questions use the host's native vision-model selection and credentials. The companion classifies and loads the image with native ReadTool, then sends only the loaded image and question back to the active host read request. Host `images.blockImages`, `images.questionTimeoutMs`, cancellation and cost limits still apply; credentials, provider headers and endpoints never enter the companion. JSON `?q=` remains native jq and needs no model. Eval `tool.read` follows the same bridge.
+
 Background execution is split by ownership rather than by tool name:
 
 - `bash async:true` creates a job in the local session's OMP job manager; native `wait` and job `proc://` reads/cancellation remain local while the command executes remotely. Independent root sessions do not share a job manager; children use their own session family's manager.
@@ -45,6 +47,8 @@ Remote eval follows native 18.12.3: use `print` or JavaScript `console.log`, not
 Remote Bash `> out://` and foreground Eval's `tool.write({path:"out://", ...})` / `tool.bash` replies use the native transcript reply channel. Connection setup captures the host's effective reply gate, including explicit `out.enabled` and the actual native session's TUI capability; subagents remain refused. Reply text is carried in native `details.replies`, never written to the remote filesystem. Other host resources such as `local://` and `skill://` are not bridged into remote execution. Extension/MCP tools not supplied by the remote runtime continue to execute on the local host; they are not blanket-blocked.
 
 While connected, direct user shell (`!`/`!!`) and Python shortcuts are explicitly refused rather than silently executed locally. Use remote `bash`/`eval`, or disconnect before using local shortcuts. `find`, `security_scan`, and `ida` are not remote-adapted and remain blocked, including xdev entrypoints. Native `checkpoint` and `rewind` stay local and are allowed: they change conversation history, not remote project files or kernel state. Remote eval supports computation and remote workspace callbacks only: local agent/workpool, judge/completion, archive, browser, and todo helpers are not bridged. The fixed workspace contract explains this distinction; use top-level local orchestration tools instead.
+
+While a remote runtime is selected, native input hooks reject `/git`, `/security`, `/wt` (including `/worktree`), `/move`, `/add-dir`, `/remove-dir`, `/review`, `/annotate`, `/loop` with a native `--until` or `--while` shell condition (including `=` forms), and native `@path` file mentions: these would use the local workspace or shell. Builtin colon syntax and bare command words enabled by `input.bareSlashCommands` are covered too. Use remote `bash`/`read` instead; drop `@` from file paths. Plain `/loop` remains available. This guard covers TUI and RPC submissions that emit the native input event, not startup, print-mode, or subagent prompts; it is not a complete host-execution boundary.
 
 GitHub operations are limited to explicit API reads. Non-search reads require an explicit `repo` rather than inferring a repository from the local directory. Remote mode rejects `pr_create`, `pr_checkout`, `pr_push`, and unknown operations.
 
@@ -97,7 +101,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 Restart OMP after linking. Rebuild the extension and both workers when updating. Run `/remote-exit` before disabling, suspending, or reloading the extension. OMP 18.12.6 dynamic suspension neither sends shutdown nor offers a before-suspend hook: suspending a connected extension restores native local tools but may retain its old worker. A plugin cannot guarantee interception or cleanup after its own hooks have been suspended.
 
-The companion is built against OMP 18.15.0 (runtime contract 0.15.0). Build identity comes from the installed source and native dependencies, never an OMP executable on PATH. Rebuild both workers when updating runtime dependencies or capture behavior, even if schemas are unchanged. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Admission reports version, edit-language, and schema drift.
+The companion is built against OMP 18.15.0 (runtime contract 0.16.0). Build identity comes from the installed source and native dependencies, never an OMP executable on PATH. Rebuild both workers when updating runtime dependencies or capture behavior, even if schemas are unchanged. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Admission reports version, edit-language, and schema drift.
 
 Uploads explicitly use `scp -O` (the SCP protocol), because remote destination paths are shell-quoted; the SFTP default in OpenSSH 9+ would treat those quotes as literal filename characters. The local SCP client must support `-O`.
 

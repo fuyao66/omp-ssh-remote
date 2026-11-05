@@ -1,9 +1,10 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import ts from "typescript";
 import { adaptNativeLspConfig } from "../src/native-lsp-config-adapter.ts";
 import { adaptNativeMutationSettlement } from "../src/omp/native-mutation-adapter.ts";
 import { SDK_SOURCE_ADAPTATIONS, SUPPORTED_SDK_VERSION, sdkAdaptationLabel } from "../src/omp/sdk-contract.ts";
+import { SEMANTIC_SDK_CONTRACTS } from "../src/omp/sdk-semantic-contracts.ts";
 
 const root = resolve(import.meta.dir, "..");
 const sdkPackages = [
@@ -11,7 +12,7 @@ const sdkPackages = [
   "@oh-my-pi/pi-coding-agent", "@oh-my-pi/pi-tui", "@oh-my-pi/pi-utils",
 ] as const;
 type Manifest = { name?: string; version?: string; dependencies?: Record<string, string>; peerDependencies?: Record<string, string> };
-type Check = { check: string; status: "PASS" | "FAIL"; detail: string };
+type Check = { check: string; status: "PASS" | "WARN" | "FAIL"; detail: string };
 
 async function manifest(path: string): Promise<Manifest> {
   return JSON.parse(await readFile(path, "utf8")) as Manifest;
@@ -125,6 +126,28 @@ async function main(): Promise<void> {
     if (unresolved.length) throw new Error(`Unresolvable SDK imports; update callers for the installed SDK:\n${unresolved.join("\n")}`);
     return `${origins.size} unique specifiers resolve from repository root`;
   });
+  await run("semantic SDK contracts", async () => {
+    const sdkSource = dirname(Bun.resolveSync("@oh-my-pi/pi-coding-agent/sdk", root));
+    const ids = new Set<string>();
+    for (const contract of SEMANTIC_SDK_CONTRACTS) {
+      if (ids.has(contract.id)) throw new Error(`Duplicate semantic contract id: ${contract.id}`);
+      ids.add(contract.id);
+      for (const [base, paths] of [[root, contract.plugin], [sdkSource, contract.native]] as const) {
+        for (const path of paths) {
+          if (!(await stat(join(base, path))).isFile()) throw new Error(`${contract.id}: not a file: ${join(base, path)}`);
+        }
+      }
+      for (const test of contract.coveredBy) {
+        const source = await readFile(join(root, test.path), "utf8");
+        if (test.name && !source.includes(test.name)) throw new Error(`${contract.id}: test name ${JSON.stringify(test.name)} not found in ${test.path}`);
+      }
+    }
+    const gaps = SEMANTIC_SDK_CONTRACTS.filter(contract => contract.gap).length;
+    return `${SEMANTIC_SDK_CONTRACTS.length} entries; paths + test references verified; ${gaps} manual-review gaps (not semantic verification)`;
+  });
+  for (const contract of SEMANTIC_SDK_CONTRACTS) {
+    if (contract.gap) checks.push({ check: `semantic gap: ${contract.id}`, status: "WARN", detail: contract.gap });
+  }
   console.log(`OMP SDK contract: ${SUPPORTED_SDK_VERSION}`);
   console.table(checks);
   if (failures.length) {

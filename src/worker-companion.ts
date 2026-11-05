@@ -13,6 +13,8 @@ import {
   PROTOCOL_VERSION,
   TOOL_RUNTIME_VERSION,
   decodeFrames,
+  IMAGE_QUESTION_CHUNK_CHARS,
+  MAX_IMAGE_QUESTION_BASE64,
   encodeMessage,
   parseRequest,
   type ExecuteRequest,
@@ -37,6 +39,7 @@ const pendingInvocations = new Map<string, {
   reject(reason: Error): void;
   onUpdate?: (value: unknown) => void;
 }>();
+const pendingImageQuestions = new Map<string, { resolve(text: string): void; reject(reason: Error): void }>();
 
 async function cleanupWorker(reason: Error): Promise<void> {
   if (cleanupPromise) return cleanupPromise;
@@ -45,6 +48,8 @@ async function cleanupWorker(reason: Error): Promise<void> {
     pendingEvents.clear();
     for (const invocation of pendingInvocations.values()) invocation.reject(reason);
     pendingInvocations.clear();
+    for (const question of pendingImageQuestions.values()) question.reject(reason);
+    pendingImageQuestions.clear();
     for (const call of active.values()) call.controller.abort(reason);
     await Promise.race([
       Promise.allSettled([...active.values()].map(call => call.done)),
@@ -179,12 +184,52 @@ function hostInvoker(parentId: string): NonNullable<Parameters<typeof createNati
   };
 }
 
+function hostImageQuestion(parentId: string): Parameters<NativeWorkerRuntime["createImageQuestionRead"]>[1] {
+  return async (question, signal) => {
+    if (!runtime || !active.has(parentId) || cleanupPromise) throw new Error("Remote image question has no active read parent");
+    signal?.throwIfAborted();
+    const id = `image_question_${nextInvocation++}`;
+    const deferred = Promise.withResolvers<string>();
+    // Cancellation or an early host rejection can arrive while chunks are still
+    // draining; keep that rejection handled until the sender awaits the reply.
+    void deferred.promise.catch(() => {});
+    pendingImageQuestions.set(id, deferred);
+    const abort = () => {
+      pendingImageQuestions.delete(id);
+      deferred.reject(signal?.reason instanceof Error ? signal.reason : new Error("Remote image question cancelled"));
+      send({ type: "image-question-cancel", id });
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      if (question.data.length > MAX_IMAGE_QUESTION_BASE64) throw new Error("Remote image question exceeds native image size limit");
+      const { data, ...metadata } = question;
+      await sendCapture({ type: "image-question-begin", id, parentId, resourceBinding: runtime.resourceBinding,
+        ...metadata, length: data.length });
+      for (let offset = 0; offset < data.length; offset += IMAGE_QUESTION_CHUNK_CHARS) {
+        signal?.throwIfAborted();
+        await sendCapture({ type: "image-question-chunk", id, offset, data: data.slice(offset, offset + IMAGE_QUESTION_CHUNK_CHARS) });
+      }
+      signal?.throwIfAborted();
+      await sendCapture({ type: "image-question-commit", id });
+      return await deferred.promise;
+    } catch (error) {
+      if (!signal?.aborted) send({ type: "image-question-cancel", id });
+      throw error;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      pendingImageQuestions.delete(id);
+    }
+  };
+}
+
 function startExecute(request: ExecuteRequest): void {
   const toolName = request.tool as RemoteToolName;
   const current = runtime;
   const tool = request.bashScope
     ? current?.createJobBash(capture => sendCapture({ type: "capture", id: request.id, capture }), request.bashScope === "session")
-    : toolName === "eval" && current ? { execute: (...args: Parameters<NativeWorkerRuntime["tools"]["eval"]["execute"]>) => current.executeEval(hostInvoker(request.id)!, ...args) } : current?.tools[toolName];
+    : toolName === "eval" && current ? { execute: (...args: Parameters<NativeWorkerRuntime["tools"]["eval"]["execute"]>) => current.executeEval(hostInvoker(request.id)!, ...args) }
+    : toolName === "read" && request.imageQuestionModel && current
+      ? current.createImageQuestionRead(request.imageQuestionModel, hostImageQuestion(request.id)) : current?.tools[toolName];
   if (!tool) {
     send({
       type: "error",
@@ -249,6 +294,14 @@ async function dispatch(request: Request): Promise<boolean> {
     case "event-ack":
       pendingEvents.get(request.id)?.resolve();
       pendingEvents.delete(request.id);
+      return true;
+    case "image-question-result":
+      pendingImageQuestions.get(request.id)?.resolve(request.text);
+      pendingImageQuestions.delete(request.id);
+      return true;
+    case "image-question-error":
+      pendingImageQuestions.get(request.id)?.reject(Object.assign(new Error(request.error.message), { name: request.error.name }));
+      pendingImageQuestions.delete(request.id);
       return true;
     case "invoke-update":
       pendingInvocations.get(request.id)?.onUpdate?.(request.result);

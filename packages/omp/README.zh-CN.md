@@ -12,6 +12,8 @@ OMP SSH Remote 将 Oh My Pi 控制面保留在本机，同时通过 SSH 在远�
 
 `read`、`write`、`edit`、`bash`、`grep`、`glob`、`lsp`、`ast_grep`、`ast_edit`、受限 `eval` 和 `debug`。
 
+远端 `read <image>?q=<question>` 与 PDF 页面截图问答使用宿主原生的视觉模型选择和凭据。companion 仍由原生 ReadTool 分类、加载图像，仅将加载后的图像和问题回传给当前宿主 read 请求。宿主的 `images.blockImages`、`images.questionTimeoutMs`、取消和费用限制继续生效；凭据、provider headers 和 endpoint 不进入 companion。JSON `?q=` 仍由原生 jq 处理，不需要模型。Eval `tool.read` 使用同一桥接路径。
+
 后台执行按归属划分，而不是按工具名划分：
 
 - `bash async:true` 在本机当前 session 的 OMP job manager 中创建 job；原生 `wait` 和 job 的 `proc://` 查询、取消留在本机，命令在远端执行。独立根 session 不共用 manager；子代理使用各自 session family 的 manager。
@@ -45,6 +47,8 @@ OMP 18.12.3 审批保留本机原生文件／目录授权。远端使用哈希�
 远端 Bash 的 `> out://`，以及前台 Eval 内的 `tool.write({path:"out://", ...})`／`tool.bash` 回复，使用原生 transcript 回复通道。连接时读取宿主的有效回复权限，包含显式 `out.enabled` 和原生 session 的实际 TUI 能力；子代理仍被拒绝。回复通过原生 `details.replies` 传输，不写入远端文件系统。`local://`、`skill://` 等其他本机资源不桥接到远端执行环境。远端 runtime 未提供的 extension／MCP 工具仍在本机执行，不作一刀切拦截。
 
 连接期间明确拒绝用户直接 shell（`!`/`!!`）和 Python 快捷入口，避免静默执行本机命令；请使用远端 `bash`/`eval`，或退出连接后使用本机快捷入口。未适配的 `find`、`security_scan`、`ida`（包括 xdev 入口）仍明确拒绝。原生 `checkpoint`、`rewind` 留在本机并允许使用：只修改对话历史，不回滚远端项目文件或内核状态。远端 eval 只支持计算和远端工作区工具回调，不桥接本机 agent/workpool、judge/completion、archive、browser、todo；固定工作区说明解释此边界，本机编排请用顶层工具。
+
+选中远端 runtime 时，原生 input hook 会拒绝 `/git`、`/security`、`/wt`（含 `/worktree`）、`/move`、`/add-dir`、`/remove-dir`、`/review`、`/annotate`、带原生 `--until` 或 `--while` shell 条件（含 `=` 写法）的 `/loop`，以及原生 `@path` 文件引用，因为这些入口会使用本机工作区或 shell。内置命令的冒号语法，以及启用 `input.bareSlashCommands` 后的裸命令词也在防护范围内。请改用远端 `bash`／`read`，文件路径去掉 `@`；不带 shell 条件的 `/loop` 仍可使用。此防护覆盖会发出原生 input 事件的 TUI 和 RPC 提交，不覆盖启动参数、print 模式或子代理 prompt，并非完整的本机执行隔离边界。
 
 GitHub 仅保留明确的 API 查询操作；非搜索查询必须显式给出 `repo`，不从本机目录推断仓库。`pr_create`、`pr_checkout`、`pr_push` 和未知操作在远端模式下拒绝。
 
@@ -97,7 +101,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 链接后重启 OMP。更新时重新构建 extension 和双架构 worker。停用、暂停或 reload 插件前，必须先执行 `/remote-exit`。OMP 18.12.6 的动态暂停不发送 shutdown，也没有暂停前回调；连接中直接暂停会恢复本机工具但可能保留旧 worker，插件无法在自己的 hook 一起被暂停后保证拦截或清理。
 
-当前 companion 基于 OMP 18.15.0 构建，runtime contract 为 0.15.0。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。
+当前 companion 基于 OMP 18.15.0 构建，runtime contract 为 0.16.0。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。
 
 上传显式使用 `scp -O`（SCP 协议），与远端目标路径的 shell 转义保持一致；OpenSSH 9+ 默认的 SFTP 会把这些引号当作文件名字符。本机 SCP 客户端须支持 `-O`。
 
