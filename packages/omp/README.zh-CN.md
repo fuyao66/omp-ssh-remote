@@ -286,7 +286,7 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 - 不支持远端到本机 artifact bridge；
 - 白名单之外的 settings 在 companion 中保持编译默认值，不提供任意 settings 透传；
 - 每个 session 或子代理各占一个 companion 进程；并发子代理各消耗一条 SSH 通道和一个 worker 进程；
-- 连接时会停放当前 session 的空闲子代理；再次发消息时会重建其 session 并绑定远端。进程内上一 session 遗留的存活代理仍可被显式代理消息唤醒，随后在本机运行。尚无 transcript 的子代理若父链指向当前 session 或其 owner id，则保守地视为运行中，因为初始化阶段共享的 Main id 无法区分所属 session。
+- 连接时会停放当前 session 的空闲子代理；再次发消息时会重建其 session 并绑定远端。连接沿用空闲 TTL 的原生检查与停放顺序（先检查 `ircWakesPending`，再调用 `AgentLifecycleManager.park`），因此连接瞬间投递已通过原生活性准入检查的消息可能丢失，与原生 TTL 停放存在相同的竞态窗口。进程内上一 session 遗留的存活代理仍可被显式代理消息唤醒，随后在本机运行。尚无 transcript 的子代理若父链指向当前 session 或其 owner id，则保守地视为运行中，因为初始化阶段共享的 Main id 无法区分所属 session。
 - 单个输出 frame 不能超过 16 MiB；
 - 宿主 Git 状态／overlay 和状态栏 Git 信息描述本机仓库，而非绑定的远端工作区；
 - 计划自动保存（`plan.autosave`）写入本机 `.omp/plans/`；

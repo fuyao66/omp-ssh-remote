@@ -453,6 +453,15 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     coveredBy: [{ path: "test/lifecycle-transactions.test.ts" }],
   },
   {
+    id: "native-warm-subagent-revival",
+    plugin: ["src/extension.ts"],
+    native: ["task/executor.ts", "registry/agent-lifecycle.ts", "irc/bus.ts", "sdk.ts", "modes/runtime-init.ts"],
+    assumption: "The executor adopts its actual warm reviver; IRC ensureLive reopens the transcript, rebuilds against expectedAgentRef, and initializes extensions before delivery. Its log-only initialization error reporter does not reject revival when owner exit revokes the unpublished remote worker.",
+    coveredBy: [
+      { path: "test/lifecycle-transactions.test.ts", name: "native IRC revival reattaches exactly once and contains owner-exit races" },
+    ],
+  },
+  {
     id: "autoresearch-tool-availability",
     plugin: ["src/extension.ts", "src/omp/input-policy.ts"],
     native: ["autoresearch/index.ts", "autoresearch/tools/run-experiment.ts"],

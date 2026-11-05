@@ -12,7 +12,7 @@ import { AgentRegistry, type AgentRef } from "@oh-my-pi/pi-coding-agent/registry
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { Database } from "bun:sqlite";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { Agent, ProxyMessageEventStream } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
@@ -20,7 +20,7 @@ import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-in
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { finalizeSubagentLifecycle } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { finalizeSubagentLifecycle, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { createNativeWorkerRuntime } from "../src/runtime.ts";
@@ -96,6 +96,7 @@ type Harness = {
 };
 const harnesses: Harness[] = [];
 const nativeSessions: { session: AgentSession; auth: AuthStorage; id: string }[] = [];
+const nativeProviderCleanups: (() => void)[] = [];
 
 /** Real native disposal and runner; the harness supplies the extension's registered handlers. */
 async function nativeChild(child: Harness) {
@@ -133,8 +134,7 @@ async function nativeChild(child: Harness) {
   return { session, ref, shutdowns: () => shutdowns, shutdown: shutdown.promise };
 }
 
-/** Model-free native session reconstruction with the real remote extension. */
-async function nativeRemoteChild(manager: SessionManager, id: string, parentId: string, expected?: AgentRef) {
+async function ensureNativeToolManifests() {
   if (!nativeToolManifests) {
     const native = await createNativeWorkerRuntime(directory);
     try {
@@ -144,43 +144,66 @@ async function nativeRemoteChild(manager: SessionManager, id: string, parentId: 
       });
     } finally { await native.dispose(); }
   }
-  const settings = Settings.isolated();
+}
+
+/** The exported executor installs its private warm reviver; only its transport is a local no-op. */
+async function nativeExecutorChild(owner: Harness, family: Family, id: string) {
+  await ensureNativeToolManifests();
+  const settings = Settings.isolated({
+    "task.agentIdleTtlMs": 0, "task.softRequestBudget": 0, "task.completionProbe": false,
+  });
   const auth = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
   const modelRegistry = new ModelRegistry(auth, undefined, { settings, ignoreLocalModelConfig: true,
     fetch: async () => { throw new Error("Unexpected model registry network request"); } });
-  const runtime = new ExtensionRuntime();
-  const loaded = await loadExtensionFromFactory(extension, directory, new EventBus(), runtime);
-  const runner = new ExtensionRunner([loaded], runtime, directory, manager, modelRegistry,
-    undefined, settings, undefined, undefined, { kind: "sub", id, name: id, depth: 1, parentId });
-  const errors: string[] = [];
-  runner.onError(error => { errors.push(error.error); });
-  const session = new AgentSession({
-    agent: new Agent({ initialState: { model: modelRegistry.getAll()[0], systemPrompt: [], tools: [],
-      messages: manager.buildSessionContext().messages } }),
-    sessionManager: manager, settings, modelRegistry, extensionRunner: runner,
-    agentId: id, agentKind: "sub", memoryEnabled: false,
+  const provider = "fixture-native-revival", model = "fixture-model";
+  let requests = 0;
+  modelRegistry.registerProvider(provider, {
+    api: provider, apiKey: "fixture", baseUrl: "https://fixture.invalid",
+    models: [{ id: model, name: model, reasoning: false, input: ["text"], supportsTools: true,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 1024 }],
+    streamSimple: () => {
+      requests++;
+      const stream = new ProxyMessageEventStream();
+      stream.push({ type: "done", reason: "stop", message: {
+        role: "assistant", content: [{ type: "text", text: "Fixture ready." }],
+        api: provider, provider, model, stopReason: "stop", timestamp: Date.now(),
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      } });
+      stream.end();
+      return stream;
+    },
   });
-  nativeSessions.push({ session, auth, id });
-  // Hold only the rebuilt session: delivery still traverses native IrcBus and
-  // ensureLive, but a deferred peer message cannot initiate a provider request.
-  if (expected) session.holdIrcWakes();
-  const registry = AgentRegistry.global(), file = manager.getSessionFile()!;
-  const ref = expected ?? registry.register({
-    id, displayName: id, kind: "sub", parentId, session, sessionFile: file, status: "running",
+  nativeProviderCleanups.push(() => modelRegistry.unregisterProvider(provider));
+  const sessions: { session: AgentSession; ref: AgentRef; errors: string[] }[] = [];
+  const result = await runSubprocess({
+    cwd: directory, id, index: 0, parentAgentId: owner.context.agent.id,
+    agent: { name: id, description: "Native warm revival fixture", systemPrompt: "Reply with Fixture ready.",
+      source: "project", tools: ["read", "write", "bash"] },
+    task: "Persisted native revival fixture.", description: "Native warm revival fixture",
+    structured: false, keepAlive: true, artifactsDir: `${family.root}/subagent`,
+    modelOverride: `${provider}/${model}`, modelRegistry, authStorage: auth, settings,
+    enableLsp: false, enableMCP: false, noContextFiles: true, skills: [], promptTemplates: [], rules: [],
+    preloadedCustomToolPaths: [],
+    preloadedPreparedExtensions: [
+      { path: "<revival-observer>", resolvedPath: "<revival-observer>", error: null, factory: pi => {
+        pi.on("session_start", () => {
+          const ref = AgentRegistry.global().get(id)!, session = ref.session!;
+          // Hold delivery after native ensureLive without replacing the executor's reviver.
+          session.holdIrcWakes();
+          const errors: string[] = [];
+          session.extensionRunner!.onError(error => { errors.push(error.error); });
+          sessions.push({ session, ref, errors });
+          nativeSessions.push({ session, auth, id });
+        });
+      } },
+      { path: "<remote-extension>", resolvedPath: "<remote-extension>", error: null, factory: extension },
+    ],
   });
-  if (expected && !registry.attachSession(id, session, file, expected)) {
-    throw new Error("Revival lost native ref ownership");
-  }
-  if (expected) registry.setStatus(id, "running", expected);
-  try {
-    await initializeExtensions(session, {
-      reportSendError: (_action, error) => { throw error; }, reportRuntimeError: error => { throw new Error(error.error); },
-    });
-  } catch (error) {
-    await session.dispose();
-    throw error;
-  }
-  return { session, ref, errors };
+  expect(result.exitCode, result.error ?? result.stderr).toBe(0);
+  expect(requests).toBe(1);
+  expect(sessions).toHaveLength(1);
+  return { sessions, requests: () => requests };
 }
 const settle = (promise: Promise<unknown>): Promise<Error | null> => promise.then(() => null, (error: Error) => error);
 async function harness(sessionFile = join(directory, "owner.jsonl"), agent: ExtensionContext["agent"] = { kind: "main", id: `owner-${crypto.randomUUID()}`, name: "owner", depth: 0 }): Promise<Harness> {
@@ -225,11 +248,14 @@ async function releaseAdmission() {
 }
 beforeEach(async () => { directory = await mkdtemp("/tmp/omp-lifecycle-"); });
 afterEach(async () => {
+  const authStores = new Set<AuthStorage>();
   for (const { session, auth, id } of nativeSessions.splice(0)) {
     await session.dispose();
     AgentRegistry.global().unregister(id);
-    auth.close();
+    authStores.add(auth);
   }
+  for (const cleanup of nativeProviderCleanups.splice(0)) cleanup();
+  for (const auth of authStores) auth.close();
   discovery?.release(); preparation?.release(); commit?.release(); await releaseAdmission();
   for (const client of clients) client.kill();
   await Promise.all(clients.map(client => client.waitForExit()));
@@ -730,32 +756,15 @@ test("a native task session named advisor retains its remote workspace wrappers"
 
 test.each([false, true])("native IRC revival reattaches exactly once and contains owner-exit races: %s", async exitDuringRevival => {
   const { owner, family } = await connected();
-  const manager = SessionManager.create(directory, `${family.root}/subagent`);
-  manager.appendMessage({ role: "user", content: "Persisted native revival fixture.", timestamp: Date.now() });
-  // Native persistence keeps a user-only session ephemeral until its first reply.
-  manager.appendMessage({
-    role: "assistant", content: [{ type: "text", text: "Fixture ready." }],
-    api: "anthropic-messages", provider: "anthropic", model: "fixture-model", stopReason: "stop",
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-    timestamp: Date.now(),
-  });
-  await manager.flush();
-  const file = manager.getSessionFile()!, id = "native-revival-child";
-  const initial = await nativeRemoteChild(manager, id, owner.context.agent.id);
+  const id = "native-revival-child";
+  const executor = await nativeExecutorChild(owner, family, id);
+  const initial = executor.sessions[0]!, file = initial.session.sessionManager.getSessionFile()!;
   expect(initial.errors).toEqual([]);
+  const initialUserMessages = initial.session.agent.state.messages.filter(message => message.role === "user");
+  expect(JSON.stringify(initialUserMessages)).toContain("Persisted native revival fixture.");
   const oldState = [...family.members].find(member => member.sessionFile === file)!;
   const oldWorker = oldState.client!;
-  let rebuilt: Awaited<ReturnType<typeof nativeRemoteChild>> | undefined;
   const lifecycle = AgentLifecycleManager.global();
-  AgentRegistry.global().setStatus(id, "idle");
-  lifecycle.adopt(id, { idleTtlMs: 0, revive: async expected => {
-    const reopened = await SessionManager.open(expected.sessionFile!, undefined, undefined, {
-      suppressBreadcrumb: true, throwIfMissing: true,
-    });
-    rebuilt = await nativeRemoteChild(reopened, id, owner.context.agent.id, expected);
-    return rebuilt.session;
-  } });
   await lifecycle.park(id);
   await oldWorker.waitForExit();
   expect(oldWorker.isClosed).toBe(true);
@@ -775,29 +784,43 @@ test.each([false, true])("native IRC revival reattaches exactly once and contain
     await releaseAdmission();
   }
   const receipt = await sending;
+  expect(executor.sessions).toHaveLength(2);
+  expect(executor.requests()).toBe(1);
+  const rebuilt = executor.sessions[1]!;
   expect(clients.length).toBe(workerCount + 1);
   if (exitDuringRevival) {
-    expect(receipt.outcome).toBe("failed");
-    expect(receipt.error).toMatch(/cancel|abort|disconnect|closed/i);
+    // The real executor logs session_start errors instead of rejecting revival
+    // (SDK 18.16.0 task/executor.ts:4235-4239); worker revocation is independent.
+    expect(receipt.outcome).toBe("revived");
+    expect(rebuilt.errors.join("\n")).toMatch(/cancel|abort|disconnect|closed/i);
     await lateWorker!.waitForExit();
     expect(lateWorker!.isClosed).toBe(true);
-    expect(nativeSessions.at(-1)!.session.isDisposed).toBe(true);
+    expect(rebuilt.session.isDisposed).toBe(false);
+    const marker = join(directory, "revived-local-fallback");
+    const status = await rebuilt.session.getToolByName("remote_workspace_status")!.execute("revived-status", {});
+    const failure = await settle(rebuilt.session.getToolByName("bash")!.execute(
+      "revoked-revival-bash", { command: `printf unsafe > ${JSON.stringify(marker)}` },
+    ));
+    expect(await Bun.file(marker).exists()).toBe(false);
+    expect(status).toMatchObject({ details: { mode: "unavailable" } });
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure!.message).toMatch(/disconnect|unavailable|closed|revoked/i);
+    await rebuilt.session.dispose();
+    expect(rebuilt.session.isDisposed).toBe(true);
     expect(family.members.size).toBe(0);
     expect(family.closing).toBe(true);
     expect(broker.hasOwner(owner.sessionFile)).toBe(false);
     return;
   }
   expect(receipt, JSON.stringify(receipt)).toMatchObject({ outcome: "revived" });
-  expect(rebuilt).toBeDefined();
-  expect(rebuilt!.session).not.toBe(initial.session);
-  expect(rebuilt!.session.sessionManager.getSessionFile()).toBe(file);
-  expect(rebuilt!.session.agent.state.messages.some(message =>
-    message.role === "user" && message.content === "Persisted native revival fixture.")).toBe(true);
-  expect(rebuilt!.session.hasQueuedIrcFrom("fixture-peer")).toBe(true);
+  expect(rebuilt.session).not.toBe(initial.session);
+  expect(rebuilt.session.sessionManager.getSessionFile()).toBe(file);
+  expect(rebuilt.session.agent.state.messages.filter(message => message.role === "user")).toEqual(initialUserMessages);
+  expect(rebuilt.session.hasQueuedIrcFrom("fixture-peer")).toBe(true);
   const revivedStates = [...family.members].filter(member => member.sessionFile === file);
   expect(revivedStates).toHaveLength(1);
   const revived = revivedStates[0]!;
-  expect(rebuilt!.errors).toEqual([]);
+  expect(rebuilt.errors).toEqual([]);
   expect(revived.client).toBe(clients.at(-1));
   expect(revived.client!.isClosed).toBe(false);
   expect(revived.family).toBe(family);
@@ -805,6 +828,6 @@ test.each([false, true])("native IRC revival reattaches exactly once and contain
   await owner.execute("remote_exit", { force: true });
   await clients.at(-1)!.waitForExit();
   expect(clients.at(-1)!.isClosed).toBe(true);
-  await rebuilt!.session.dispose();
+  await rebuilt.session.dispose();
   expect(family.members.size).toBe(0);
 });
