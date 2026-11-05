@@ -68,7 +68,7 @@ flowchart LR
 
 ## 环境要求
 
-- 本机 Linux 或 WSL，OMP `>=18.15.0`，并安装 Bun `1.4.4+`、npm、tar、OpenSSH 和 SCP；
+- 本机 Linux 或 WSL，OMP `>=18.16.0`，并安装 Bun `1.4.4+`、npm、tar、OpenSSH 和 SCP；
 - 远端为 glibc Linux `x86_64` 或 `aarch64`；
 - 公钥 SSH 可在 batch mode 下登录；
 - 远端项目目录已存在；
@@ -99,7 +99,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 链接后重启 OMP。更新时重新构建 extension 和双架构 worker。停用、暂停或 reload 插件前，必须先执行 `/remote-exit`。OMP 18.12.6 的动态暂停不发送 shutdown，也没有暂停前回调；连接中直接暂停会恢复本机工具但可能保留旧 worker，插件无法在自己的 hook 一起被暂停后保证拦截或清理。
 
-当前 companion 基于 OMP 18.15.0 构建，runtime contract 为 0.15.0。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。
+当前 companion 基于 OMP 18.16.0 构建，runtime contract 为 0.15.0。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。
 
 上传显式使用 `scp -O`（SCP 协议），与远端目标路径的 shell 转义保持一致；OpenSSH 9+ 默认的 SFTP 会把这些引号当作文件名字符。本机 SCP 客户端须支持 `-O`。
 
@@ -160,7 +160,7 @@ bun run build:worker:all
 
 后续连接完整校验并复用，不重复上传。原型每次复用仍计算本机 archive 和远端全部文件哈希，有额外 I/O，不宣称 sidecar 快速路径。Pack **暂不自动 GC**，不参与 worker 的“两代”回收。损坏最终目录只拒绝，不覆盖、不递归删除；需要修复时停止使用者后由操作者仅处理报错的具体目录。
 
-原生 LSP 的项目标记、惰性启动、定义／引用、编辑诊断与 reload 保持不变。项目本地／PATH server 优先；仅原生默认 Pyright 缺失时补充私有 launcher。显式 Pyright `command`、`disabled`、fileTypes／rootMarkers 不覆盖；显式选择的其他 Python 语义 server 即使命令缺失也不额外补 Pyright，已安装 basedpyright／pylsp／其他 Python 语义 server 同样优先，Ruff 单独存在不阻止补充。仅修改 Pyright settings 可使用 fallback。Worker 构建对 SDK **18.15.0** 的 config loader 做小范围编译期适配，版本或源码锚点变化即构建失败；不编辑安装的 OMP 源码、不 monkeypatch 运行时导出。
+原生 LSP 的项目标记、惰性启动、定义／引用、编辑诊断与 reload 保持不变。项目本地／PATH server 优先；仅原生默认 Pyright 缺失时补充私有 launcher。显式 Pyright `command`、`disabled`、fileTypes／rootMarkers 不覆盖；显式选择的其他 Python 语义 server 即使命令缺失也不额外补 Pyright，已安装 basedpyright／pylsp／其他 Python 语义 server 同样优先，Ruff 单独存在不阻止补充。仅修改 Pyright settings 可使用 fallback。Worker 构建对 SDK **18.16.0** 的 config loader 做小范围编译期适配，版本或源码锚点变化即构建失败；不编辑安装的 OMP 源码、不 monkeypatch 运行时导出。
 
 分析环境由远端已有 `pyrightconfig.json`／`pyproject.toml` 决定。需要显式指定远端解释器时，可自行在项目原生 `lsp.json` 中配置 settings，不设置 `command`：
 
@@ -194,7 +194,7 @@ bun scripts/prepare-typescript-lsp.ts arm64  # 或 x64
 
 写入／编辑的迟到诊断通过宿主原生 yield queue 交付，严格绑定所属会话和连接。保留原生去重，消费时根据版本拒绝过期结果。修改类工具串行执行至实际操作完成，并以文件内容修订覆盖原生 LSP／AST 未更新 mutation counter 的情况。取消仍会协作传递，但须等进行中的原生修改实际完成，才释放诊断交付屏障。
 
-Worker 构建仅对 SDK 18.15.0 做严格锚点匹配的配置后备与修改完成适配，同时修正原生单文件／批量 writethrough 的完成判定：只承载格式化状态、尚未验证的诊断占位结果不能取消迟到诊断等待；已验证的行内正常／错误结果仍按原生方式完成。源码漂移即构建失败，不修改已安装的宿主 SDK。
+Worker 构建仅对 SDK 18.16.0 做严格锚点匹配的配置后备与修改完成适配，同时修正原生单文件／批量 writethrough 的完成判定：只承载格式化状态、尚未验证的诊断占位结果不能取消迟到诊断等待；已验证的行内正常／错误结果仍按原生方式完成。源码漂移即构建失败，不修改已安装的宿主 SDK。
 
 ## 可选私有 C/C++ LSP Pack
 
@@ -276,16 +276,17 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 ## 限制
 
 - 仅支持 Linux glibc x86_64 和 ARM64；
-- OMP `>=18.15.0`，且 companion schema 匹配；
+- OMP `>=18.16.0`，且 companion schema 匹配；
 - 远端须有 util-linux 的 `flock`，用于保护活跃 worker 可执行文件；
 - 支持显式 async Bash 和符合条件的自动后台化，不桥接交互 Bash PTY；
 - 不支持远端图像问答（`?q=`）；请直接读取图像，将像素交给模型；
 - `tools.restrictedFolders` 适用于原生本机资源，尚未实现远端文件系统的目录限制审批；
-- 保留原生宿主审批及 enabled-tool 门控，但 SDK 18.15.0 的公开 AgentSession API 不暴露有效 `ToolSession.lspReadOnly`／`deviceOnlyWrite` 策略，无法镜像这些字段的显式会话级覆盖；不要将此版本当作只读沙箱。AgentRef 的只读历史元数据不是执行策略。
+- 保留原生宿主审批及 enabled-tool 门控，但 SDK 18.16.0 的公开 AgentSession API 不暴露有效 `ToolSession.lspReadOnly`／`deviceOnlyWrite` 策略，无法镜像这些字段的显式会话级覆盖；不要将此版本当作只读沙箱。AgentRef 的只读历史元数据不是执行策略。
 - 不支持 `task isolated:true` 远端 worktree；
 - 不支持远端到本机 artifact bridge；
 - 白名单之外的 settings 在 companion 中保持编译默认值，不提供任意 settings 透传；
 - 每个 session 或子代理各占一个 companion 进程；并发子代理各消耗一条 SSH 通道和一个 worker 进程；
+- 连接时会停放当前 session 的空闲子代理；再次发消息时会重建其 session 并绑定远端。进程内上一 session 遗留的存活代理仍可被显式代理消息唤醒，随后在本机运行。尚无 transcript 的子代理若父链指向当前 session 或其 owner id，则保守地视为运行中，因为初始化阶段共享的 Main id 无法区分所属 session。
 - 单个输出 frame 不能超过 16 MiB；
 - 宿主 Git 状态／overlay 和状态栏 Git 信息描述本机仓库，而非绑定的远端工作区；
 - 计划自动保存（`plan.autosave`）写入本机 `.omp/plans/`；

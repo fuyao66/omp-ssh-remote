@@ -28,7 +28,7 @@ test("missing edit metadata uses the effective host edit mode", async () => {
     const handshake = await withActiveSettings(settings, () => captureOmpHandshake(pi, state));
     expect(handshake.editMode).toBe("replace");
     expect(() => handshake.validateReady({
-      type: "ready", protocolVersion: PROTOCOL_VERSION, host: "omp", hostVersion: "18.15.0",
+      type: "ready", protocolVersion: PROTOCOL_VERSION, host: "omp", hostVersion: "18.16.0",
       runtimeVersion: TOOL_RUNTIME_VERSION, editMode: "replace", cwd,
       tools: Object.values(runtime.tools).map(tool => ({ ...captureOmpToolSnapshot(tool), description: tool.description })),
     })).not.toThrow();

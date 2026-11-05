@@ -123,17 +123,20 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "artifact-output-publication",
     plugin: ["src/omp/artifacts.ts"],
-    native: ["tools/output-meta.ts", "tools/bash.ts", "../../pi-tui/src/tools/output-meta.ts"],
-    assumption: "Native truncated Bash results expose artifact IDs and generated output references that can be republished as bound remote references.",
-    coveredBy: [{ path: "test/worker.test.ts", name: "truncated bash output is recoverable through remote artifact selectors" }],
+    native: ["tools/output-meta.ts", "tools/bash.ts", "exec/bash-executor.ts", "../../pi-tui/src/tools/output-meta.ts", "../../pi-tui/src/tools/bash.ts"],
+    assumption: "Native truncated and minimized Bash results expose artifact IDs and generated raw-output references that can be republished as bound remote references; the renderer retains the remote recovery target.",
+    coveredBy: [
+      { path: "test/worker.test.ts", name: "truncated bash output is recoverable through remote artifact selectors" },
+      { path: "test/worker.test.ts", name: "minimized bash metadata and rendered output recover the same bound remote artifact" },
+    ],
   },
   {
     id: "artifact-output-shapes",
     plugin: ["src/omp/artifacts.ts"],
-    native: ["tools/output-meta.ts", "edit/index.ts", "../../pi-tui/src/tools/output-meta.ts"],
-    assumption: "Native OutputMeta slots, Edit per-file results, sampled-output selectors and exact generated footers remain the structures recognized by remote artifact publication.",
+    native: ["tools/output-meta.ts", "edit/index.ts", "../../pi-tui/src/tools/output-meta.ts", "../../pi-tui/src/tools/bash.ts"],
+    assumption: "Native OutputMeta slots (including minimized raw captures), Edit per-file results, sampled-output selectors and exact generated footers remain the structures recognized by remote artifact publication.",
     coveredBy: [],
-    gap: "Exhaustive publication tests construct synthetic metadata rather than native Edit, sampling and footer producers.",
+    gap: "Native Bash minimization and rendering are covered; exhaustive Edit, sampling and footer publication tests still construct synthetic metadata instead of exercising every native producer.",
   },
   {
     id: "process-uri-identity",
@@ -445,9 +448,9 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "live-descendant-registry",
     plugin: ["src/extension.ts"],
-    native: ["registry/agent-registry.ts", "task/executor.ts"],
-    assumption: "AgentRef parentId preserves runtime ancestry, including parked intermediates; a non-null session remains live even after its task status becomes idle.",
-    coveredBy: [{ path: "test/lifecycle-transactions.test.ts", name: "connect refuses %s descendants including live grandchildren" }],
+    native: ["registry/agent-registry.ts", "registry/agent-lifecycle.ts", "registry/persisted-agents.ts", "task/executor.ts"],
+    assumption: "AgentRef ancestry includes parked intermediates; persisted session paths scope descendants to the selected transcript root, and native lifecycle parking cancels pending attachment and disposes attached sessions before connect publishes.",
+    coveredBy: [{ path: "test/lifecycle-transactions.test.ts" }],
   },
   {
     id: "autoresearch-tool-availability",

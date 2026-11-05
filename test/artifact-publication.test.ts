@@ -282,6 +282,29 @@ describe("remote artifact publication", () => {
     }
   });
 
+  test("publishes minimized raw captures without changing application metadata or duplicating Bash footers", async () => {
+    const artifacts = await createArtifacts();
+    const uri = `remote-artifact://${artifacts.namespace}/93`;
+    const minimized = { filter: "cat", inputBytes: 4096, outputBytes: 256, artifactId: "93" };
+    const input = {
+      ...textResult({ minimized }),
+      details: { meta: { minimized }, application: { meta: { minimized } } },
+    };
+    const original = structuredClone(input);
+    const published = artifacts.publish(input, "bash") as typeof input;
+    expect(published.details.meta.minimized).toEqual({ ...minimized, artifactId: uri });
+    expect(published.details.application).toBe(input.details.application);
+    expect(textContent(published)).toEqual(["application output", `Read ${uri} for full output`]);
+    expect(input).toEqual(original);
+    expect(artifacts.publish(published, "bash")).toEqual(published);
+    const footer = artifacts.publish(textResult({ minimized }, "summary\n[raw output: artifact://93]"), "bash") as TextResult;
+    expect(textContent(footer)).toEqual([`summary\n[raw output: ${uri}]`]);
+    for (const artifactId of [uri, "not-native", "artifact://93"]) {
+      const result = textResult({ minimized: { ...minimized, artifactId } });
+      expect(artifacts.publish(result, "bash")).toEqual(result);
+    }
+  });
+
   test("Bash raw footers retain head/tail-sample warnings from either owned metadata slot", async () => {
     const artifacts = await createArtifacts();
     const id = "92";

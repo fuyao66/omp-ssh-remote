@@ -68,7 +68,7 @@ flowchart LR
 
 ## Requirements
 
-- local Linux or WSL with OMP `>=18.15.0`, Bun `1.4.4+`, npm, tar, OpenSSH, and SCP;
+- local Linux or WSL with OMP `>=18.16.0`, Bun `1.4.4+`, npm, tar, OpenSSH, and SCP;
 - remote glibc Linux `x86_64` or `aarch64`;
 - public-key SSH that succeeds in batch mode;
 - an existing remote project directory;
@@ -99,7 +99,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 Restart OMP after linking. Rebuild the extension and both workers when updating. Run `/remote-exit` before disabling, suspending, or reloading the extension. OMP 18.12.6 dynamic suspension neither sends shutdown nor offers a before-suspend hook: suspending a connected extension restores native local tools but may retain its old worker. A plugin cannot guarantee interception or cleanup after its own hooks have been suspended.
 
-The companion is built against OMP 18.15.0 (runtime contract 0.15.0). Build identity comes from the installed source and native dependencies, never an OMP executable on PATH. Rebuild both workers when updating runtime dependencies or capture behavior, even if schemas are unchanged. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Admission reports version, edit-language, and schema drift.
+The companion is built against OMP 18.16.0 (runtime contract 0.15.0). Build identity comes from the installed source and native dependencies, never an OMP executable on PATH. Rebuild both workers when updating runtime dependencies or capture behavior, even if schemas are unchanged. Native addons are embedded as per-file zstd payloads and extracted on first use; build caches are partitioned by architecture and version. Admission reports version, edit-language, and schema drift.
 
 Uploads explicitly use `scp -O` (the SCP protocol), because remote destination paths are shell-quoted; the SFTP default in OpenSSH 9+ would treat those quotes as literal filename characters. The local SCP client must support `-O`.
 
@@ -162,7 +162,7 @@ The first connection transfers the compressed archive over the existing strict S
 
 Later connections verify and reuse the complete cache without upload. Full file hashing on reuse is intentional in this prototype and adds local/remote I/O; it is not a sidecar-only fast path. Packs have **no automatic GC** and are independent of the two-worker retention window. Invalid existing final directories are refused, not overwritten or recursively removed; remove only the specifically diagnosed pack directory yourself after stopping its users if repair is needed.
 
-Native LSP discovery, root markers, lazy startup, diagnostics-on-edit and reload remain native. Project-local/PATH servers win; the private launcher is used only for missing default Pyright. Explicit Pyright `command`, `disabled`, file-type or root-marker configuration is not replaced. A configured semantic alternative (even missing) or an installed basedpyright/pylsp/other Python semantic server suppresses the extra Pyright; Ruff alone does not. Settings-only Pyright configuration can use the fallback. The worker build narrowly adapts SDK **18.15.0** configuration loading after native resolution; mismatched version/source anchors fail the build. Installed OMP source is never edited and native runtime exports are not monkeypatched.
+Native LSP discovery, root markers, lazy startup, diagnostics-on-edit and reload remain native. Project-local/PATH servers win; the private launcher is used only for missing default Pyright. Explicit Pyright `command`, `disabled`, file-type or root-marker configuration is not replaced. A configured semantic alternative (even missing) or an installed basedpyright/pylsp/other Python semantic server suppresses the extra Pyright; Ruff alone does not. Settings-only Pyright configuration can use the fallback. The worker build narrowly adapts SDK **18.16.0** configuration loading after native resolution; mismatched version/source anchors fail the build. Installed OMP source is never edited and native runtime exports are not monkeypatched.
 
 Use existing remote `pyrightconfig.json` / `pyproject.toml` for analysis paths and environments. If an explicit remote interpreter is needed, use native project `lsp.json` settings without a `command` override:
 
@@ -196,7 +196,7 @@ The private TLS fallback defaults `initOptions.disableAutomaticTypingAcquisition
 
 Late write/edit diagnostics return to the owning host session's native yield queue, scoped to the exact session and connection binding. Native deduplication is retained; consumption-time version checks reject obsolete results. Mutating tool requests serialize until actual operation settlement, with per-file content revisions covering LSP/AST changes that omit native mutation counters. Cancellation remains cooperative but waits for an in-flight native mutation to settle before releasing that delivery barrier.
 
-Worker builds apply narrowly guarded SDK 18.15.0 adaptations for configuration fallback and mutation settlement. They also correct native single/batch writethrough finalization: a formatter-only, unverified diagnostic placeholder must not cancel a pending late diagnostic fetch. Verified inline clean/error results retain native finalization. Source drift fails the build; the installed host SDK is not modified.
+Worker builds apply narrowly guarded SDK 18.16.0 adaptations for configuration fallback and mutation settlement. They also correct native single/batch writethrough finalization: a formatter-only, unverified diagnostic placeholder must not cancel a pending late diagnostic fetch. Verified inline clean/error results retain native finalization. Source drift fails the build; the installed host SDK is not modified.
 
 ## Optional Private C/C++ LSP Pack
 
@@ -299,7 +299,7 @@ One plugin upgrade/reload can change the initial prefix. Model/configuration cha
 ## Limits
 
 - Linux glibc x86_64 and ARM64 only;
-- OMP `>=18.15.0` with matching compiled companion schemas;
+- OMP `>=18.16.0` with matching compiled companion schemas;
 - remote `flock` (util-linux) is required: workers hold shared per-version leases so cache pruning cannot delete a live worker's self-reentry executable;
 - explicit async Bash and eligible automatic backgrounding are supported; interactive Bash PTY is not bridged;
 - remote image questions (`?q=`) are not supported; read the image directly to give the model its pixels;
@@ -307,8 +307,9 @@ One plugin upgrade/reload can change the initial prefix. Model/configuration cha
 - no remote-to-local artifact bridge;
 - settings outside the forwarded allowlist keep the companion's compiled defaults; there is no arbitrary settings passthrough;
 - `tools.restrictedFolders` applies to native local resources; remote filesystem restriction prompts are not implemented;
-- Native host approval and enabled-tool gating are retained, but SDK 18.15.0 has no public AgentSession API for effective `ToolSession.lspReadOnly` / `deviceOnlyWrite` policy. Remote execution cannot mirror explicit per-session overrides of those fields; do not use this release as a read-only sandbox. AgentRef read-only history metadata is not the execution policy.
+- Native host approval and enabled-tool gating are retained, but SDK 18.16.0 has no public AgentSession API for effective `ToolSession.lspReadOnly` / `deviceOnlyWrite` policy. Remote execution cannot mirror explicit per-session overrides of those fields; do not use this release as a read-only sandbox. AgentRef read-only history metadata is not the execution policy.
 - one companion process per session or subagent; concurrent children each cost an SSH channel and a worker process;
+- Connect parks this session's idle subagents; messaging them revives their sessions with remote workspace tools. Live agents left from a previous session in the same process can still be woken by explicit agent messaging and then run locally. Children without a transcript are conservatively treated as running when their parent chain reaches this session or its owner id, since the shared Main id cannot distinguish roots during initialization.
 - no output frame above 16 MiB;
 - host Git status/overlay and status-line Git information describe the local repository, not the bound remote workspace;
 - plan autosave (`plan.autosave`) writes to local `.omp/plans/`;

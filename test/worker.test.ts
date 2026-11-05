@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { watch } from "node:fs";
@@ -10,6 +10,8 @@ import { daemonClientForProject } from "@oh-my-pi/pi-coding-agent/launch/client"
 import { startRemoteService } from "../src/omp/service-jobs.ts";
 import { executeOwnedRemoteService } from "../src/omp/service-lifecycle.ts";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
+import { bashToolRenderer, type BashToolDetails } from "@oh-my-pi/pi-tui/tools/bash";
 import { PROTOCOL_VERSION, TOOL_RUNTIME_VERSION, encodeMessage, decodeFrames } from "../src/protocol.ts";
 
 test("worker bootstrap isolates native re-entry imports and installs signal ownership first", async () => {
@@ -74,6 +76,36 @@ describe("native worker round trip", () => {
     const artifact = recovered as AgentToolResult<{ rowPrefixes: boolean }>;
     expect(artifact.content.filter(part => part.type === "text").map(part => part.text).join("\n").split("\n")).toEqual(expect.arrayContaining(["10000", "10001", "10002"]));
     expect(artifact.details?.rowPrefixes).toBe(false);
+  });
+
+  test("minimized bash metadata and rendered output recover the same bound remote artifact", async () => {
+    const source = Array.from({ length: 40 }, (_, index) =>
+      `export function probe${index}() {\n  const marker = "raw capture sentinel ${index}";\n  return marker;\n}\n`,
+    ).join("\n");
+    await writeFile(join(cwd, "minimized-source.ts"), source);
+    const args = { command: "cat minimized-source.ts" };
+    const result = await client.execute("bash", "minimized-output", args) as AgentToolResult<BashToolDetails>;
+    const minimized = result.details?.meta?.minimized;
+    expect(minimized).toBeDefined();
+    const uri = minimized!.artifactId;
+    expect(uri).toMatch(/^remote-artifact:\/\/[a-f0-9-]+\/\d+$/);
+    expect(minimized!.inputBytes).toBe(Buffer.byteLength(source));
+    expect(minimized!.outputBytes).toBeLessThan(minimized!.inputBytes);
+    const text = result.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+    expect(text).toContain(`[raw output: ${uri}]`);
+    expect(text).not.toContain("raw capture sentinel");
+    expect(JSON.stringify(result)).not.toMatch(/(?<!remote-)artifact:\/\//);
+    const recovered = await client.execute("read", "recover-minimized-output", { path: `${uri}:raw` }) as AgentToolResult<unknown>;
+    expect(recovered.content.filter(part => part.type === "text").map(part => part.text).join("\n")).toBe(source);
+    const theme = await getThemeByName("dark");
+    if (!theme) throw new Error("Expected the native dark theme");
+    const options = { expanded: true, isPartial: false };
+    const rendered = Bun.stripANSI(bashToolRenderer.renderResult(result, options, theme, args).render(240).join("\n"));
+    expect(rendered).toContain(uri);
+    expect(rendered).toContain("Minimized");
+    const view = JSON.stringify(bashToolRenderer.describeResult(result, options, args));
+    expect(view).toContain(uri);
+    expect(view).not.toMatch(/(?<!remote-)artifact:\/\//);
   });
 
   for (const via of ["read", "grep"] as const) {

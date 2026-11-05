@@ -41,6 +41,8 @@ import { isProcessListingPath, mergeProcessListings } from "./omp/process-routin
 import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { sessionFileBelongsToRoot } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import { resolveHostSessionRef } from "./omp/host-session.ts";
 import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { captureExecutionSettings, type RemoteExecutionSettings } from "./omp/execution-settings.ts";
@@ -360,23 +362,80 @@ function cursorBlockReason(state: RemoteExtensionState, ctx?: ExtensionContext):
   return advisor ? `Advisor ${advisor.name}: ${CURSOR_BOUND_REASON}` : undefined;
 }
 
-/** Native refs keep idle task sessions live; parked ancestors still carry lineage. */
-function hasLiveDescendants(state: RemoteExtensionState, ctx?: ExtensionContext): boolean {
+/** Transcript ownership disambiguates the process-wide Main id after session navigation. */
+function liveDescendants(state: RemoteExtensionState, ownerSessionFile: string, ctx?: ExtensionContext) {
   const refs = AgentRegistry.global().list();
-  const ownerId = resolveHostSessionRef(state.sessionFile, ctx ?? state.hostContext)?.id ?? ctx?.agent?.id;
-  if (!ownerId) return false;
+  const ownerId = resolveHostSessionRef(ownerSessionFile, ctx ?? state.hostContext)?.id ?? ctx?.agent?.id;
   const byId = new Map(refs.map(ref => [ref.id, ref]));
-  return refs.some(ref => {
-    if (ref.kind !== "sub" || !ref.session || ref.id === ownerId) return false;
-    const visited = new Set<string>();
+  return refs.filter(ref => {
+    if (ref.kind !== "sub" || ref.id === ownerId || (!ref.session && ref.status !== "running")) return false;
+    if (ref.sessionFile) return sessionFileBelongsToRoot(ref.sessionFile, ownerSessionFile);
+    // Native initialization registers running refs before their transcript exists.
+    // Fail closed on attributable, unfiled children; Main alone cannot prove their root.
+    const visited = new Set<string>([ref.id]);
     let parent = ref.parentId;
     while (parent && !visited.has(parent)) {
       if (parent === ownerId) return true;
       visited.add(parent);
-      parent = byId.get(parent)?.parentId;
+      const ancestor = byId.get(parent);
+      if (ancestor?.sessionFile) return sessionFileBelongsToRoot(ancestor.sessionFile, ownerSessionFile);
+      parent = ancestor?.parentId;
     }
     return false;
   });
+}
+
+function descendantAdmissionError(refs: ReturnType<typeof liveDescendants>, reason = "live descendant agents"): Error {
+  const names = refs.map(ref => `${ref.displayName} (${ref.id}, ${ref.status})${ref.session?.ircWakesPending ? " — has pending messages; retry shortly" : ""}`).join(", ");
+  return new Error(`This session has ${reason}: ${names}. Wait for them to finish, or open /hub and press x to stop them.`);
+}
+
+/** Use the native TTL transition so revival rebuilds extensions against the new family. */
+async function parkIdleDescendants(
+  state: RemoteExtensionState,
+  ownerSessionFile: string,
+  transaction: ConnectionTransaction,
+  ctx?: ExtensionContext,
+): Promise<void> {
+  const refs = liveDescendants(state, ownerSessionFile, ctx);
+  // Match native TTL admission: idle refs can still owe turns to queued IRC.
+  const blockers = refs.filter(ref => ref.status !== "idle" || !ref.sessionFile || ref.session?.ircWakesPending);
+  if (blockers.length) throw descendantAdmissionError(blockers);
+  const registry = AgentRegistry.global(), lifecycle = AgentLifecycleManager.global();
+  for (const ref of refs) {
+    assertConnectionTransaction(state, transaction);
+    if (registry.get(ref.id) !== ref || ref.status !== "idle" || ref.session?.ircWakesPending) {
+      throw descendantAdmissionError([ref]);
+    }
+    const refSession = ref.session!;
+    let woke = false;
+    // Native park yields before detach. A direct running transition must cancel
+    // that park just as a native peer send's ensureLive does, not dispose an active turn.
+    const unsubscribe = registry.onChange(event => {
+      if (event.ref === ref && event.type === "status_changed" && ref.status === "running") {
+        woke = true;
+        if (ref.session) void lifecycle.ensureLive(ref.id).catch(() => {});
+      }
+    });
+    try {
+      await lifecycle.park(ref.id);
+      // Native park logs disposal errors instead of rejecting. AgentSession.dispose
+      // is idempotent; joining its original promise also verifies cleanup succeeded.
+      const parked = registry.get(ref.id);
+      if (parked?.status === "parked" && parked === ref && !parked.session) {
+        await refSession.dispose();
+      }
+    } catch (error) {
+      throw descendantAdmissionError([ref], `a descendant that could not be parked (${error instanceof Error ? error.message : String(error)})`);
+    } finally {
+      unsubscribe();
+    }
+    assertConnectionTransaction(state, transaction);
+    if (woke) throw descendantAdmissionError([ref]);
+  }
+  // park() can be a no-op (unadopted/cancelled) or race a revival/new child.
+  const remaining = liveDescendants(state, ownerSessionFile, ctx);
+  if (remaining.length) throw descendantAdmissionError(remaining);
 }
 
 
@@ -1269,9 +1328,9 @@ async function connectOwner(
   const assertAdmission = () => {
     const cursorReason = cursorBlockReason(state, ctx);
     if (cursorReason) throw new Error(cursorReason);
-    if (hasLiveDescendants(state, ctx)) {
-      throw new Error("This session has live descendant agents; wait for or stop them before connecting a remote workspace.");
-    }
+    const running = liveDescendants(state, normalizedSessionFile, ctx)
+      .filter(ref => ref.status !== "idle" || !ref.sessionFile || ref.session?.ircWakesPending);
+    if (running.length) throw descendantAdmissionError(running);
     if (pi.getActiveTools().some(name => AUTORESEARCH_TOOLS.has(name))) {
       throw new Error("Autoresearch is active locally; run /autoresearch off and wait for experiments to stop before connecting.");
     }
@@ -1281,6 +1340,8 @@ async function connectOwner(
   let prepared: PreparedRemoteWorker | undefined;
   let opened: OpenedTransport | undefined;
   try {
+    await parkIdleDescendants(state, normalizedSessionFile, transaction, ctx);
+    assertConnectionTransaction(state, transaction);
     const hosts = await loadConfiguredSshHosts(input.localCwd);
     assertConnectionTransaction(state, transaction);
     const request = input.parseRequest(hosts);
@@ -1299,11 +1360,17 @@ async function connectOwner(
     assertConnectionTransaction(state, transaction);
     await prepared.commitUsage();
     assertConnectionTransaction(state, transaction);
-    // The broker is process-wide; another extension instance may have claimed this session.
+    assertAdmission();
+    await parkIdleDescendants(state, normalizedSessionFile, transaction, ctx);
+    assertConnectionTransaction(state, transaction);
+    // No await between this final admission snapshot and family publication.
+    assertAdmission();
+    const remaining = liveDescendants(state, normalizedSessionFile, ctx);
+    if (remaining.length) throw descendantAdmissionError(remaining);
+    // The broker is process-wide; parking may have yielded to another owner.
     if (remoteFamilyBroker.hasOwner(normalizedSessionFile)) {
       throw new Error("This session already owns a remote runtime family");
     }
-    assertAdmission();
     const ready = opened.ready;
     const resolvedRemoteCwd = ready.cwd ?? remoteCwd;
     const family: RemoteFamily = {

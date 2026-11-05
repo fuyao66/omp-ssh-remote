@@ -215,7 +215,7 @@ export async function createRemoteArtifacts(
       const text = formatFullOutputReference(id, elided).replace(`artifact://${id}`, remote(id));
       return source?.type === "report" ? `${text} (report: ${source.value})` : text;
     };
-    // Only these two OutputMeta slots own artifact ids. Rich values and arbitrary
+    // Only typed OutputMeta artifact slots own ids. Rich values and arbitrary
     // application records (including their own `meta`) never enter this adapter.
     const adaptMeta = (value: unknown): OutputMeta | undefined => {
       if (!record(value)) return undefined;
@@ -253,6 +253,11 @@ export async function createRemoteArtifacts(
           delete column.artifactId;
         }
         meta.limits = { ...meta.limits, columnTruncated: column };
+      }
+      if (meta.minimized && nativeId(meta.minimized.artifactId)) {
+        const id = meta.minimized.artifactId;
+        meta.minimized = { ...meta.minimized, artifactId: remote(id) };
+        if (!recoveries.has(remote(id))) recoveries.set(remote(id), reference(id));
       }
       return meta;
     };

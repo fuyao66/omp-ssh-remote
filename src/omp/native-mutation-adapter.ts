@@ -11,7 +11,7 @@ export function adaptNativeMutationSettlement(source: string, sdkVersion: string
   source = replaceSdkAnchor(adaptation, source, "settlement",
     adaptation.anchors.settlement.text.replace("untilAborted", "awaitMutationSettled"));
   if (module === "writethrough") {
-    // SDK 18.15 synthesizes an unverified diagnostics object to carry formatter
+    // SDK 18.16 synthesizes an unverified diagnostics object to carry formatter
     // status after a late handoff. That placeholder must not abort the waiter.
     for (const [anchorId, result] of [["finalizeSingle", "diag"], ["finalizeBatch", "diagnostics"]] as const) {
       source = replaceSdkAnchor(adaptation, source, anchorId,
