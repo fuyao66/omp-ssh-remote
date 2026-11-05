@@ -1,6 +1,6 @@
 {
   "name": "omp-ssh-remote-workspace",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "private": true,
   "type": "module",
   "description": "Oh My Pi SSH remote workspace plugin",
@@ -14,7 +14,7 @@
     "build:worker:arm64": "bun scripts/compile-worker.ts arm64",
     "build:worker:x64": "bun scripts/compile-worker.ts x64",
     "build:worker:all": "bun scripts/compile-worker.ts arm64 && bun scripts/compile-worker.ts x64",
-    "benchmark:omp": "bun scripts/benchmark-remote.ts omp",
+    "benchmark:omp": "bun scripts/benchmark-remote.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "check:sdk": "bun scripts/check-sdk.ts",

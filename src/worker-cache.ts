@@ -24,13 +24,11 @@ export function buildWorkerDeploymentLeaseCommand(root: string, namespace: strin
  * Only direct regular native binaries/sidecars and explicitly named symlinks are owned.
  * Unknown direct children make the entire directory non-deletable.
  */
-export function buildCommitWorkerCacheCommand(root: string, namespace: string, hash: string, companionLinks: readonly string[] = []): string {
+export function buildCommitWorkerCacheCommand(root: string, namespace: string, hash: string): string {
   validateWorkerCacheIdentity(namespace, hash);
-  for (const name of companionLinks) if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.startsWith("worker") || name === MANIFEST) throw new Error("Invalid worker companion name");
-  const links = companionLinks.length ? companionLinks.join(",") : "-";
   return [
     cacheRootSetup(root),
-    `current_ns=${quoteRemoteArgument(namespace)}; current_hash='${hash}'; current_links='${links}';`,
+    `current_ns=${quoteRemoteArgument(namespace)}; current_hash='${hash}';`,
     `manifest='${MANIFEST}'; owner='${NATIVE_WORKER_OWNER}';`,
     // Temporary metadata is never sourced, and all paths come from validated direct children.
     'tmp=$(mktemp -d "$root/.native-gc.XXXXXXXX"); trap \'rm -rf -- "$tmp"\' EXIT HUP INT TERM;',
@@ -87,10 +85,10 @@ export function buildCommitWorkerCacheCommand(root: string, namespace: string, h
     'printf "completed\\n" > "$root/.native-cache-migrated-v1";',
     'fi;',
     'active="$root/$current_ns/$current_hash";',
-    'test -d "$root/$current_ns" && test ! -L "$root/$current_ns" && native_layout "$active" "$current_links" || exit 1;',
+    'test -d "$root/$current_ns" && test ! -L "$root/$current_ns" && native_layout "$active" - || exit 1;',
     'sequence=$((sequence + 1)); test "$sequence" -lt 999999999999999 || exit 1;',
     'printf "%s\\n" "$sequence" > "$tmp/state"; chmod 600 "$tmp/state"; mv -f -- "$tmp/state" "$root/.native-cache-state";',
-    'write_manifest "$active" "$current_ns" "$current_hash" "$sequence" admitted "$current_links";',
+    'write_manifest "$active" "$current_ns" "$current_hash" "$sequence" admitted -;',
     'rm -f -- "$active/.native-pending-v1";',
     'unclassified=0;',
     'for ns in "$root"/*; do test -d "$ns" && test ! -L "$ns" || continue; valid_ns "${ns##*/}" || continue;',

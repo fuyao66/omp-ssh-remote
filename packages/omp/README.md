@@ -212,7 +212,9 @@ Deployment reuses the common format-1 manifest, bounded regular-file-only archiv
 
 Only a missing native default clangd executable receives this fallback. Project/PATH clangd, explicit command/disable/file types/root markers and configured semantic alternatives such as ccls win, even if an explicitly selected alternative is unavailable. Native arguments (`--background-index`, `--clang-tidy`, `--header-insertion=iwyu`) and native file types remain unchanged. Background indexing may create clangd's ordinary project cache. No wildcard `--query-driver` is enabled: executing a project compiler for include discovery requires explicit project authorization/configuration.
 
-The pack does not supply a C/C++ standard library SDK, compiler, CANN SDK or project compile database. Those remain project-owned. clangd uses existing `compile_commands.json` and `.clangd`; use native `lsp.json` arguments for an explicit `--compile-commands-dir=...` when needed. Verify actual standard headers and vendor APIs on the target project, not just server startup. CUDA/Objective-C file types are inherited native selection, not a claim that their SDKs are bundled.
+The pack does not supply a C/C++ standard library SDK, compiler, vendor SDK or project compile database. Those remain project-owned. clangd uses existing `compile_commands.json` and `.clangd`; use native `lsp.json` arguments for an explicit `--compile-commands-dir=...` when needed. Verify actual standard headers and vendor APIs on the target project, not just server startup. CUDA/Objective-C file types are inherited native selection, not a claim that their SDKs are bundled.
+
+The `cpp-lsp` smoke suite always runs its scratch C++ checks. To add read-only acceptance on an existing project, set `REMOTE_CPP_PROJECT_ROOT` (absolute), `REMOTE_CPP_PROJECT_DATABASE`, `REMOTE_CPP_PROJECT_FILE`, `REMOTE_CPP_PROJECT_SYMBOL`, `REMOTE_CPP_PROJECT_LINE`, `REMOTE_CPP_PROJECT_DEFINITION_FILE`, `REMOTE_CPP_PROJECT_DEFINITION_LINE`, and `REMOTE_CPP_PROJECT_REFERENCE_COUNT`. File/database paths may be absolute or relative to the project root; line numbers are one-based and the reference count is exact. The selected file must have exactly one compile command. Diagnostics must be clean unless every message matches an explicitly supplied JavaScript regexp in `REMOTE_CPP_PROJECT_DIAGNOSTIC_PATTERN`; missing headers always fail. The suite uses the packaged clangd with background indexing disabled, puts its configuration in scratch, and verifies unchanged source, definition and database hashes.
 
 ## Deployment and Security
 
@@ -308,4 +310,12 @@ One plugin upgrade/reload can change the initial prefix. Model/configuration cha
 - Native host approval and enabled-tool gating are retained, but SDK 18.15.0 has no public AgentSession API for effective `ToolSession.lspReadOnly` / `deviceOnlyWrite` policy. Remote execution cannot mirror explicit per-session overrides of those fields; do not use this release as a read-only sandbox. AgentRef read-only history metadata is not the execution policy.
 - one companion process per session or subagent; concurrent children each cost an SSH channel and a worker process;
 - no output frame above 16 MiB;
+- host Git status/overlay and status-line Git information describe the local repository, not the bound remote workspace;
+- plan autosave (`plan.autosave`) writes to local `.omp/plans/`;
+- `/clear` and prompt refresh re-read local project context files;
+- native hooks and `pi.exec` execute locally;
+- remote Bash may still accept `out://` after automatic background promotion, unlike native background execution;
+- remote AST previews do not enforce native pending-preview reminders or escalation;
+- Cursor models and effective Cursor advisors are refused at connect and before each turn. Advisor workspace calls through `tool_call` are blocked, but Cursor-advisor direct operations bypass that hook; later advisor model transitions are not continuously gated and remain unsupported while bound;
+- connect refuses enabled autoresearch tools; its private running-experiment state is not exposed, so turn autoresearch off and wait for existing experiments to stop first;
 - no remote browser, desktop, model credentials, memory, or local session control plane.

@@ -108,7 +108,7 @@ async function initialize(request: InitializeRequest): Promise<void> {
   await ensureTheme();
   // remote-artifact:// names files on this host; only the worker process mounts it.
   mountRemoteArtifactScheme();
-  runtime = await createNativeWorkerRuntime(request.cwd, hostVersion, {
+  runtime = await createNativeWorkerRuntime(request.cwd, {
     sessionId: request.sessionId,
     settings: request.settings,
     outReplies: request.outReplies,
@@ -156,7 +156,7 @@ async function initialize(request: InitializeRequest): Promise<void> {
   });
 }
 
-function hostInvoker(parentId: string): NonNullable<Parameters<typeof createNativeWorkerRuntime>[2]>["invokeTool"] {
+function hostInvoker(parentId: string): NonNullable<Parameters<typeof createNativeWorkerRuntime>[1]>["invokeTool"] {
   return async (tool, toolCallId, args, signal, onUpdate) => {
     if (!runtime || !active.has(parentId) || cleanupPromise) throw new Error("Remote Eval invocation has no active parent binding");
     signal?.throwIfAborted();

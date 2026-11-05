@@ -17,13 +17,13 @@ async function artifact() {
 }
 
 describe("artifact input boundaries", () => {
-  test("read resolves only its leading resource and preserves selector/query literals", async () => {
+  test("read preserves immutable URLs and isolates query-specific materialization", async () => {
     const file = await artifact();
     const query = `?q=.uri==${JSON.stringify(file.uri)}`;
     const input = { path: file.uri + query, extra: file.uri };
     expect(await resolveRemoteArtifactArgs("read", input)).toEqual({ path: file.path + query, extra: file.uri });
     expect(input.path).toBe(file.uri + query);
-    expect(await resolveRemoteArtifactArgs("read", { path: file.uri + ":raw:2-4" })).toEqual({ path: file.path + ":raw:2-4" });
+    expect(await resolveRemoteArtifactArgs("read", { path: file.uri + ":raw:2-4" })).toEqual({ path: file.uri + ":raw:2-4" });
   });
 
   test("grep resolves each artifact path, never the search pattern", async () => {
@@ -74,7 +74,7 @@ describe("native remote artifact shell filesystem", () => {
           import { resolveRemoteArtifactArgs } from ${JSON.stringify(fileURLToPath(new URL("../src/omp/artifact-input.ts", import.meta.url)))};
           await mkdir(process.env.HOME, { recursive: true });
           mountRemoteArtifactScheme();
-          const runtime = await createNativeWorkerRuntime(${JSON.stringify(temporary)}, "18.15.0");
+          const runtime = await createNativeWorkerRuntime(${JSON.stringify(temporary)});
           try {
             const file = await runtime.session.getArtifactManager().allocatePath("bash");
             assert(file.path.startsWith(process.env.HOME + "/"), file.path);
@@ -124,7 +124,7 @@ describe("native remote artifact shell filesystem", () => {
       const child = Bun.spawn([process.execPath, "--eval", `
         import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
         import { createNativeWorkerRuntime } from ${JSON.stringify(fileURLToPath(new URL("../src/runtime.ts", import.meta.url)))};
-        const runtime = await createNativeWorkerRuntime(${JSON.stringify(temporary)}, "18.15.0");
+        const runtime = await createNativeWorkerRuntime(${JSON.stringify(temporary)});
         try { console.log(InternalUrlRouter.instance().getHandler("remote-artifact") === undefined ? "unmounted" : "mounted"); }
         finally { await runtime.dispose(); }
       `], { cwd: join(import.meta.dir, ".."), env: { ...process.env, HOME: temporary }, stdout: "pipe", stderr: "pipe" });
@@ -137,13 +137,13 @@ describe("native remote artifact shell filesystem", () => {
     }
   });
 
-  test("does not resolve unsafe artifact filenames sharing an id prefix", async () => {
+  test("native artifact lookup preserves literal filenames without interpreting shell syntax", async () => {
     mountRemoteArtifactScheme();
     const file = await artifact();
     const unsafe = join(dirname(file.path), `${file.id}.log'; touch MARKER; #`);
     await rm(file.path);
     await writeFile(unsafe, "not an artifact filename");
-    await expect(resolveRemoteArtifactArgs("read", { path: file.uri })).rejects.toThrow("Remote artifact not found");
-    await expect(InternalUrlRouter.instance().locate(file.uri)).rejects.toThrow("Remote artifact not found");
+    expect(await resolveRemoteArtifactArgs("read", { path: file.uri })).toEqual({ path: file.uri });
+    expect(await InternalUrlRouter.instance().locate(file.uri)).toBe(unsafe);
   });
 });

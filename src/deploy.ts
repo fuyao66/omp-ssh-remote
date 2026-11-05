@@ -6,10 +6,7 @@ import { fileURLToPath } from "node:url";
 import { OMP_WORKER_BUNDLE } from "./omp/runtime-contract.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { deployLanguagePack } from "./language-pack-deploy.ts";
-import type {
-  RemoteCompanionArtifact,
-  RemoteWorkerBundle,
-} from "./runtime-contract.ts";
+import type { RemoteWorkerBundle } from "./runtime-contract.ts";
 import {
   buildScpBaseCommand,
   buildSshBaseCommand,
@@ -32,22 +29,6 @@ export interface WorkerDeploymentOptions extends SshConnectionOptions {
 
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 
-async function collectBounded(
-  stream: ReadableStream<Uint8Array>,
-  label: string,
-): Promise<string> {
-  const chunks: Uint8Array[] = [];
-  let bytes = 0;
-  for await (const chunk of stream) {
-    bytes += chunk.byteLength;
-    if (bytes > MAX_COMMAND_OUTPUT_BYTES)
-      throw new Error(`${label} exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes`);
-    chunks.push(chunk);
-  }
-  return new TextDecoder("utf-8", { fatal: true }).decode(
-    Buffer.concat(chunks, bytes),
-  );
-}
 
 const deploymentContext = new AsyncLocalStorage<Pick<WorkerDeploymentOptions, "signal" | "onProgress">>();
 const deployments = new Map<string, Promise<unknown>>();
@@ -96,60 +77,20 @@ const MODULE_DIR =
     ? import.meta.dir
     : dirname(fileURLToPath(import.meta.url));
 
-function resolveLocalWorkerPath(
-  arch: "arm64" | "x64",
-  artifactDir = MODULE_DIR,
-): string[] {
-  return [join(artifactDir, `worker-linux-${arch}`)];
-}
-
-function resolveLocalCompanionPath(
-  artifact: RemoteCompanionArtifact,
-  arch: "arm64" | "x64",
-  artifactDir = MODULE_DIR,
-): string {
-  return join(artifactDir, `${artifact.filePrefix}-${arch}`);
-}
-
-async function resolveLocalCompanionBinary(
-  artifact: RemoteCompanionArtifact,
-  arch: "arm64" | "x64",
-  artifactDir?: string,
-): Promise<string> {
-  const candidate = resolveLocalCompanionPath(artifact, arch, artifactDir);
-  try {
-    await access(candidate);
-    return candidate;
-  } catch {}
-  throw new Error(
-    `${arch} ${artifact.id} companion artifact not found; checked: ${candidate}`,
-  );
-}
-
 async function resolveLocalWorker(
   arch: "arm64" | "x64",
   explicitPath?: string,
-  artifactDir?: string,
+  artifactDir = MODULE_DIR,
 ): Promise<string> {
-  const candidates = explicitPath
-    ? [explicitPath]
-    : resolveLocalWorkerPath(arch, artifactDir);
-  for (const candidate of candidates) {
-    try {
-      await access(candidate);
-      return candidate;
-    } catch (error) {
-      if (!(
-        error instanceof Error &&
-        "code" in error &&
-        error.code === "ENOENT"
-      ))
-        throw error;
-    }
+  const candidate = explicitPath ?? join(artifactDir, `worker-linux-${arch}`);
+  try {
+    await access(candidate);
+    return candidate;
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT"))
+      throw error;
+    throw new Error(`${arch} worker binary not found; checked: ${candidate}`);
   }
-  throw new Error(
-    `${arch} worker binary not found; checked: ${candidates.join(", ")}`,
-  );
 }
 async function readWorkerHash(workerPath: string): Promise<string> {
   try {
@@ -186,7 +127,7 @@ export type PreparedRemoteWorker = {
   pythonLspPack?: string;
   typescriptLspPack?: string;
   cppLspPack?: string;
-  home?: string;
+  home: string;
   /** Combined caller/lease signal, only for deployment and admission. */
   signal: AbortSignal;
   cacheAudit: RemoteWorkerCacheAudit;
@@ -289,19 +230,10 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
     ],
     "Remote worker check",
   );
-  if (exists === "present") {
-    await deployCompanionArtifacts(
-      options,
-      probe.home,
-      arch,
-      remoteDir,
-      bundle,
-    );
-    return Object.assign(preparedWorker(options, cacheDir, bundle.cacheNamespace, hash, remoteWorker, probe.home, bundle.companionArtifacts.map(artifact => artifact.executableName), lease), { pythonLspPack, typescriptLspPack, cppLspPack });
-  }
-  if (exists !== "missing")
+  if (exists !== "present" && exists !== "missing")
     throw new Error(`Unexpected remote worker check response: ${exists}`);
 
+  if (exists === "missing") {
   await run(
     [
       ...buildSshBaseCommand(options),
@@ -338,8 +270,8 @@ async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: Remo
     ], "Remove incomplete worker upload", 20000)).catch(() => {});
     throw error;
   }
-  await deployCompanionArtifacts(options, probe.home, arch, remoteDir, bundle);
-  return Object.assign(preparedWorker(options, cacheDir, bundle.cacheNamespace, hash, remoteWorker, probe.home, bundle.companionArtifacts.map(artifact => artifact.executableName), lease), { pythonLspPack, typescriptLspPack, cppLspPack });
+  }
+  return Object.assign(preparedWorker(options, cacheDir, bundle.cacheNamespace, hash, remoteWorker, probe.home, lease), { pythonLspPack, typescriptLspPack, cppLspPack });
     });
   } catch (error) { await lease.dispose(); throw error; }
 }
@@ -400,7 +332,7 @@ async function acquireDeploymentLease(options: WorkerDeploymentOptions, root: st
   finally { clearTimeout(timer); }
 }
 
-function preparedWorker(options: WorkerDeploymentOptions, root: string, namespace: string, hash: string, workerPath: string, home: string, links: readonly string[], lease: { signal: AbortSignal; dispose(): Promise<void> }): PreparedRemoteWorker {
+function preparedWorker(options: WorkerDeploymentOptions, root: string, namespace: string, hash: string, workerPath: string, home: string, lease: { signal: AbortSignal; dispose(): Promise<void> }): PreparedRemoteWorker {
   let committed: Promise<RemoteWorkerCacheAudit> | undefined;
   const result: PreparedRemoteWorker = {
     workerPath, home, signal: lease.signal, dispose: lease.dispose,
@@ -409,7 +341,7 @@ function preparedWorker(options: WorkerDeploymentOptions, root: string, namespac
       return committed ??= deploymentContext.run({ ...options, signal: lease.signal }, async () => {
         lease.signal.throwIfAborted();
         try {
-          const output = await run([...buildSshBaseCommand(options), getSshDestination(options), `timeout -k 1s 8s sh -c ${quoteRemoteArgument(buildCommitWorkerCacheCommand(root, namespace, hash, links))}`], "Commit admitted worker usage and collect cache", 10_000);
+          const output = await run([...buildSshBaseCommand(options), getSshDestination(options), `timeout -k 1s 8s sh -c ${quoteRemoteArgument(buildCommitWorkerCacheCommand(root, namespace, hash))}`], "Commit admitted worker usage and collect cache", 10_000);
           result.cacheAudit = parseRemoteWorkerCacheAudit(output);
         } catch {
           result.cacheAudit = { available: false, observedAt: new Date().toISOString(), warning: "Worker cache audit unavailable (usage commit/collection failed or exceeded 10s); connection continues." };
@@ -420,91 +352,4 @@ function preparedWorker(options: WorkerDeploymentOptions, root: string, namespac
     },
   };
   return result;
-}
-
-async function deployCompanionArtifacts(
-  options: WorkerDeploymentOptions,
-  home: string,
-  arch: "arm64" | "x64",
-  workerRemoteDir: string,
-  bundle: RemoteWorkerBundle,
-): Promise<void> {
-  for (const artifact of bundle.companionArtifacts) {
-    await deployCompanionArtifact(
-      options,
-      home,
-      arch,
-      workerRemoteDir,
-      bundle,
-      artifact,
-    );
-  }
-}
-
-async function deployCompanionArtifact(
-  options: WorkerDeploymentOptions,
-  home: string,
-  arch: "arm64" | "x64",
-  workerRemoteDir: string,
-  bundle: RemoteWorkerBundle,
-  artifact: RemoteCompanionArtifact,
-): Promise<void> {
-  const localArtifact = await resolveLocalCompanionBinary(
-    artifact,
-    arch,
-    options.localArtifactDir,
-  );
-  const artifactHash = await readWorkerHash(localArtifact);
-  const remoteArtifactDir = `${home}/.cache/omp-ssh-remote/${bundle.cacheNamespace}/${artifact.id}/${arch}/${artifactHash}`;
-  const remoteArtifactBin = `${remoteArtifactDir}/${artifact.executableName}`;
-  const marker = `${remoteArtifactBin}.sha256`;
-  const quotedRemoteArtifactBin = quoteRemoteArgument(remoteArtifactBin);
-  const quotedMarker = quoteRemoteArgument(marker);
-  const quotedWorkerDir = quoteRemoteArgument(workerRemoteDir);
-
-  const exists = await run(
-    [
-      ...buildSshBaseCommand(options),
-      getSshDestination(options),
-      `test -x ${quotedRemoteArtifactBin} && test "$(cat ${quotedMarker} 2>/dev/null)" = '${artifactHash}' && printf present || printf missing`,
-    ],
-    `${artifact.id} companion artifact check`,
-  );
-
-  if (exists !== "present") {
-    await run(
-      [
-        ...buildSshBaseCommand(options),
-        getSshDestination(options),
-        `mkdir -p ${quoteRemoteArgument(remoteArtifactDir)} && chmod 700 ${quoteRemoteArgument(remoteArtifactDir)}`,
-      ],
-      `${artifact.id} companion artifact cache setup`,
-    );
-    const nonce = crypto.randomUUID();
-    const tempUpload = `${remoteArtifactBin}.upload-${nonce}`;
-    const tempMarker = `${marker}.upload-${nonce}`;
-    const scp = buildScpBaseCommand(options);
-    scp.push(
-      localArtifact,
-      `${getScpDestination(options)}:${quoteRemoteArgument(tempUpload)}`,
-    );
-    await run(scp, `${artifact.id} companion artifact upload`);
-    await run(
-      [
-        ...buildSshBaseCommand(options),
-        getSshDestination(options),
-        `set -eu; actual=$(sha256sum ${quoteRemoteArgument(tempUpload)} | cut -d ' ' -f 1); test "$actual" = '${artifactHash}'; chmod 700 ${quoteRemoteArgument(tempUpload)}; mv -f ${quoteRemoteArgument(tempUpload)} ${quotedRemoteArtifactBin}; printf '%s\n' '${artifactHash}' > ${quoteRemoteArgument(tempMarker)}; chmod 600 ${quoteRemoteArgument(tempMarker)}; mv -f ${quoteRemoteArgument(tempMarker)} ${quotedMarker}`,
-      ],
-      `${artifact.id} companion artifact activation`,
-    );
-  }
-
-  await run(
-    [
-      ...buildSshBaseCommand(options),
-      getSshDestination(options),
-      `ln -sf ${quotedRemoteArtifactBin} ${quotedWorkerDir}/${quoteRemoteArgument(artifact.executableName)}`,
-    ],
-    `Link ${artifact.id} companion artifact to worker directory`,
-  );
 }

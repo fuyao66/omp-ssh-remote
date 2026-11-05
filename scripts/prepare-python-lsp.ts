@@ -8,15 +8,14 @@ const arch = process.argv[2] as PythonLspArchitecture;
 if (arch !== "arm64" && arch !== "x64") throw new Error("Usage: bun scripts/prepare-python-lsp.ts arm64|x64");
 const root = resolve(import.meta.dir, "..");
 const cache = resolve(root, ".cache/language-pack-downloads");
-const legacyCaches = [resolve(root, ".cache/python-lsp-downloads"), resolve(root, ".cache/typescript-lsp-downloads")];
 const dist = resolve(root, "packages/omp/dist");
 await mkdir(cache, { recursive: true });
 await mkdir(dist, { recursive: true });
 
 const nodeName = `node-v${PYTHON_LSP_PINS.node.version}-linux-${arch}.tar.xz`;
 const nodeUrl = `https://nodejs.org/dist/v${PYTHON_LSP_PINS.node.version}/${nodeName}`;
-const node = await downloadPinned(cache, nodeUrl, nodeName, "sha256", PYTHON_LSP_PINS.node.sha256[arch], legacyCaches);
-const pyright = await downloadPinned(cache, PYTHON_LSP_PINS.pyright.url, `pyright-${PYTHON_LSP_PINS.pyright.version}.tgz`, "sha512", PYTHON_LSP_PINS.pyright.integrity.slice(7), legacyCaches);
+const node = await downloadPinned(cache, nodeUrl, nodeName, "sha256", PYTHON_LSP_PINS.node.sha256[arch]);
+const pyright = await downloadPinned(cache, PYTHON_LSP_PINS.pyright.url, `pyright-${PYTHON_LSP_PINS.pyright.version}.tgz`, "sha512", PYTHON_LSP_PINS.pyright.integrity.slice(7));
 const provenance = {
   node: { version: PYTHON_LSP_PINS.node.version, url: nodeUrl, sha256: PYTHON_LSP_PINS.node.sha256[arch], checksums: PYTHON_LSP_PINS.node.checksums },
   pyright: PYTHON_LSP_PINS.pyright,

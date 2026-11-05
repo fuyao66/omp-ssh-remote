@@ -1,7 +1,7 @@
 // Run with build-smoke.ts/run-smoke.ts cpp-lsp and REMOTE_CONNECT_ARGS selecting lsp.cpp:true.
-// Optional REMOTE_CPP_PROJECT_ROOT enables read-only acceptance against an existing build/compile_commands.json.
-// Real-project overrides: REMOTE_CPP_PROJECT_FILE, REMOTE_CPP_PROJECT_SYMBOL, REMOTE_CPP_PROJECT_API,
-// REMOTE_CPP_SDK_ROOT. Paths and source locations are discovered remotely; no personal host data belongs here.
+// Optional read-only project acceptance requires REMOTE_CPP_PROJECT_{ROOT,DATABASE,FILE,SYMBOL,
+// LINE,DEFINITION_FILE,DEFINITION_LINE,REFERENCE_COUNT}; paths are remote, absolute or root-relative.
+// REMOTE_CPP_PROJECT_DIAGNOSTIC_PATTERN optionally permits known diagnostic messages (JavaScript regexp).
 import assert from "node:assert/strict";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { lookup, type AnySetting } from "@oh-my-pi/pi-coding-agent/config/registry";
@@ -138,94 +138,77 @@ export default async function cppLspSmoke(pi: ExtensionAPI) {
       const realRoot = process.env.REMOTE_CPP_PROJECT_ROOT;
       if (realRoot) {
         assert.match(realRoot, /^\//, "REMOTE_CPP_PROJECT_ROOT must be absolute");
-        const realFile = `${realRoot}/${process.env.REMOTE_CPP_PROJECT_FILE ?? "src/host/init/backends/shmem_init_backend.cpp"}`;
-        const realSymbol = process.env.REMOTE_CPP_PROJECT_SYMBOL ?? "setup_trusted_pids";
-        const realApi = process.env.REMOTE_CPP_PROJECT_API ?? "aclrtDeviceGetBareTgid";
-        const realHeader = `${realRoot}/${process.env.REMOTE_CPP_PROJECT_HEADER ?? "include/host/init/shmem_host_init.h"}`;
-        const publicSymbol = process.env.REMOTE_CPP_PROJECT_PUBLIC_SYMBOL ?? "aclshmem_finalize";
-        const publicImplementation = `${realRoot}/${process.env.REMOTE_CPP_PROJECT_IMPLEMENTATION ?? "src/host/init/shmem_init.cpp"}`;
-        const sdk = process.env.REMOTE_CPP_SDK_ROOT ?? "/usr/local/Ascend/ascend-toolkit/latest";
+        const required = (key: string): string => {
+          const value = process.env[`REMOTE_CPP_PROJECT_${key}`];
+          if (!value?.trim()) throw new Error(`REMOTE_CPP_PROJECT_${key} is required in project mode`);
+          return value;
+        };
+        const projectPath = (key: string): string => {
+          const value = required(key);
+          return value.startsWith("/") ? value : `${realRoot}/${value}`;
+        };
+        const integer = (key: string, minimum: number): number => {
+          const value = required(key);
+          assert.match(value, /^\d+$/, `REMOTE_CPP_PROJECT_${key} must be an integer`);
+          const result = Number(value);
+          assert(Number.isSafeInteger(result) && result >= minimum, `Invalid REMOTE_CPP_PROJECT_${key}`);
+          return result;
+        };
+        const realFile = projectPath("FILE"), database = projectPath("DATABASE");
+        const definitionFile = projectPath("DEFINITION_FILE"), definitionLine = integer("DEFINITION_LINE", 1);
+        const symbol = required("SYMBOL"), line = integer("LINE", 1), referenceCount = integer("REFERENCE_COUNT", 0);
+        const diagnosticPattern = process.env.REMOTE_CPP_PROJECT_DIAGNOSTIC_PATTERN;
+        const allowedDiagnostic = diagnosticPattern ? new RegExp(diagnosticPattern) : undefined;
         const inspect = [
           "import json,pathlib,hashlib,shlex",
-          `r=pathlib.Path(${JSON.stringify(realRoot)}); p=pathlib.Path(${JSON.stringify(realFile)})`,
-          'db=r/"build/compile_commands.json"; d=json.loads(db.read_text())',
-          'selected=[x for x in d if pathlib.Path(x["file"]).resolve()==p.resolve()]',
-          'assert len(selected)==1,"Expected exactly one real compile command"',
+          `db=pathlib.Path(${JSON.stringify(database)}).resolve(); p=pathlib.Path(${JSON.stringify(realFile)}).resolve()`,
+          'assert db.name=="compile_commands.json","REMOTE_CPP_PROJECT_DATABASE must resolve to a file named compile_commands.json"',
+          'd=json.loads(db.read_text())',
+          'def source(entry):',
+          '    path=pathlib.Path(entry["file"]); directory=pathlib.Path(entry["directory"])',
+          '    return (path if path.is_absolute() else directory/path).resolve()',
+          'selected=[x for x in d if source(x)==p]',
+          'assert len(selected)==1,"Expected exactly one compile command for the selected file"',
           'entry=selected[0]; argv=entry.get("arguments") or shlex.split(entry["command"])',
-          `header=pathlib.Path(${JSON.stringify(realHeader)}); implementation=pathlib.Path(${JSON.stringify(publicImplementation)})`,
-          'paths=[db,p,header,implementation]',
-          'def locations(file,symbol):',
-          '    return [i for i,line in enumerate(file.read_text().splitlines(),1) if symbol+"(" in line]',
-          `symbol_lines=locations(p,${JSON.stringify(realSymbol)}); api_lines=locations(p,${JSON.stringify(realApi)})`,
-          `declaration_lines=locations(header,${JSON.stringify(publicSymbol)}); implementation_lines=locations(implementation,${JSON.stringify(publicSymbol)})`,
-          'assert len(symbol_lines)>=2 and api_lines and declaration_lines and implementation_lines,"Missing expected project symbols"',
-          'print(json.dumps({"entries":len(d),"existingSources":sum(pathlib.Path(x["file"]).is_file() for x in d),',
-          '"selected":{"file":entry["file"],"directory":entry["directory"],"driver":argv[0],"argumentCount":len(argv),"commandSha256":hashlib.sha256(json.dumps(argv).encode()).hexdigest()},',
-          '"locations":{"symbolDefinition":symbol_lines[0],"symbolUse":symbol_lines[1],"apiLine":api_lines[0],"declarationLine":declaration_lines[0],"implementationLine":implementation_lines[0]},',
-          '"hashes":{str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in paths}},indent=2))',
+          `paths={db,p,pathlib.Path(${JSON.stringify(definitionFile)}).resolve()}`,
+          'print(json.dumps({"entries":len(d),"existingSources":sum(source(x).is_file() for x in d),',
+          '"databaseDirectory":str(db.parent),"selected":{"file":str(p),"directory":entry["directory"],"driver":argv[0],"argumentCount":len(argv),',
+          '"commandSha256":hashlib.sha256(json.dumps(argv).encode()).hexdigest()},',
+          '"hashes":{str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in paths}}))',
         ].join("\n");
         const inspectProject = async () => {
           const output = (await shell(`python3 -c ${quote(inspect)}`)).trim();
-          assert.doesNotMatch(output, /truncated|artifact:\/\//i, "Real-project metadata transport was truncated");
-          try { return JSON.parse(output); }
-          catch (error) { throw new Error(`Invalid real-project metadata (${output.length} characters): ${error}`); }
+          assert.doesNotMatch(output, /truncated|artifact:\/\//i, "Project metadata transport was truncated");
+          return JSON.parse(output);
         };
         const baseline = await inspectProject();
         assert(baseline.existingSources > 0); report("real_compile_database", baseline);
-        const { symbolDefinition, symbolUse, apiLine, declarationLine, implementationLine } = baseline.locations;
-        // An isolated native config changes only index persistence and compile-database discovery.
-        // Absolute real files still use their unchanged existing compile commands (including vendor flags).
-        // Pack launch provenance is taken from this worker, never a system clangd substitution.
+        // Keep index/configuration writes in scratch; existing source and compile commands stay unchanged.
         const realScratch = `${scratch}/real-project`;
         await shell(`mkdir -- ${quote(realScratch)}`);
-        const config = { servers: { clangd: { command: clangd, args: ["--background-index=false", "--clang-tidy", "--header-insertion=iwyu", `--compile-commands-dir=${realRoot}/build`], rootMarkers: ["."] } } };
+        const config = { servers: { clangd: { command: clangd, args: ["--background-index=false", "--clang-tidy", "--header-insertion=iwyu", `--compile-commands-dir=${baseline.databaseDirectory}`], rootMarkers: ["."] } } };
         await shell(`printf %s ${quote(JSON.stringify(config))} > ${quote(`${realScratch}/lsp.json`)}`);
         await exit(); await connect(reconnectArgs(realScratch));
-        await lsp("symbols", { file: publicImplementation }); await lsp("symbols", { file: realHeader });
-        const publicDefinition = await lsp("definition", { file: realHeader, line: declarationLine, symbol: publicSymbol });
-        assert(count(publicDefinition, "definition") >= 1);
-        assert(publicDefinition.includes(`${publicImplementation}:${implementationLine}:`), publicDefinition);
-        report("real_cross_file_definition", publicDefinition);
-        await lsp("symbols", { file: realFile });
-        const localDefinition = await lsp("definition", { file: realFile, line: symbolUse, symbol: realSymbol });
-        assert(localDefinition.includes(`${realFile}:${symbolDefinition}:`), localDefinition);
-        const realReferences = await untilReferences(realFile, realSymbol, 2, symbolDefinition);
-        assert(realReferences.includes(`${realFile}:${symbolUse}:`), realReferences);
-        report("real_references", { expected: 2, actual: count(realReferences, "reference"), definition: localDefinition, references: realReferences });
-        const apiDefinition = await lsp("definition", { file: realFile, line: apiLine, symbol: realApi });
-        assert(count(apiDefinition, "definition") >= 1);
-        const canonicalSdk = (await shell(`readlink -f -- ${quote(sdk)}`)).trim();
-        assert(apiDefinition.includes(`${sdk}/`) || apiDefinition.includes(`${canonicalSdk}/`), apiDefinition);
-        assert.match(apiDefinition, /\/acl\/acl_rt\.h:\d+:/);
-        report("real_cann_header_resolution", { api: realApi, definition: apiDefinition });
-        const realDiagnostics = await lsp("diagnostics", { file: realFile });
-        console.log("CPP_LSP_REAL_DIAGNOSTICS", JSON.stringify({ file: realFile, diagnostics: realDiagnostics }));
-        assert.doesNotMatch(realDiagnostics, /no diagnostics report yet|file_not_found|file not found|'[^']+' file not found/i);
-        const messages = realDiagnostics.split("\n").filter(line => /\[(?:error|warning|info|hint)\]/i.test(line));
-        const counts = { error: 0, warning: 0, info: 0, hint: 0 };
-        let projectWarnings = 0, vendorBoundaries = 0;
-        if (realDiagnostics.trim() !== "OK") {
-          assert(messages.length > 0, `No classified diagnostic messages: ${realDiagnostics}`);
-          for (const message of messages) {
-            const severity = message.match(/\[(error|warning|info|hint)\]/i)![1].toLowerCase() as keyof typeof counts;
-            counts[severity]++;
-            if (severity === "warning" && /\[clangd\].*Included header .* is not used directly.*\(unused-includes\)\s*$/.test(message)) {
-              projectWarnings++;
-            } else {
-              assert.match(message,
-                /__aicore__|__gm__|__global__|unknown.*attribute|unknown.*type.*half|unsupported option|unknown argument|undeclared identifier.*(?:Ascend|ASCEND)/i,
-                `Unclassified real-project diagnostic requires investigation: ${message}`);
-              vendorBoundaries++;
-            }
-          }
+        await lsp("symbols", { file: definitionFile }); await lsp("symbols", { file: realFile });
+        const definition = await lsp("definition", { file: realFile, line, symbol });
+        assert(count(definition, "definition") >= 1);
+        assert(definition.includes(`${definitionFile}:${definitionLine}:`), definition);
+        report("real_cross_file_definition", definition);
+        const references = await untilReferences(realFile, symbol, referenceCount, line);
+        report("real_references", { expected: referenceCount, actual: count(references, "reference"), references });
+        const diagnostics = await lsp("diagnostics", { file: realFile });
+        assert.doesNotMatch(diagnostics, /no diagnostics report yet|file_not_found|file not found|'[^']+' file not found/i);
+        const messages = diagnostics.split("\n").filter(message => /\[(?:error|warning|info|hint)\]/i.test(message));
+        if (diagnostics.trim() !== "OK") {
+          assert(messages.length > 0, `No classified diagnostic messages: ${diagnostics}`);
+          assert(allowedDiagnostic, `Project diagnostics require an explicit REMOTE_CPP_PROJECT_DIAGNOSTIC_PATTERN: ${diagnostics}`);
+          for (const message of messages) assert.match(message, allowedDiagnostic);
         }
-        report("real_diagnostics", { diagnostics: realDiagnostics, counts, projectWarnings, vendorBoundaries },
-          vendorBoundaries ? "upstream-vendor-dialect-boundary" : projectWarnings ? "project-diagnostics" : "positive");
-        const afterReal = await inspectProject();
-        assert.deepEqual(afterReal.hashes, baseline.hashes);
-        report("real_readonly", { unchangedSourceHeaderAndDatabaseHashes: Object.keys(baseline.hashes).length, backgroundIndex: false, configurationInScratch: true });
+        report("real_diagnostics", { diagnostics, allowedPattern: diagnosticPattern ?? null, messages: messages.length }, messages.length ? "expected-project-diagnostics" : "positive");
+        assert.deepEqual((await inspectProject()).hashes, baseline.hashes);
+        report("real_readonly", { unchangedSourceAndDatabaseHashes: Object.keys(baseline.hashes).length, backgroundIndex: false, configurationInScratch: true });
       }
-      assert.equal(modelTurns, 0); assert.equal(rows.length, realRoot ? 19 : 13);
+      assert.equal(modelTurns, 0); assert.equal(rows.length, realRoot ? 18 : 13);
       console.log("CPP_LSP_SMOKE_PASS", JSON.stringify({ checks: rows.length, modelTurns, classifications: rows.filter(row => row.outcome !== "positive"), realProject: !!realRoot }));
     } catch (error) {
       console.error("CPP_LSP_SMOKE_FAILED", JSON.stringify({ completedChecks: rows, error: error instanceof Error ? error.stack : String(error) })); throw error;

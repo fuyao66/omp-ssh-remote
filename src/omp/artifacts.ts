@@ -11,17 +11,14 @@ import {
 } from "@oh-my-pi/pi-tui/tools/output-meta";
 
 const root = () => join(homedir(), ".cache/omp-ssh-remote/artifacts");
-const references = /remote-artifact:\/\/([a-f0-9-]{36})\/(\d+)/g;
 const NAMESPACE_NAME = /^[a-f0-9-]{36}$/;
-const ARTIFACT_NAME = /^(\d+)\.[A-Za-z0-9_+,:@%=-]+(?:\.[A-Za-z0-9_+,:@%=-]+)*$/;
 /** Mirrors the native artifact:// gate: path consumers locate, only materialization reads bytes. */
 const MAX_INLINE_ARTIFACT_BYTES = 8 * 1024 * 1024;
 
 async function resolveArtifactPath(namespace: string, id: string): Promise<string> {
-  const dir = join(root(), namespace);
-  const name = (await readdir(dir)).find(entry => ARTIFACT_NAME.exec(entry)?.[1] === id);
-  if (!name) throw new Error(`Remote artifact not found: remote-artifact://${namespace}/${id}`);
-  return join(dir, name);
+  const path = await new ArtifactManager(join(root(), namespace)).getPath(id);
+  if (!path) throw new Error(`Remote artifact not found: remote-artifact://${namespace}/${id}`);
+  return path;
 }
 
 const ARTIFACT_URL = /^remote-artifact:\/\/([a-f0-9-]{36})(?:\/(\d+))?\/?$/;
@@ -164,19 +161,11 @@ export async function sweepOrphanedArtifactNamespaces(
   return removed;
 }
 
-export async function resolveRemoteArtifacts(value: unknown): Promise<unknown> {
-  if (typeof value === "string") {
-    let result = value;
-    for (const match of value.matchAll(references)) {
-      result = result.replaceAll(match[0], await resolveArtifactPath(match[1]!, match[2]!));
-    }
-    return result;
-  }
-  if (Array.isArray(value)) return Promise.all(value.map(resolveRemoteArtifacts));
-  if (value && typeof value === "object") {
-    return Object.fromEntries(await Promise.all(Object.entries(value).map(async ([key, item]) => [key, await resolveRemoteArtifacts(item)])));
-  }
-  return value;
+/** Locate one exact operand; tool data and URI selectors never enter this helper. */
+export async function resolveRemoteArtifacts(uri: string): Promise<string> {
+  const { namespace, id } = parseArtifactUrl(uri);
+  if (id === undefined) throw new Error(`Remote artifact requires an id: ${uri}`);
+  return resolveArtifactPath(namespace, id);
 }
 
 export type RemoteArtifacts = {
@@ -269,6 +258,8 @@ export async function createRemoteArtifacts(
     };
     const originalDetails = record(result.details);
     const details = originalDetails ? { ...originalDetails } : undefined;
+    // Remote filenames must never enter the TUI's local-file media fast path.
+    if (details) delete details.mediaPath;
     const originalMeta = record(originalDetails?.meta) ? originalDetails!.meta as OutputMeta : undefined;
     const meta = adaptMeta(originalMeta);
     if (details && meta) details.meta = meta;

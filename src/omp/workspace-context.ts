@@ -22,7 +22,7 @@ export function workspaceNotice(current: WorkspaceBindingNotice): CustomMessage<
   return {
     role: "custom", customType: WORKSPACE_NOTICE_TYPE, display: false, details: current, timestamp: Date.now(),
     content: `Workspace binding: ${current.mode}; ${location}; cwd=${JSON.stringify(current.cwd)}. ` +
-      (current.mode === "remote" ? "Tools not provided by the remote runtime (extension/MCP tools) execute on the local host. " : "") +
+      (current.mode === "remote" ? "Native workstation, repository, project-tree and date/cwd blocks describe the local machine, not this SSH host. Workspace tools operate on the remote host. Tools not provided by the remote runtime (extension/MCP tools) execute on the local host. " : "") +
       (current.mode === "unavailable"
         ? "Remote execution is unavailable; no local fallback. Reconnect or explicitly exit remote mode."
         : "This is the current execution environment. Do not carry file/edit assumptions across bindings; a new remote binding has no previous runtime's kernel or staged state."),

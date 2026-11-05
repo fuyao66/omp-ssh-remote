@@ -19,7 +19,6 @@ export class LspDiagnosticRevisions {
     // the revision diagnostics will describe; capture only after real settlement.
     this.#revisions.set(path, { version, pending: true });
   }
-  retire(path: string, version: number): void { if (this.#revisions.get(path)?.version === version) this.#revisions.delete(path); }
   diagnostics(entry: DeferredDiagnosticsEntry): void {
     if (this.#active) this.#pending.push(entry);
     else { this.#reconcile(); if (!entry.isStale()) this.deliver(entry); }

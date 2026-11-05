@@ -45,7 +45,7 @@ const tools = new Map<string, ToolDefinition>();
 const events = new Set<string>();
 const eventHandlers = new Map<string, (...args: any[]) => unknown>();
 
-const schemaRuntime = await createNativeWorkerRuntime(process.cwd(), "smoke");
+const schemaRuntime = await createNativeWorkerRuntime(process.cwd());
 const nativeTools = REMOTE_TOOL_NAMES.map((name) => ({
   name,
   description: schemaRuntime.tools[name].description,

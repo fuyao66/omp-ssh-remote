@@ -210,7 +210,9 @@ Worker 构建仅对 SDK 18.15.0 做严格锚点匹配的配置后备与修改完
 
 只为缺失的原生默认 clangd 补可执行文件；项目／PATH clangd、显式 command／disabled／fileTypes／rootMarkers 和 ccls 等语义替代配置优先，即使显式替代命令不可用也不新增重复 server。保留原生 `--background-index`／`--clang-tidy`／`--header-insertion=iwyu` 及文件类型；后台索引可能创建 clangd 常规项目缓存。不自动添加通配 `--query-driver`，执行项目编译器探测 include 必须由项目显式授权配置。
 
-不提供标准库 SDK、编译器、CANN SDK 或编译数据库。clangd 使用项目已有 `compile_commands.json`／`.clangd`，需要时可在原生 `lsp.json` 参数设置 `--compile-commands-dir=...`。应验证实际标准头文件和厂商 API，不能以 server 启动代替正确性。CUDA／Objective-C 文件类型仅继承原生选择，不代表捆绑其 SDK。
+不提供标准库 SDK、编译器、厂商 SDK 或编译数据库。clangd 使用项目已有 `compile_commands.json`／`.clangd`，需要时可在原生 `lsp.json` 参数设置 `--compile-commands-dir=...`。应验证实际标准头文件和厂商 API，不能以 server 启动代替正确性。CUDA／Objective-C 文件类型仅继承原生选择，不代表捆绑其 SDK。
+
+`cpp-lsp` smoke 始终运行 scratch C++ 检查。现有项目的只读验收由环境变量显式启用：`REMOTE_CPP_PROJECT_ROOT`（绝对路径）、`REMOTE_CPP_PROJECT_DATABASE`、`REMOTE_CPP_PROJECT_FILE`、`REMOTE_CPP_PROJECT_SYMBOL`、`REMOTE_CPP_PROJECT_LINE`、`REMOTE_CPP_PROJECT_DEFINITION_FILE`、`REMOTE_CPP_PROJECT_DEFINITION_LINE`、`REMOTE_CPP_PROJECT_REFERENCE_COUNT`。文件／数据库路径可为绝对路径或相对项目根目录的路径；行号从 1 开始，引用数量必须精确匹配；所选文件必须恰好有一条编译命令。诊断默认必须干净；如提供 `REMOTE_CPP_PROJECT_DIAGNOSTIC_PATTERN`（JavaScript 正则表达式），每条诊断都必须匹配，缺失头文件仍必定失败。验收使用包内 clangd，关闭后台索引，只在 scratch 写配置，并校验源文件、定义文件及数据库哈希未变。
 
 ## 部署与安全
 
@@ -285,4 +287,12 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 - 白名单之外的 settings 在 companion 中保持编译默认值，不提供任意 settings 透传；
 - 每个 session 或子代理各占一个 companion 进程；并发子代理各消耗一条 SSH 通道和一个 worker 进程；
 - 单个输出 frame 不能超过 16 MiB；
+- 宿主 Git 状态／overlay 和状态栏 Git 信息描述本机仓库，而非绑定的远端工作区；
+- 计划自动保存（`plan.autosave`）写入本机 `.omp/plans/`；
+- `/clear` 和提示刷新会重新读取本机项目上下文文件；
+- 原生 hooks 和 `pi.exec` 在本机执行；
+- 远端 Bash 自动转入后台后仍可能接受 `out://`，与原生后台执行不同；
+- 远端 AST 预览不执行原生待处理预览的提醒和升级约束；
+- 连接和每轮开始前会拒绝 Cursor 模型及当前使用 Cursor 的 advisor。经 `tool_call` 的 advisor 工作区调用会被阻止，但 Cursor advisor 的直接操作绕过该 hook；后续 advisor 模型变化不受持续门控，绑定期间不支持此类用法；
+- 启用 autoresearch 工具时拒绝连接；原生未暴露私有的实验运行状态，请先关闭 autoresearch 并等待已有实验停止；
 - browser、desktop、模型凭据、memory 和本机 session 控制面不进入远端。

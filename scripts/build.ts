@@ -1,22 +1,9 @@
-import { mkdir, readdir, rm } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { resolveOmpBuildVersion } from "../src/omp/host-identity.ts";
 const root = resolve(import.meta.dir, "..");
 const ompOutdir = resolve(root, "packages/omp/dist");
 await mkdir(ompOutdir, { recursive: true });
-{
-  for (const entry of await readdir(ompOutdir)) {
-    if (
-      entry === "worker.js" ||
-      /^(cache|lifecycle|capture|rich-output|lsp|cpp-lsp)-smoke\.js$/.test(entry) ||
-      entry.startsWith("CHANGELOG-") ||
-      entry.startsWith("template-") ||
-      entry.startsWith("tool-views.generated-")
-    ) {
-      await rm(resolve(ompOutdir, entry), { force: true });
-    }
-  }
-}
 {
   const hostVersion = await resolveOmpBuildVersion(root);
   const extension = await Bun.build({

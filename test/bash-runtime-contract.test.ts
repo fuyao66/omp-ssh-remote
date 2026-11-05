@@ -22,9 +22,9 @@ describe("bash local orchestration and remote execution contracts", () => {
 
   test("frontend runtime snapshots reject service stops without a worker driver and dispatch injected stops exactly", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-service-driver-"));
-    const snapshot = await createNativeWorkerRuntime(cwd, "18.12.6");
+    const snapshot = await createNativeWorkerRuntime(cwd);
     const calls: Array<{ cwd: string; name: string; id: string }> = [];
-    const worker = await createNativeWorkerRuntime(cwd, "18.12.6", {
+    const worker = await createNativeWorkerRuntime(cwd, {
       serviceLifecycle: {
         execute: async () => { throw new Error("This test exercises stop dispatch only"); },
         stop: async (cwd, name, id) => {
@@ -66,7 +66,7 @@ describe("bash local orchestration and remote execution contracts", () => {
   for (const bashServices of [false, true]) {
     test(`actual native schema matrix preserves service capability=${bashServices}`, async () => {
       const cwd = await mkdtemp(join(tmpdir(), "omp-bash-contract-"));
-      const runtime = await createNativeWorkerRuntime(cwd, "18.12.6", { bashServices });
+      const runtime = await createNativeWorkerRuntime(cwd, { bashServices });
       try {
         const tools = Object.values(runtime.tools).map(tool => ({ ...captureOmpToolSnapshot(tool), description: tool.description }));
         const ready: ReadyMessage = { type: "ready", protocolVersion: PROTOCOL_VERSION, runtimeVersion: TOOL_RUNTIME_VERSION, host: "omp", hostVersion: "18.12.6", tools };

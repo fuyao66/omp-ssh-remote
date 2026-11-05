@@ -1,17 +1,18 @@
 import { editInspect, type EditInspection } from "@oh-my-pi/pi-natives";
 import { recoverConflictUriPrefix } from "@oh-my-pi/pi-coding-agent/tools/conflict-detect";
 import { unwrapHashlineHeaderPath } from "@oh-my-pi/pi-coding-agent/tools/plan-mode-guard";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import type { OmpEditMode, RemoteToolName } from "./protocol.ts";
 
 const URI_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 
 export function isInternalUri(path: string): boolean {
-  return URI_SCHEME.test(path);
+  return URI_SCHEME.test(InternalUrlRouter.instance().normalize(path));
 }
 
 export function normalizePathArgument(value: unknown): string {
   if (typeof value !== "string") return "";
-  return recoverConflictUriPrefix(unwrapHashlineHeaderPath(value.trim())).path;
+  return InternalUrlRouter.instance().normalize(recoverConflictUriPrefix(unwrapHashlineHeaderPath(value.trim())).path);
 }
 
 export function pathsShouldStayLocal(paths: string[]): boolean {

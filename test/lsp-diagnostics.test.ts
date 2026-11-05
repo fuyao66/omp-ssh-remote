@@ -86,7 +86,7 @@ test("actual native write/edit producers share ordered versions and suppress old
   const cwd = await mkdtemp(join(tmpdir(), "remote-lsp-producer-"));
   const received: LspDiagnostics[] = [];
   const order: string[] = [];
-  const runtime = await createNativeWorkerRuntime(cwd, "18.15.0", {
+  const runtime = await createNativeWorkerRuntime(cwd, {
     sessionId: "native-owner", resourceBinding: "native-binding",
     settings: { "lsp.diagnosticsDeduplicate": false },
     onLspMutation: event => order.push(`mutation:${event.version}`),

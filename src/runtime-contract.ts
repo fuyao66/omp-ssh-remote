@@ -12,14 +12,7 @@ export interface RemoteRuntimeHandshake {
   validateReady(ready: ReadyMessage): void;
 }
 
-export interface RemoteCompanionArtifact {
-  id: string;
-  filePrefix: string;
-  executableName: string;
-}
-
 export interface RemoteWorkerBundle {
   owner: "omp-ssh-remote/native-omp";
   cacheNamespace: string;
-  companionArtifacts: readonly RemoteCompanionArtifact[];
 }

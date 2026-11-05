@@ -71,8 +71,9 @@ describe("native worker round trip", () => {
     const uri = JSON.stringify(result).match(/remote-artifact:\/\/[a-f0-9-]+\/\d+/)?.[0];
     expect(uri).toBeDefined();
     const recovered = await client.execute("read", "recover-output", { path: `${uri}:10000-10002` });
-    expect(JSON.stringify(recovered)).toContain("10000:10000");
-    expect(JSON.stringify(recovered)).toContain("10002:10002");
+    const artifact = recovered as AgentToolResult<{ rowPrefixes: boolean }>;
+    expect(artifact.content.filter(part => part.type === "text").map(part => part.text).join("\n").split("\n")).toEqual(expect.arrayContaining(["10000", "10001", "10002"]));
+    expect(artifact.details?.rowPrefixes).toBe(false);
   });
 
   for (const via of ["read", "grep"] as const) {

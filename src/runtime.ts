@@ -3,7 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { resolveEditMode } from "@oh-my-pi/pi-coding-agent/utils/edit-mode";
 import { DebugTool } from "@oh-my-pi/pi-coding-agent/tools/debug";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
@@ -15,9 +15,11 @@ import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { GlobTool } from "@oh-my-pi/pi-coding-agent/tools/glob";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { createXdevState, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
+import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
+import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import {
   REMOTE_TOOL_NAMES,
   parseResourceBinding,
@@ -42,6 +44,7 @@ export interface RemoteNativeTool {
   readonly name: string;
   readonly description: string;
   readonly parameters: unknown;
+  readonly concurrency?: AgentTool["concurrency"];
   readonly mode?: OmpEditMode;
   readonly customFormat?: ToolManifest["customFormat"];
   readonly customWireName?: string;
@@ -54,53 +57,6 @@ export interface RemoteNativeTool {
   ): Promise<unknown>;
 }
 
-function asRemoteNativeTool(
-  tool:
-    | ReadTool
-    | WriteTool
-    | EditTool
-    | BashTool
-    | GlobTool
-    | GrepTool
-    | LspTool
-    | AstGrepTool
-    | AstEditTool
-    | EvalTool
-    | DebugTool,
-): RemoteNativeTool {
-  return tool as unknown as RemoteNativeTool;
-}
-
-type PendingInvoker = {
-  id: string;
-  sourceToolName: string;
-  onInvoked: (input: unknown) => Promise<unknown> | unknown;
-};
-
-class PendingInvokerQueueAdapter {
-  #pending: PendingInvoker[] = [];
-
-  registerPendingInvoker(
-    id: string,
-    sourceToolName: string,
-    onInvoked: PendingInvoker["onInvoked"],
-  ): void {
-    this.removePendingInvoker(id);
-    this.#pending.push({ id, sourceToolName, onInvoked });
-  }
-
-  removePendingInvoker(id: string): void {
-    this.#pending = this.#pending.filter((entry) => entry.id !== id);
-  }
-
-  clearPendingInvokers(): void {
-    this.#pending = [];
-  }
-
-  peekPendingInvoker(): PendingInvoker["onInvoked"] | undefined {
-    return this.#pending.at(-1)?.onInvoked;
-  }
-}
 
 /**
  * Structural pins. These decide tool wire schemas or execution-domain
@@ -169,7 +125,6 @@ export type NativeWorkerRuntimeOptions = {
 
 export async function createNativeWorkerRuntime(
   cwd: string,
-  hostVersion: string,
   options: NativeWorkerRuntimeOptions = {},
 ): Promise<NativeWorkerRuntime> {
   const resourceBinding = parseResourceBinding(options.resourceBinding ?? randomUUID());
@@ -201,8 +156,8 @@ export async function createNativeWorkerRuntime(
     if (!entry.isStale()) options.onDeferredDiagnostics?.({ sessionId, resourceBinding, path: entry.path,
       version: mutationVersions.get(entry.path) ?? 0, summary: entry.summary, messages: entry.messages, errored: entry.errored });
   });
-  const pendingInvokers = new PendingInvokerQueueAdapter();
-  const xdevTools = new Map<string, RemoteNativeTool>();
+  const pendingInvokers = new ToolChoiceQueue();
+  const xdevTools = new Map<string, Tool>();
   const xdevMountedNames = new Set<string>(["lsp", "ast_grep", "ast_edit", "debug"]);
   const callableTools = new Map<string, RemoteNativeTool>();
   type EvalLease = { invoke: NonNullable<NativeWorkerRuntimeOptions["invokeTool"]>; active: boolean };
@@ -240,12 +195,6 @@ export async function createNativeWorkerRuntime(
           },
         }
       : {}),
-    xdev: {
-      tools: xdevTools,
-      mountedNames: xdevMountedNames,
-      builtInNames: new Set(xdevMountedNames),
-      isActive: (name) => REMOTE_TOOL_NAMES.includes(name as (typeof REMOTE_TOOL_NAMES)[number]),
-    } as NonNullable<ToolSession["xdev"]>,
     getFileMutationVersion: (path) => mutationVersions.get(path) ?? 0,
     bumpFileMutationVersion: (path) => {
       const next = (mutationVersions.get(path) ?? 0) + 1;
@@ -259,7 +208,8 @@ export async function createNativeWorkerRuntime(
     } : {}),
     isToolActive: (name) => REMOTE_TOOL_NAMES.includes(name as (typeof REMOTE_TOOL_NAMES)[number]),
     getToolByName: name => {
-      const tool = callableTools.get(name);
+      const bareName = stripXdUrlPrefix(name);
+      const tool = callableTools.get(bareName) ?? [...callableTools.values()].find(tool => tool.customWireName === bareName);
       if (!tool) return undefined;
       // Native JS/Python resolve ordinary tools synchronously while their
       // per-run registration is still active. Snapshot ownership at lookup,
@@ -270,20 +220,18 @@ export async function createNativeWorkerRuntime(
         async execute(...args: Parameters<RemoteNativeTool["execute"]>) {
           args[2]?.throwIfAborted();
           if (lease && (!lease.active || evalLease !== lease)) throw new Error("Remote Eval invocation lease is no longer active");
-          assertNestedRemoteTool(name, args[1], resourceBinding, resolveEditMode(session));
+          assertNestedRemoteTool(tool.name, args[1], resourceBinding, resolveEditMode(session));
           const invoke = lease?.invoke ?? options.invokeTool;
           if (!invoke) throw new Error("Remote Eval nested tools require the host invocation bridge");
-          return invoke(name as RemoteToolName, ...args);
+          return invoke(tool.name as RemoteToolName, ...args);
         },
       } as unknown as ReturnType<NonNullable<ToolSession["getToolByName"]>>;
     },
-    getToolChoiceQueue: () =>
-      pendingInvokers as unknown as ReturnType<
-        NonNullable<ToolSession["getToolChoiceQueue"]>
-      >,
+    getToolChoiceQueue: () => pendingInvokers,
     peekPendingInvoker: () => pendingInvokers.peekPendingInvoker(),
     clearPendingInvokers: () => pendingInvokers.clearPendingInvokers(),
   };
+  session.xdev = createXdevState(session, xdevTools, new Set(xdevMountedNames), xdevMountedNames);
   const editMode = resolveEditMode(session);
   if (options.editMode !== undefined && editMode !== options.editMode) {
     await artifacts.dispose();
@@ -291,17 +239,17 @@ export async function createNativeWorkerRuntime(
   }
 
   const tools: Record<RemoteToolName, RemoteNativeTool> = {
-    read: asRemoteNativeTool(new ReadTool(session)),
-    write: asRemoteNativeTool(new WriteTool(session)),
-    edit: asRemoteNativeTool(new EditTool(session, editMode)),
-    bash: asRemoteNativeTool(new BashTool(session)),
-    grep: asRemoteNativeTool(new GrepTool(session)),
-    glob: asRemoteNativeTool(new GlobTool(session, { rootPathAlias: true })),
-    lsp: asRemoteNativeTool(new LspTool(session)),
-    ast_grep: asRemoteNativeTool(new AstGrepTool(session)),
-    ast_edit: asRemoteNativeTool(new AstEditTool(session)),
-    eval: asRemoteNativeTool(new EvalTool(session)),
-    debug: asRemoteNativeTool(new DebugTool(session)),
+    read: new ReadTool(session),
+    write: new WriteTool(session),
+    edit: new EditTool(session, editMode) as unknown as RemoteNativeTool,
+    bash: new BashTool(session) as unknown as RemoteNativeTool,
+    grep: new GrepTool(session),
+    glob: new GlobTool(session, { rootPathAlias: true }),
+    lsp: new LspTool(session) as unknown as RemoteNativeTool,
+    ast_grep: new AstGrepTool(session),
+    ast_edit: new AstEditTool(session),
+    eval: new EvalTool(session),
+    debug: new DebugTool(session),
   };
   const read = tools.read.execute.bind(tools.read);
   tools.read.execute = (...args) => conflictHistory.captureRead(() => read(...args));
@@ -356,12 +304,13 @@ export async function createNativeWorkerRuntime(
   const evalCallableNames = NESTED_TOOL_NAMES;
   for (const name of evalCallableNames) {
     const tool = tools[name];
-    callableTools.set(name, { name: tool.name, description: tool.description, parameters: tool.parameters,
+    callableTools.set(name, { name: tool.name, description: tool.description,
+      parameters: tool.parameters, customWireName: tool.customWireName,
       execute: async () => { throw new Error("Eval callable tools must resolve an invocation lease"); },
     });
   }
   for (const name of xdevMountedNames)
-    xdevTools.set(name, tools[name as RemoteToolName]);
+    xdevTools.set(name, tools[name as RemoteToolName] as Tool);
   let disposed: Promise<void> | undefined;
   const dispose = () => (disposed ??= (revisions.dispose(), artifacts.dispose()));
   return {

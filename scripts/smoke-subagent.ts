@@ -41,7 +41,7 @@ const activeTools = [
   "eval",
   "debug",
 ];
-const schemaRuntime = await createNativeWorkerRuntime(localCwd, "smoke");
+const schemaRuntime = await createNativeWorkerRuntime(localCwd);
 const nativeTools = REMOTE_TOOL_NAMES.map((name) => ({
   name,
   description: schemaRuntime.tools[name].description,

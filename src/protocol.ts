@@ -31,7 +31,6 @@ export const REMOTE_TOOL_NAMES = [
   "debug",
 ] as const;
 export type RemoteToolName = (typeof REMOTE_TOOL_NAMES)[number];
-export type AnyRemoteToolName = string;
 
 export const OMP_EDIT_MODES = ["replace", "patch", "apply_patch", "hashline", "sloppy"] as const;
 export type OmpEditMode = (typeof OMP_EDIT_MODES)[number];

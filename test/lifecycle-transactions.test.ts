@@ -8,6 +8,8 @@ import * as ssh from "../src/ssh.ts";
 import * as identity from "../src/omp/host-identity.ts";
 import * as deployment from "../src/deploy.ts";
 import * as configuration from "../src/connect-options.ts";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 
 function gate() {
   const entered = Promise.withResolvers<void>(), released = Promise.withResolvers<void>();
@@ -66,19 +68,25 @@ const active = (globalThis as unknown as Record<symbol, Map<string, Family>>)[Sy
 type Harness = {
   sessionFile: string;
   nativeReads: string[];
-  emit(name: string): Promise<unknown>;
-  command(name: string): Promise<unknown>;
+  emit(name: string, event?: unknown): Promise<unknown>;
+  command(name: string, args?: string): Promise<unknown>;
+  setModel(model: { provider: string; api?: string } | undefined): void;
+  activeTools: string[];
+  context: ExtensionContext;
+  aborts: string[];
   execute(name: string, args?: Record<string, unknown>): Promise<{ details?: unknown }>;
   state(family: Family): State;
   status(): Promise<{ mode: string }>;
 };
 const harnesses: Harness[] = [];
 const settle = (promise: Promise<unknown>): Promise<Error | null> => promise.then(() => null, (error: Error) => error);
-async function harness(sessionFile = join(directory, "owner.jsonl")): Promise<Harness> {
+async function harness(sessionFile = join(directory, "owner.jsonl"), agent: ExtensionContext["agent"] = { kind: "main", id: `owner-${crypto.randomUUID()}`, name: "owner", depth: 0 }): Promise<Harness> {
   const hooks = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
   const tools = new Map<string, ToolDefinition>(), commands = new Map<string, { handler: Function }>();
   const nativeReads: string[] = [];
-  const ctx = { cwd: directory, sessionManager: { getSessionFile: () => sessionFile, getBranch: () => [] },
+  const activeTools = ["read", "bash"], aborts: string[] = [];
+  const ctx = { cwd: directory, model: undefined, agent, sessionManager: { getSessionFile: () => sessionFile, getBranch: () => [] },
+    abort() { aborts.push("abort"); },
     ui: { notify() {}, setStatus() {}, setWorkingMessage() {} },
     async invokeTool(params: { path?: string; command?: string }) {
       if (params.path) { nativeReads.push(params.path); await readFile(params.path); }
@@ -89,13 +97,14 @@ async function harness(sessionFile = join(directory, "owner.jsonl")): Promise<Ha
   await extension({ registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
     registerCommand: (name: string, command: { handler: Function }) => commands.set(name, command),
     on: (name: string, hook: (event: unknown, ctx: ExtensionContext) => unknown) => hooks.set(name, hook),
-    getActiveTools: () => ["read", "bash"], getAllTools: () => REMOTE_TOOL_NAMES.map(name => ({
+    getActiveTools: () => activeTools, getAllTools: () => REMOTE_TOOL_NAMES.map(name => ({
       name, description: name, parameters: { type: "object" }, sourceInfo: { source: "builtin" },
     })),
   } as unknown as ExtensionAPI);
-  const h: Harness = { sessionFile, nativeReads,
-    emit: async (name: string) => await hooks.get(name)!({}, ctx),
-    command: async (name: string) => await commands.get(name)!.handler("", ctx),
+  const h: Harness = { sessionFile, nativeReads, activeTools, context: ctx, aborts,
+    setModel(model) { Object.assign(ctx, { model }); },
+    emit: async (name: string, event = {}) => await hooks.get(name)!(event, ctx),
+    command: async (name: string, args = "") => await commands.get(name)!.handler(args, ctx),
     execute: async (name: string, args = {}) => await tools.get(name)!.execute(name, args, undefined, undefined, ctx),
     state: (family: Family): State => [...family.members].find(member => member.sessionFile === sessionFile)!,
     status: async () => (await tools.get("remote_workspace_status")!.execute("status", {}, undefined, undefined, ctx)).details as { mode: string },
@@ -202,4 +211,98 @@ test("transport death rejects wrapped filesystem tools without native local fall
   expect(owner.nativeReads).toEqual([]);
   expect(await readFile(marker, "utf8")).toBe("local sentinel");
   expect(await Bun.file(join(directory, "native-bash")).exists()).toBe(false);
+});
+
+test.each(["running", "idle"] as const)("connect refuses %s descendants including live grandchildren", async status => {
+  const owner = await harness(), registry = AgentRegistry.global();
+  const ownerId = owner.context.agent.id;
+  const child = `${ownerId}-child`, grandchild = `${ownerId}-grandchild`;
+  registry.register({ id: ownerId, displayName: "owner", kind: "main", session: {
+    sessionManager: owner.context.sessionManager, getToolByName: () => undefined, settings: Settings.isolated(),
+    getAdvisorStats: () => ({ configured: false, advisors: [] }),
+  } as never });
+  registry.register({ id: child, displayName: "child", kind: "sub", parentId: ownerId, session: null, status: "parked" });
+  registry.register({ id: grandchild, displayName: "grandchild", kind: "sub", parentId: child, session: {} as never, status });
+  try {
+    await expect(owner.execute("remote_connect", { target: "fixture.invalid" })).rejects.toThrow(/live descendant.*wait.*stop/i);
+    await expect(owner.command("remote-connect", "fixture.invalid")).rejects.toThrow(/live descendant.*wait.*stop/i);
+    expect((await owner.status()).mode).toBe("local");
+    registry.detachSession(grandchild);
+    await owner.execute("remote_connect", { target: "fixture.invalid" });
+    expect((await owner.status()).mode).toBe("remote");
+  } finally { for (const id of [grandchild, child, ownerId]) registry.unregister(id); }
+});
+
+test("connect refuses enabled autoresearch before deployment", async () => {
+  const owner = await harness();
+  owner.activeTools.push("run_experiment");
+  await expect(owner.execute("remote_connect", { target: "fixture.invalid" })).rejects.toThrow(/autoresearch.*off/i);
+  await expect(owner.command("remote-connect", "fixture.invalid")).rejects.toThrow(/autoresearch.*off/i);
+  expect((await owner.status()).mode).toBe("local");
+});
+
+test.each([{ provider: "cursor" }, { provider: "custom", api: "cursor-agent" }])("Cursor provider cannot connect or start a bound turn: %j", async model => {
+  const owner = await harness();
+  owner.setModel(model);
+  await expect(owner.execute("remote_connect", { target: "fixture.invalid" })).rejects.toThrow(/Cursor.*locally.*unavailable while bound/i);
+  await expect(owner.command("remote-connect", "fixture.invalid")).rejects.toThrow(/Cursor.*locally.*unavailable while bound/i);
+  owner.setModel({ provider: "fixture" });
+  await owner.execute("remote_connect", { target: "fixture.invalid" });
+  owner.setModel(model);
+  await owner.emit("before_agent_start");
+  expect(owner.aborts).toEqual(["abort"]);
+  owner.setModel({ provider: "fixture" });
+  await owner.emit("before_agent_start");
+  expect(owner.aborts).toEqual(["abort"]);
+});
+
+test("Cursor advisor effective models veto connect and bound turns", async () => {
+  const owner = await harness(), registry = AgentRegistry.global(), id = owner.context.agent.id;
+  const advisors = [{ name: "local-review", model: { provider: "cursor", api: "cursor-agent" } }];
+  registry.register({ id, displayName: "owner", kind: "main", session: {
+    sessionManager: owner.context.sessionManager, settings: Settings.isolated(), getToolByName: () => undefined,
+    getAdvisorStats: () => ({ configured: true, advisors }),
+  } as never });
+  try {
+    await expect(owner.execute("remote_connect", { target: "fixture.invalid" })).rejects.toThrow(/Advisor local-review: Cursor/);
+    await expect(owner.command("remote-connect", "fixture.invalid")).rejects.toThrow(/Advisor local-review: Cursor/);
+    advisors[0]!.model = { provider: "fixture", api: "fixture" };
+    await owner.execute("remote_connect", { target: "fixture.invalid" });
+    advisors[0]!.model = { provider: "cursor", api: "cursor-agent" };
+    await owner.emit("before_agent_start");
+    expect(owner.aborts).toEqual(["abort"]);
+  } finally { registry.unregister(id); }
+});
+
+test("switching to Cursor after connect aborts before_agent_start without throwing", async () => {
+  const { owner } = await connected();
+  owner.setModel({ provider: "cursor", api: "cursor-agent" });
+  expect(await owner.emit("before_agent_start")).toBeUndefined();
+  expect(owner.aborts).toEqual(["abort"]);
+});
+
+test("connect admission rechecks descendants created during deployment", async () => {
+  const owner = await harness(), registry = AgentRegistry.global();
+  const child = `${owner.context.agent.id}-late-child`;
+  preparation = gate();
+  const connecting = settle(owner.execute("remote_connect", { target: "fixture.invalid" }));
+  await preparation.entered;
+  registry.register({ id: child, displayName: "child", kind: "sub", parentId: owner.context.agent.id, session: {} as never });
+  try {
+    preparation.release();
+    const error = await connecting;
+    expect(error?.message).toMatch(/live descendant/i);
+    expect((await owner.status()).mode).toBe("local");
+    expect(broker.hasOwner(owner.sessionFile)).toBe(false);
+  } finally { registry.unregister(child); }
+});
+
+test("a native task session named advisor retains its remote workspace wrappers", async () => {
+  const { owner, family } = await connected();
+  const child = await harness(`${family.root}/subagent/advisor.jsonl`, {
+    kind: "sub", id: "advisor", name: "advisor", depth: 1, parentId: owner.context.agent.id,
+  });
+  expect(await child.emit("tool_call", { toolName: "read", input: { path: "/remote/project" } })).toBeUndefined();
+  expect(await child.execute("read", { path: "/remote/project" })).toMatchObject({ details: { path: "/remote/project" } });
+  expect(child.nativeReads).toEqual([]);
 });

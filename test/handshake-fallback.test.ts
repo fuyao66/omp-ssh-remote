@@ -18,7 +18,7 @@ test("missing edit metadata uses the effective host edit mode", async () => {
   process.argv[1] = import.meta.resolve("@oh-my-pi/pi-coding-agent").replace(/^file:\/\//, "");
   delete process.env.PI_EDIT_VARIANT;
   const settings = Settings.isolated({ "edit.mode": "replace" });
-  const runtime = await createNativeWorkerRuntime(cwd, "18.15.0", { editMode: "replace" });
+  const runtime = await createNativeWorkerRuntime(cwd, { editMode: "replace" });
   try {
     const pi = { getAllTools: () => Object.values(runtime.tools).filter(tool => tool.name !== "edit") } as unknown as ExtensionAPI;
     const state = {

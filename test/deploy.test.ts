@@ -14,8 +14,8 @@ async function build(root: string, c: string, ns = "omp-1") {
   await writeFile(join(directory, "worker-linux-x64.sha256"), hash(c) + "\n");
   return directory;
 }
-function commit(root: string, c: string, ns = "omp-1", links: string[] = []) {
-  const result = spawnSync("sh", ["-c", buildCommitWorkerCacheCommand(root, ns, hash(c), links)], { encoding: "utf8", timeout: 10000 });
+function commit(root: string, c: string, ns = "omp-1") {
+  const result = spawnSync("sh", ["-c", buildCommitWorkerCacheCommand(root, ns, hash(c))], { encoding: "utf8", timeout: 10000 });
   expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: "" });
   return parseRemoteWorkerCacheAudit(result.stdout.trim());
 }
@@ -104,9 +104,11 @@ describe("managed native worker cache", () => {
       await writeFile(join(a, "user-data"), "keep");
       const b = await build(root, "b"); commit(root, "b");
       await writeFile(join(b, ".native-worker-v1"), "invalid\n");
-      const c = await build(root, "c");
+      const c = await build(root, "c"); commit(root, "c");
       await writeFile(join(root, "shared"), "shared asset"); await symlink(join(root, "shared"), join(c, "companion"));
-      commit(root, "c", "omp-1", ["companion"]);
+      // Historical manifests retain their validated link ownership; new admissions never create links.
+      const manifest = join(c, ".native-worker-v1");
+      await writeFile(manifest, (await readFile(manifest, "utf8")).replace(/\t-\n$/, "\tcompanion\n"));
       await build(root, "d"); commit(root, "d");
       await build(root, "e"); const audit = commit(root, "e");
       expect(audit).toMatchObject({ unclassified: 2 });

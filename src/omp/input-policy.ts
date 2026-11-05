@@ -2,7 +2,7 @@ import type { ExtensionContext, InputEvent, InputEventResult } from "@oh-my-pi/p
 import { extractFileMentions } from "@oh-my-pi/pi-coding-agent/utils/file-mentions";
 import { resolveReadPath } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { lookupBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
-import { parseSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/parse";
+import { parseSlashCommand, parseSubcommand } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/parse";
 import { parseLoopArgs } from "@oh-my-pi/pi-coding-agent/modes/loop-limit";
 import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgBareSlashCommands } from "@oh-my-pi/pi-coding-agent/modes/settings";
@@ -16,12 +16,13 @@ const HOST_COMMAND_ALTERNATIVES: Readonly<Record<string, string>> = {
   "/remove-dir": "Use explicit remote paths rather than changing local directory context.",
   "/review": "Use git diff through remote bash, then remote read to review the changes.",
   "/annotate": "Use remote read to inspect source files instead.",
+  "/autoresearch": "Autoresearch executes Git and experiments locally; use remote tools instead.",
 };
 
 // Native has no pure consumption predicate: dispatch runs the handler and
 // inspects its result (builtin-registry.ts:169-196; acp-builtins.ts:63-69).
-// Only exempt the source-audited /switch: builtin-modes.ts:470-505 never
-// returns a residual prompt; usage() also consumes input (helpers/parse.ts:70-72).
+// /switch consumes aliases (builtin-modes.ts:470-505); /todo append stores
+// literal task text (helpers/todo.ts:160-185; todo-command-controller.ts:265-306).
 const CONSUMED_MENTION_BUILTINS: ReadonlySet<string> = new Set(["switch"]);
 
 /** Match native resolveMentionPath without reading or materializing host contents. */
@@ -60,11 +61,14 @@ export async function remoteInputPolicy(
   const alternative = Object.hasOwn(HOST_COMMAND_ALTERNATIVES, command)
     ? HOST_COMMAND_ALTERNATIVES[command] : undefined;
   const loop = builtin?.name === "loop" && parsed ? parseLoopArgs(parsed.args) : undefined;
-  const consumed = builtin && CONSUMED_MENTION_BUILTINS.has(builtin.name) &&
+  const todoVerb = builtin?.name === "todo" && parsed ? parseSubcommand(parsed.args).verb : undefined;
+  const consumed = builtin && (CONSUMED_MENTION_BUILTINS.has(builtin.name) || todoVerb === "append") &&
     (!parsed?.args.length || builtin.allowArgs) && event.source !== "extension";
   let reason: string | undefined;
   if (alternative) {
     reason = `${command} would act on the local machine while bound to remote. ${alternative} Use /remote-exit before running it locally.`;
+  } else if (todoVerb === "export" || todoVerb === "import") {
+    reason = `/todo ${todoVerb} would act on a local project file while bound to remote. Use remote read/write, or /remote-exit first.`;
   } else if (loop && typeof loop !== "string" && loop.condition) {
     reason = "/loop would act on the local machine while bound to remote: --until and --while conditions execute in the native local shell. Run conditions through remote bash, or use /loop without a shell condition.";
   } else if (!consumed && await hasHostFileMention(event.text, ctx.sessionManager.getCwd())) {

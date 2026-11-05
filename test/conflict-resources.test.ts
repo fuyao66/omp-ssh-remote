@@ -100,7 +100,7 @@ describe("read-owned conflict registrations", () => {
 
   test("native runtime emits structured ids for multi-path, concurrent and repeated reads only", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-read-conflicts-"));
-    const runtime = await createNativeWorkerRuntime(cwd, "test");
+    const runtime = await createNativeWorkerRuntime(cwd);
     try {
       for (const file of ["one.txt", "two.txt", "three.txt", "four.txt"]) await writeFile(join(cwd, file), conflict);
       await writeFile(join(cwd, "literal.txt"), "conflict://999 is documentation, not a native registration\n");

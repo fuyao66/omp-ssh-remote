@@ -7,12 +7,6 @@ import {
 import { prepareRemoteWorker } from "../src/deploy.ts";
 import { buildSshWorkerCommand } from "../src/ssh.ts";
 
-type Host = "omp";
-
-const host = process.argv[2] as Host | undefined;
-if (host !== "omp") {
-  throw new Error(`Usage: bun scripts/benchmark-remote.ts <omp>`);
-}
 const target = process.env.REMOTE_ALIAS ?? process.env.REMOTE_TARGET;
 const requestedCwd = process.env.REMOTE_CWD;
 if (!target) throw new Error("REMOTE_ALIAS or REMOTE_TARGET is required");
@@ -57,7 +51,7 @@ const summary = (samples: number[]) => ({
   samples,
 });
 
-const localArtifactDir = new URL(`../packages/${host}/dist/`, import.meta.url)
+const localArtifactDir = new URL("../packages/omp/dist/", import.meta.url)
   .pathname;
 let started = performance.now();
 const prepared = await prepareRemoteWorker(
@@ -65,14 +59,13 @@ const prepared = await prepareRemoteWorker(
 );
 const deployCacheMs = milliseconds(started);
 const cwd = requestedCwd ?? prepared.home;
-if (!cwd) { await prepared.dispose(); throw new Error("Remote cwd and probed remote home are unavailable"); }
 const client = new RemoteRuntimeClient({
   command: buildSshWorkerCommand({
     ...connection,
     workerPath: prepared.workerPath,
   }),
 });
-const benchmarkFile = `.ssh-remote-benchmark-${host}-${process.pid}.ts`;
+const benchmarkFile = `.ssh-remote-benchmark-omp-${process.pid}.ts`;
 try {
   started = performance.now();
   const ready = await client.initialize(
@@ -96,23 +89,15 @@ try {
     client.execute("bash", `benchmark-bash-${index}`, { command: ":" }),
   );
 
-  const hostSpecific =
-    host === "omp"
-      ? {
-          lspStatus: summary(
-            await sample(3, (index) =>
-              client.execute("write", `benchmark-lsp-${index}`, {
-                path: "xd://lsp",
-                content: JSON.stringify({ action: "status" }),
-              }),
-            ),
-          ),
-        }
-      : {};
+  const lspStatus = summary(await sample(3, (index) =>
+    client.execute("write", `benchmark-lsp-${index}`, {
+      path: "xd://lsp", content: JSON.stringify({ action: "status" }),
+    }),
+  ));
 
   console.log(
     JSON.stringify({
-      host,
+      host: "omp",
       remoteRuntime:
         ready.capabilities?.assembly ?? ready.ompVersion ?? ready.hostVersion,
       toolCount: ready.tools.length,
@@ -120,7 +105,7 @@ try {
       initializeMs,
       read: summary(reads),
       bash: summary(shells),
-      ...hostSpecific,
+      lspStatus,
     }),
   );
 } finally {

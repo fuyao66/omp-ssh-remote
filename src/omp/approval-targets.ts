@@ -93,9 +93,9 @@ export function remoteWrapperApproval(
       const target = state.family?.connection.displayTarget ?? "unknown";
       return [...rows, `Remote: ${target}:${state.remoteCwd ?? "(unknown cwd)"}`];
     },
-    approval(args) {
+    approval(args, context) {
       assertBinding(args);
-      return typeof nativeApproval === "function" ? nativeApproval(args) : nativeApproval;
+      return typeof nativeApproval === "function" ? nativeApproval(args, context) : nativeApproval;
     },
     approvalCacheTargets(args) {
       assertBinding(args);

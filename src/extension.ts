@@ -15,7 +15,7 @@ import {
   type RemoteConnectRequest,
 } from "./connect-options.ts";
 import { RemoteRuntimeClient, remoteErrorMessage } from "./client.ts";
-import { describeRemoteWorkerCacheAudit, prepareRemoteWorker, resolveRemoteHome, type PreparedRemoteWorker, type RemoteWorkerCacheAudit } from "./deploy.ts";
+import { describeRemoteWorkerCacheAudit, prepareRemoteWorker, type PreparedRemoteWorker, type RemoteWorkerCacheAudit } from "./deploy.ts";
 import { REMOTE_TOOL_NAMES, type RemoteToolName, type ReadyMessage } from "./protocol.ts";
 import { createOmpRuntimeHandshake, captureOmpToolSnapshot } from "./omp/runtime-contract.ts";
 import { ompHostCompatibility, resolveOmpHostVersion, type OmpHostCompatibility } from "./omp/host-identity.ts";
@@ -58,6 +58,7 @@ import { resourceOwnershipTarget } from "./resource-ownership.ts";
 import type { ToolContextStore } from "@oh-my-pi/pi-coding-agent/tools/context";
 import { RemoteLspDiagnostics, mayMutateLsp, parseLspEvent, type LspDiagnostics } from "./omp/lsp-diagnostics.ts";
 import { remoteInputPolicy } from "./omp/input-policy.ts";
+import { REPO_SCOPE_QUALIFIER_PATTERN } from "@oh-my-pi/pi-coding-agent/tools/gh-search";
 
 /**
  * Snapshot the execution-domain subset of the local session's settings.
@@ -343,6 +344,41 @@ function effectiveHostEditMode(state: RemoteExtensionState, ctx?: ExtensionConte
   return resolveEditMode({ settings, getActiveModelString: () => model ? `${model.provider}/${model.id}` : undefined });
 }
 
+const AUTORESEARCH_TOOLS = new Set(["init_experiment", "run_experiment", "log_experiment", "update_notes"]);
+const CURSOR_BOUND_REASON = "Cursor's provider executes workspace operations locally and is unavailable while bound.";
+
+function cursorModel(model: { provider: string; api: string } | undefined): boolean {
+  return model?.provider === "cursor" || model?.api === "cursor-agent";
+}
+
+/** AdvisorStats reads each live advisor Agent's effective model, not its selector. */
+function cursorBlockReason(state: RemoteExtensionState, ctx?: ExtensionContext): string | undefined {
+  const host = hostSessionFor(state, ctx);
+  if (cursorModel(ctx?.model ?? host?.model)) return CURSOR_BOUND_REASON;
+  const stats = host?.getAdvisorStats();
+  const advisor = stats?.configured ? stats.advisors.find(item => cursorModel(item.model)) : undefined;
+  return advisor ? `Advisor ${advisor.name}: ${CURSOR_BOUND_REASON}` : undefined;
+}
+
+/** Native refs keep idle task sessions live; parked ancestors still carry lineage. */
+function hasLiveDescendants(state: RemoteExtensionState, ctx?: ExtensionContext): boolean {
+  const refs = AgentRegistry.global().list();
+  const ownerId = resolveHostSessionRef(state.sessionFile, ctx ?? state.hostContext)?.id ?? ctx?.agent?.id;
+  if (!ownerId) return false;
+  const byId = new Map(refs.map(ref => [ref.id, ref]));
+  return refs.some(ref => {
+    if (ref.kind !== "sub" || !ref.session || ref.id === ownerId) return false;
+    const visited = new Set<string>();
+    let parent = ref.parentId;
+    while (parent && !visited.has(parent)) {
+      if (parent === ownerId) return true;
+      visited.add(parent);
+      parent = byId.get(parent)?.parentId;
+    }
+    return false;
+  });
+}
+
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -361,6 +397,9 @@ export function remoteControlPlaneBlockReason(
   input: unknown,
   sessionFile?: string,
 ): string | undefined {
+  if (AUTORESEARCH_TOOLS.has(toolName)) {
+    return "Autoresearch tools execute experiments and Git operations locally and are unavailable while bound to remote. Disconnect first.";
+  }
   if (["find", "security_scan", "ida"].includes(toolName)) {
     return `${toolName} is not remote-adapted. Disconnect before using it on the local workspace; use remote grep/glob/bash for remote files.`;
   }
@@ -378,7 +417,10 @@ export function remoteControlPlaneBlockReason(
     if (typeof op !== "string" || apiReads[op] !== true) {
       return "GitHub workspace operations are not remote-adapted. Use remote bash with an explicitly selected repository, or disconnect first.";
     }
-    if (!op.startsWith("search_") && (typeof params?.repo !== "string" || !params.repo.trim())) {
+    const scopedSearch = ["search_issues", "search_prs", "search_code", "search_commits"].includes(op);
+    const queryScoped = typeof params?.query === "string" && REPO_SCOPE_QUALIFIER_PATTERN.test(params.query);
+    if (op !== "search_repos" && !(scopedSearch && queryScoped) &&
+        (typeof params?.repo !== "string" || !params.repo.trim())) {
       return "GitHub API reads require an explicit repo while remote is selected; inferring the local repository is disabled.";
     }
   }
@@ -735,6 +777,7 @@ function registerWrapper(
   state: RemoteExtensionState,
   name: RemoteToolName,
   native: ToolInfo,
+  fallbackConcurrency?: AgentTool["concurrency"],
 ): void {
   const original = hostSessionFor(state)?.getToolByName(name);
   const approval = remoteWrapperApproval(
@@ -751,6 +794,10 @@ function registerWrapper(
     label: original?.label ?? TOOL_LABELS[name],
     get description() { return original?.description ?? native.description; },
     get parameters() { return original?.parameters ?? native.parameters; },
+    get concurrency() {
+      const concurrency = original?.concurrency ?? fallbackConcurrency;
+      return typeof concurrency === "function" ? concurrency.bind(original) : concurrency;
+    },
     ...remoteWrapperRenderer(name),
     loadMode: original?.loadMode ?? "essential",
     readsSkillUris: original?.readsSkillUris,
@@ -847,10 +894,7 @@ export async function captureOmpHandshake(pi: ExtensionAPI, state: RemoteExtensi
   const missing = REMOTE_TOOL_NAMES.filter((name) => !metadata.has(name));
   // Only setting-gated tools absent from the actual registry need a fallback.
   // Never substitute a default editor for the editor advertised by the host.
-  const fallback = missing.length ? await createNativeWorkerRuntime(
-    ctx?.cwd ?? state.localCwd ?? process.cwd(), hostVersion,
-    { editMode, settings: host ? captureExecutionSettings(host.settings) : captureLocalExecutionSettings() },
-  ) : undefined;
+  const fallback = missing.length ? await createNativeWorkerRuntime(ctx?.cwd ?? state.localCwd ?? process.cwd(), { editMode, settings: host ? captureExecutionSettings(host.settings) : captureLocalExecutionSettings() }) : undefined;
   try {
     const localTools = REMOTE_TOOL_NAMES.map((name) => {
       const live = host?.getToolByName(name);
@@ -875,15 +919,25 @@ async function registerActiveWrappers(
 ): Promise<void> {
   const active = new Set(pi.getActiveTools());
   const metadata = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
-  for (const name of REMOTE_TOOL_NAMES) {
-    if (!active.has(name) || state.wrappedTools.has(name)) continue;
-    const native = metadata.get(name);
-    if (!native)
-      throw new Error(`OMP native tool metadata is unavailable: ${name}`);
-    // Preserve other plugins' ownership; remote calls to unbound names fail closed.
-    if (native.sourceInfo.source !== "builtin") continue;
-    registerWrapper(pi, state, name, native);
-  }
+  const host = hostSessionFor(state);
+  const needsFallback = REMOTE_TOOL_NAMES.some(name => active.has(name) && !state.wrappedTools.has(name) &&
+    metadata.get(name)?.sourceInfo.source === "builtin" && !host?.getToolByName(name));
+  const fallback = needsFallback ? await createNativeWorkerRuntime(process.cwd(), {
+    editMode: effectiveHostEditMode(state),
+  }) : undefined;
+  try {
+    for (const name of REMOTE_TOOL_NAMES) {
+      if (!active.has(name) || state.wrappedTools.has(name)) continue;
+      const native = metadata.get(name);
+      if (!native)
+        throw new Error(`OMP native tool metadata is unavailable: ${name}`);
+      // Preserve other plugins' ownership; remote calls to unbound names fail closed.
+      if (native.sourceInfo.source !== "builtin") continue;
+      const fallbackTool = fallback?.tools[name];
+      const concurrency = fallbackTool?.concurrency;
+      registerWrapper(pi, state, name, native, typeof concurrency === "function" ? concurrency.bind(fallbackTool) : concurrency);
+    }
+  } finally { await fallback?.dispose(); }
   await hostSessionFor(state)?.runToolRegistryMutation(async () => {});
 }
 
@@ -1212,6 +1266,17 @@ async function connectOwner(
   if (remoteFamilyBroker.hasOwner(normalizedSessionFile)) {
     throw new Error("This session already owns a remote runtime family");
   }
+  const assertAdmission = () => {
+    const cursorReason = cursorBlockReason(state, ctx);
+    if (cursorReason) throw new Error(cursorReason);
+    if (hasLiveDescendants(state, ctx)) {
+      throw new Error("This session has live descendant agents; wait for or stop them before connecting a remote workspace.");
+    }
+    if (pi.getActiveTools().some(name => AUTORESEARCH_TOOLS.has(name))) {
+      throw new Error("Autoresearch is active locally; run /autoresearch off and wait for experiments to stop before connecting.");
+    }
+  };
+  assertAdmission();
   const transaction = beginConnectionTransaction(state, input.signal);
   let prepared: PreparedRemoteWorker | undefined;
   let opened: OpenedTransport | undefined;
@@ -1221,8 +1286,7 @@ async function connectOwner(
     const request = input.parseRequest(hosts);
     prepared = await prepareRemoteWorker({ ...request, signal: transaction.signal, onProgress: input.onProgress });
     assertConnectionTransaction(state, transaction);
-    const remoteCwd = request.cwd ?? prepared.home ?? (await resolveRemoteHome({ ...request, signal: transaction.signal }));
-    assertConnectionTransaction(state, transaction);
+    const remoteCwd = request.cwd ?? prepared.home;
     const connection = {
       ...request,
       cwd: remoteCwd,
@@ -1239,6 +1303,7 @@ async function connectOwner(
     if (remoteFamilyBroker.hasOwner(normalizedSessionFile)) {
       throw new Error("This session already owns a remote runtime family");
     }
+    assertAdmission();
     const ready = opened.ready;
     const resolvedRemoteCwd = ready.cwd ?? remoteCwd;
     const family: RemoteFamily = {
@@ -1661,18 +1726,34 @@ export default async function remoteRuntimeExtension(
   pi.on("user_python", () => state.selected ? { result: { ...blockedUserExecution(), displayOutputs: [], stdinRequested: false } } : undefined);
   pi.on("input", (event, ctx) => remoteInputPolicy(state.selected, event, ctx));
   pi.on("before_agent_start", (_event, ctx) => {
+    const cursorReason = state.selected ? cursorBlockReason(state, ctx) : undefined;
+    if (cursorReason) {
+      ctx.ui.notify(cursorReason, "warning");
+      // Native abort advances promptGeneration before the preparation commit;
+      // hook exceptions alone are swallowed and cannot veto the turn.
+      ctx.abort();
+      return;
+    }
     const current: WorkspaceBindingNotice = {
       binding: state.binding,
       mode: !state.selected ? "local" : (!state.client || state.client.isClosed || state.connectionError) ? "unavailable" : "remote",
       target: state.selected ? state.family?.connection.displayTarget ?? null : null,
-      cwd: (state.selected ? state.remoteCwd : state.localCwd) ?? null,
+      cwd: (state.selected ? state.remoteCwd : ctx.cwd) ?? null,
     };
     const message = workspaceAnnouncement(current, ctx.sessionManager.getBranch());
     return message ? { message } : undefined;
   });
 
-  pi.on("tool_call", (event) => {
+  pi.on("tool_call", (event, ctx) => {
     if (!state.selected) return;
+    // Native synthetic advisors have depth zero and parentId equal to this
+    // session's own agent id (sdk.ts:4957-4963). Resolve the live registry owner,
+    // falling back to the normal session_start context, never the caller override.
+    const ownerId = resolveHostSessionRef(state.sessionFile, state.hostContext)?.id ?? state.hostContext?.agent?.id;
+    if (ctx.agent?.kind === "sub" && ctx.agent.id === "advisor" && ctx.agent.depth === 0 &&
+        ownerId !== undefined && ctx.agent.parentId === ownerId && REMOTE_TOOL_SET.has(event.toolName)) {
+      return { block: true, reason: "Advisor tools run locally and are not routed to the remote workspace. Use the session's remote workspace tools instead." };
+    }
     if (event.toolName === "task" && (!state.client || state.client.isClosed || state.connectionError)) {
       return { block: true, reason: "Remote runtime is unavailable; spawning a new task cannot fall back locally. Reconnect first." };
     }

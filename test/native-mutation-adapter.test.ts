@@ -62,7 +62,7 @@ test("actual adapted native WriteTool waits for an aborted filesystem primitive 
     // A static import would instead load the unadapted SDK and cannot test this boundary.
     const { createNativeWorkerRuntime, createLspWritethrough, shutdownAll } = await import(outfile);
     const operations: string[] = [];
-    const runtime = await createNativeWorkerRuntime(cwd, SUPPORTED_SDK_VERSION, {
+    const runtime = await createNativeWorkerRuntime(cwd, {
       settings: { "lsp.diagnosticsOnWrite": false, "lsp.formatOnWrite": false },
       onLspOperation: (_event: unknown, phase: string) => operations.push(phase),
     });
@@ -92,7 +92,7 @@ test("actual adapted native WriteTool waits for an aborted filesystem primitive 
     await writeFile(join(cwd, "lsp.json"), JSON.stringify({ servers: { fixture: {
       command: "python3", args: [fixture, log], fileTypes: [".smoke"], rootMarkers: ["lsp.json"],
     } } }));
-    const queryRuntime = await createNativeWorkerRuntime(cwd, SUPPORTED_SDK_VERSION);
+    const queryRuntime = await createNativeWorkerRuntime(cwd);
     try {
       const late = Promise.withResolvers<unknown>();
       const controller = new AbortController();

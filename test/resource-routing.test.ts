@@ -165,9 +165,9 @@ describe("bound remote conflict resources", () => {
       await writeFile(localFile, "local-before\n<<<<<<< HEAD\nlocal-ours\n=======\nlocal-theirs\n>>>>>>> branch\nlocal-after\n");
       await writeFile(remoteFile, "remote-before\n<<<<<<< HEAD\nremote-ours\n=======\nremote-theirs\n>>>>>>> branch\nremote-after\n");
       const localBefore = await readFile(localFile);
-      const local = await createNativeWorkerRuntime(localCwd, "test");
+      const local = await createNativeWorkerRuntime(localCwd);
       runtimes.push(local);
-      const remote = await createNativeWorkerRuntime(remoteCwd, "test");
+      const remote = await createNativeWorkerRuntime(remoteCwd);
       runtimes.push(remote);
       await local.tools.read.execute("local-register", { path: "file.txt:conflicts" });
       const params = { path: "file.txt:conflicts" };
