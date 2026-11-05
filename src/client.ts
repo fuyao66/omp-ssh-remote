@@ -9,18 +9,15 @@ import {
   type ReadyMessage,
   type Request,
   type InvokeMessage,
-  type ImageQuestionMessage,
-  type ImageQuestionModel,
-  imageQuestionModelMetadata,
-  type ImageQuestionBegin,
-  type ImageQuestionTransfer,
-  IMAGE_QUESTION_CHUNK_CHARS,
-  MAX_IMAGE_QUESTION_BASE64,
-  MAX_IMAGE_QUESTION_BYTES,
 } from "./protocol.ts";
 import type { RemoteRuntimeHandshake } from "./runtime-contract.ts";
 import type { RemoteExecutionSettings } from "./omp/execution-settings.ts";
 import type { JobCapturePayload } from "./omp/job-capture.ts";
+
+/** The host-visible message reconstructed from a serialized worker error. */
+export function remoteErrorMessage(error: { name: string; message: string }): string {
+  return `${error.name}: ${error.message}`;
+}
 
 export type SpawnSpec = {
   command: string[];
@@ -36,8 +33,6 @@ type PendingCall = {
   tool?: string;
   signal?: AbortSignal;
   onInvoke?: HostToolInvoker;
-  onImageQuestion?: HostImageQuestionHandler;
-  resourceBinding?: string;
   invocationIds?: Set<string>;
 };
 
@@ -46,7 +41,6 @@ export type HostToolInvoker = (
   signal: AbortSignal,
   onUpdate: (value: unknown) => void,
 ) => Promise<unknown>;
-export type HostImageQuestionHandler = (question: ImageQuestionMessage, signal: AbortSignal) => Promise<string>;
 async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
@@ -88,10 +82,6 @@ export class RemoteRuntimeClient {
   readonly #eventListeners = new Set<(event: EventMessage) => void | Promise<void>>();
   readonly #closeListeners = new Set<(error: Error) => void>();
   readonly #invocations = new Map<string, { parentId: string; controller: AbortController }>();
-  readonly #imageTransfers = new Map<string, {
-    begin: ImageQuestionBegin; chunks: string[]; size: number; controller: AbortController;
-  }>();
-  #resourceBinding?: string;
 
   onClose(listener: (error: Error) => void): () => void {
     if (this.#closed) listener(new Error("Remote transport is closed"));
@@ -226,7 +216,7 @@ export class RemoteRuntimeClient {
     args: Record<string, unknown>,
     signal?: AbortSignal,
     onUpdate?: (update: unknown) => void,
-    options: { toolNames?: readonly string[]; steeringSignal?: AbortSignal; bashScope?: "job" | "session"; onCapture?: (capture: JobCapturePayload) => void; onInvoke?: HostToolInvoker; imageQuestionModel?: ImageQuestionModel; onImageQuestion?: HostImageQuestionHandler } = {},
+    options: { toolNames?: readonly string[]; steeringSignal?: AbortSignal; bashScope?: "job" | "session"; onCapture?: (capture: JobCapturePayload) => void; onInvoke?: HostToolInvoker } = {},
   ): Promise<unknown> {
     if (this.#closed) throw new Error("Remote runtime is disconnected");
     if (signal?.aborted) {
@@ -235,11 +225,9 @@ export class RemoteRuntimeClient {
     }
     const id = `req_${this.#nextId++}`;
     const promise = new Promise<unknown>((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject, onUpdate, onCapture: options.onCapture, tool, signal, onInvoke: options.onInvoke,
-        onImageQuestion: options.onImageQuestion, resourceBinding: this.#resourceBinding });
+      this.#pending.set(id, { resolve, reject, onUpdate, onCapture: options.onCapture, tool, signal, onInvoke: options.onInvoke });
     });
     const abortHandler = () => {
-      this.#discardImageTransfers(id, signal?.reason ?? new Error("Remote read cancelled"));
       for (const call of this.#invocations.values()) {
         if (call.parentId === id) call.controller.abort(signal?.reason ?? new Error("Remote Eval cancelled"));
       }
@@ -265,7 +253,6 @@ export class RemoteRuntimeClient {
         ...(options.toolNames ? { toolNames: [...options.toolNames] } : {}),
         ...(options.steeringSignal ? { steering: true } : {}),
         ...(options.bashScope ? { bashScope: options.bashScope } : {}),
-        ...(options.imageQuestionModel ? { imageQuestionModel: imageQuestionModelMetadata(options.imageQuestionModel) } : {}),
       });
       options.steeringSignal?.addEventListener("abort", steerHandler, { once: true });
       if (options.steeringSignal?.aborted) steerHandler();
@@ -274,7 +261,6 @@ export class RemoteRuntimeClient {
       signal?.removeEventListener("abort", abortHandler);
       options.steeringSignal?.removeEventListener("abort", steerHandler);
       this.#pending.delete(id);
-      this.#discardImageTransfers(id, new Error("Remote read parent call settled"));
       for (const call of this.#invocations.values()) {
         if (call.parentId === id) call.controller.abort(new Error("Remote Eval parent call settled"));
       }
@@ -361,20 +347,6 @@ export class RemoteRuntimeClient {
 
 
   #handle(message: Message): void {
-    if (message.type === "image-question-begin" || message.type === "image-question-chunk" || message.type === "image-question-commit") {
-      this.#imageTransfer(message);
-      return;
-    }
-    if (message.type === "image-question") {
-      void this.#imageQuestion(message);
-      return;
-    }
-    if (message.type === "image-question-cancel") {
-      const transfer = this.#imageTransfers.delete(message.id);
-      this.#invocations.get(message.id)?.controller.abort(new Error("Remote image question cancelled"));
-      if (transfer) this.#invocations.delete(message.id);
-      return;
-    }
     if (message.type === "invoke") {
       // Never await a callback in the frame reader: it may execute another
       // native worker tool while the originating Eval waits for its reply.
@@ -386,7 +358,6 @@ export class RemoteRuntimeClient {
       return;
     }
     if (message.type === "ready") {
-      this.#resourceBinding = message.resourceBinding;
       this.#resolveReady?.(message);
       this.#resolveReady = undefined;
       this.#rejectReady = undefined;
@@ -417,7 +388,7 @@ export class RemoteRuntimeClient {
       pending.resolve(message.result);
       return;
     }
-    const error = new Error(`${message.error.name}: ${message.error.message}`);
+    const error = new Error(remoteErrorMessage(message.error));
     if (message.id) {
       const pending = this.#pending.get(message.id);
       if (!pending) return;
@@ -430,7 +401,6 @@ export class RemoteRuntimeClient {
   }
 
   #abortInvocations(parentId: string, reason: Error): void {
-    this.#discardImageTransfers(parentId, reason);
     for (const invocation of this.#invocations.values()) {
       if (invocation.parentId === parentId) invocation.controller.abort(reason);
     }
@@ -470,106 +440,6 @@ export class RemoteRuntimeClient {
     }
   }
 
-  #discardImageTransfers(parentId: string, reason: unknown): void {
-    for (const [id, transfer] of this.#imageTransfers) {
-      if (transfer.begin.parentId !== parentId) continue;
-      transfer.controller.abort(reason);
-      this.#imageTransfers.delete(id);
-      this.#invocations.delete(id);
-    }
-  }
-
-  #imageQuestionError(id: string, error: unknown): void {
-    if (this.#closed) return;
-    const failure = error instanceof Error ? error : new Error(String(error));
-    try { this.#send({ type: "image-question-error", id, error: { name: failure.name, message: failure.message } }); }
-    catch (sendError) { this.#terminate(sendError); }
-  }
-
-  #imageTransfer(message: ImageQuestionTransfer): void {
-    try {
-      if (message.type === "image-question-begin") {
-        const parent = this.#pending.get(message.parentId);
-        if (!parent || parent.tool !== "read" || !parent.onImageQuestion || !parent.resourceBinding ||
-            message.resourceBinding !== parent.resourceBinding)
-          throw new Error("Remote image question has no authorized active read parent");
-        const seen = parent.invocationIds ??= new Set<string>();
-        if (seen.has(message.id) || this.#invocations.has(message.id)) {
-          this.#terminate(new Error("Duplicate remote image question id"));
-          return;
-        }
-        if ([...this.#invocations.values()].some(invocation => invocation.parentId === message.parentId))
-          throw new Error("Remote read parent already has an in-flight image question");
-        // Reserve only after validating the parent and bounded allocation below.
-        parent.signal?.throwIfAborted();
-        if (!Number.isSafeInteger(message.length) || message.length <= 0 || message.length > MAX_IMAGE_QUESTION_BASE64)
-          throw new Error("Remote image question exceeds native image size limit");
-        seen.add(message.id);
-        const controller = new AbortController();
-        this.#invocations.set(message.id, { parentId: message.parentId, controller });
-        this.#imageTransfers.set(message.id, { begin: message,
-          chunks: new Array<string>(Math.ceil(message.length / IMAGE_QUESTION_CHUNK_CHARS)), size: 0, controller });
-        return;
-      }
-      const transfer = this.#imageTransfers.get(message.id);
-      if (!transfer) throw new Error("Remote image question transfer is not active");
-      transfer.controller.signal.throwIfAborted();
-      if (message.type === "image-question-chunk") {
-        const expectedLength = Math.min(IMAGE_QUESTION_CHUNK_CHARS, transfer.begin.length - transfer.size);
-        if (expectedLength <= 0 || message.offset !== transfer.size || message.data.length !== expectedLength ||
-            transfer.size + message.data.length > transfer.begin.length || !/^[A-Za-z0-9+/]*={0,2}$/.test(message.data) ||
-            (message.data.includes("=") && transfer.size + message.data.length !== transfer.begin.length))
-          throw new Error("Invalid remote image question chunk");
-        transfer.chunks[transfer.size / IMAGE_QUESTION_CHUNK_CHARS] = message.data;
-        transfer.size += message.data.length;
-        return;
-      }
-      if (transfer.size !== transfer.begin.length) throw new Error("Incomplete remote image question transfer");
-      const data = transfer.chunks.join("");
-      const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
-      if (data.length % 4 !== 0 || data.length / 4 * 3 - padding > MAX_IMAGE_QUESTION_BYTES)
-        throw new Error("Remote image question exceeds native image size limit");
-      this.#imageTransfers.delete(message.id);
-      void this.#imageQuestion({ ...transfer.begin, type: "image-question", data }, transfer.controller);
-    } catch (error) {
-      this.#imageTransfers.delete(message.id);
-      this.#invocations.get(message.id)?.controller.abort(error);
-      this.#invocations.delete(message.id);
-      this.#imageQuestionError(message.id, error);
-    }
-  }
-
-  async #imageQuestion(message: ImageQuestionMessage, admittedController?: AbortController): Promise<void> {
-    const parent = this.#pending.get(message.parentId);
-    const controller = admittedController ?? new AbortController();
-    const token = admittedController ? this.#invocations.get(message.id)! : { parentId: message.parentId, controller };
-    const current = () => !this.#closed && this.#pending.get(message.parentId) === parent;
-    try {
-      if (!parent || parent.tool !== "read" || !parent.onImageQuestion || !parent.resourceBinding ||
-          message.resourceBinding !== parent.resourceBinding)
-        throw new Error("Remote image question has no authorized active read parent");
-      const seen = parent.invocationIds ??= new Set<string>();
-      if (!admittedController) {
-        if (seen.has(message.id) || this.#invocations.has(message.id)) {
-          this.#terminate(new Error("Duplicate remote image question id"));
-          return;
-        }
-        seen.add(message.id);
-      }
-      if (message.data.length > MAX_IMAGE_QUESTION_BASE64) throw new Error("Remote image question exceeds native image size limit");
-      this.#invocations.set(message.id, token);
-      if (parent.signal?.aborted) controller.abort(parent.signal.reason);
-      controller.signal.throwIfAborted();
-      const text = await parent.onImageQuestion(message, controller.signal);
-      controller.signal.throwIfAborted();
-      if (current()) this.#send({ type: "image-question-result", id: message.id, text });
-    } catch (error) {
-      this.#imageQuestionError(message.id, error);
-    } finally {
-      if (this.#invocations.get(message.id) === token) this.#invocations.delete(message.id);
-    }
-  }
-
   #terminate(error: unknown): void {
     const failure = error instanceof Error ? error : new Error(String(error));
     if (!this.#exited && !this.#killSent) {
@@ -584,7 +454,6 @@ export class RemoteRuntimeClient {
     this.#closed = true;
     for (const invocation of this.#invocations.values()) invocation.controller.abort(error);
     this.#invocations.clear();
-    this.#imageTransfers.clear();
     this.#rejectReady?.(error);
     for (const pending of this.#pending.values()) pending.reject(error);
     this.#pending.clear();

@@ -4,7 +4,7 @@ import ts from "typescript";
 import { adaptNativeLspConfig } from "../src/native-lsp-config-adapter.ts";
 import { adaptNativeMutationSettlement } from "../src/omp/native-mutation-adapter.ts";
 import { SDK_SOURCE_ADAPTATIONS, SUPPORTED_SDK_VERSION, sdkAdaptationLabel } from "../src/omp/sdk-contract.ts";
-import { SEMANTIC_SDK_CONTRACTS } from "../src/omp/sdk-semantic-contracts.ts";
+import { SEMANTIC_SDK_CONTRACTS } from "./sdk-semantic-contracts.ts";
 
 const root = resolve(import.meta.dir, "..");
 const sdkPackages = [

@@ -12,8 +12,6 @@ OMP SSH Remote 将 Oh My Pi 控制面保留在本机，同时通过 SSH 在远�
 
 `read`、`write`、`edit`、`bash`、`grep`、`glob`、`lsp`、`ast_grep`、`ast_edit`、受限 `eval` 和 `debug`。
 
-远端 `read <image>?q=<question>` 与 PDF 页面截图问答使用宿主原生的视觉模型选择和凭据。companion 仍由原生 ReadTool 分类、加载图像，仅将加载后的图像和问题回传给当前宿主 read 请求。宿主的 `images.blockImages`、`images.questionTimeoutMs`、取消和费用限制继续生效；凭据、provider headers 和 endpoint 不进入 companion。JSON `?q=` 仍由原生 jq 处理，不需要模型。Eval `tool.read` 使用同一桥接路径。
-
 后台执行按归属划分，而不是按工具名划分：
 
 - `bash async:true` 在本机当前 session 的 OMP job manager 中创建 job；原生 `wait` 和 job 的 `proc://` 查询、取消留在本机，命令在远端执行。独立根 session 不共用 manager；子代理使用各自 session family 的 manager。
@@ -101,7 +99,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 链接后重启 OMP。更新时重新构建 extension 和双架构 worker。停用、暂停或 reload 插件前，必须先执行 `/remote-exit`。OMP 18.12.6 的动态暂停不发送 shutdown，也没有暂停前回调；连接中直接暂停会恢复本机工具但可能保留旧 worker，插件无法在自己的 hook 一起被暂停后保证拦截或清理。
 
-当前 companion 基于 OMP 18.15.0 构建，runtime contract 为 0.16.0。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。
+当前 companion 基于 OMP 18.15.0 构建，runtime contract 为 0.15.0。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。
 
 上传显式使用 `scp -O`（SCP 协议），与远端目标路径的 shell 转义保持一致；OpenSSH 9+ 默认的 SFTP 会把这些引号当作文件名字符。本机 SCP 客户端须支持 `-O`。
 
@@ -279,6 +277,7 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 - OMP `>=18.15.0`，且 companion schema 匹配；
 - 远端须有 util-linux 的 `flock`，用于保护活跃 worker 可执行文件；
 - 支持显式 async Bash 和符合条件的自动后台化，不桥接交互 Bash PTY；
+- 不支持远端图像问答（`?q=`）；请直接读取图像，将像素交给模型；
 - `tools.restrictedFolders` 适用于原生本机资源，尚未实现远端文件系统的目录限制审批；
 - 保留原生宿主审批及 enabled-tool 门控，但 SDK 18.15.0 的公开 AgentSession API 不暴露有效 `ToolSession.lspReadOnly`／`deviceOnlyWrite` 策略，无法镜像这些字段的显式会话级覆盖；不要将此版本当作只读沙箱。AgentRef 的只读历史元数据不是执行策略。
 - 不支持 `task isolated:true` 远端 worktree；

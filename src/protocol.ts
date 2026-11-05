@@ -1,5 +1,3 @@
-import type { ResolvedImageQuestionModel } from "@oh-my-pi/pi-coding-agent/utils/image-question";
-import { MAX_IMAGE_INPUT_BYTES } from "@oh-my-pi/pi-tui/chat/image-loading";
 import {
   parseExecutionSettings,
   type RemoteExecutionSettings,
@@ -16,13 +14,9 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.16.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.15.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
-/** Native image bytes, base64-expanded; individual frames retain the global cap. */
-export const MAX_IMAGE_QUESTION_BYTES = MAX_IMAGE_INPUT_BYTES;
-export const MAX_IMAGE_QUESTION_BASE64 = 4 * Math.ceil(MAX_IMAGE_QUESTION_BYTES / 3);
-export const IMAGE_QUESTION_CHUNK_CHARS = 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
   "read",
   "write",
@@ -80,52 +74,6 @@ export type InitializeRequest = {
   resourceBinding?: string;
 };
 
-type NativeImageModel = ResolvedImageQuestionModel["model"];
-/** Only native selection/decoding metadata crosses this boundary. The readers are
- * sendsImageInputOnWire (input/api/transport/compat.stripImageInput),
- * webpExclusionForModel (provider/api/imageInputDecoder), and model matching (id/name/provider).
- * Thinking, pricing, endpoints, headers, hooks and arbitrary compat stay on the host. */
-export type ImageQuestionModel = Pick<NativeImageModel, "id" | "name" | "api" | "provider" | "input" | "transport" | "imageInputDecoder"> & {
-  compat: { stripImageInput?: boolean };
-};
-
-export function imageQuestionModelMetadata(model: ImageQuestionModel | NativeImageModel): ImageQuestionModel {
-  return {
-    id: model.id, name: model.name, api: model.api, provider: model.provider, input: [...model.input],
-    ...(model.transport === "pi-native" ? { transport: model.transport } : {}),
-    ...(model.imageInputDecoder === "stb" ? { imageInputDecoder: model.imageInputDecoder } : {}),
-    compat: { ...("stripImageInput" in (model.compat ?? {}) && (model.compat as { stripImageInput?: boolean }).stripImageInput === true ? { stripImageInput: true } : {}) },
-  };
-}
-
-function parseImageQuestionModel(value: unknown): ImageQuestionModel {
-  const model = asRecord(value, "imageQuestionModel");
-  for (const key of ["id", "name", "api", "provider"]) stringField(model, key);
-  if (!Array.isArray(model.input) || !model.input.every(input => input === "text" || input === "image"))
-    throw new Error("Protocol imageQuestionModel input must contain native modalities");
-  return imageQuestionModelMetadata(model as ImageQuestionModel);
-}
-
-export type ImageQuestionMessage = {
-  type: "image-question";
-  id: string;
-  parentId: string;
-  resourceBinding: string;
-  question: string;
-  data: string;
-  mimeType: string;
-};
-export type ImageQuestionBegin = Omit<ImageQuestionMessage, "type" | "data"> & {
-  type: "image-question-begin";
-  length: number;
-};
-export type ImageQuestionTransfer = ImageQuestionBegin
-  | { type: "image-question-chunk"; id: string; offset: number; data: string }
-  | { type: "image-question-commit"; id: string };
-export type ImageQuestionReply =
-  | { type: "image-question-result"; id: string; text: string }
-  | { type: "image-question-error"; id: string; error: { name: string; message: string } };
-
 export type ExecuteRequest = {
   type: "execute";
   id: string;
@@ -138,7 +86,6 @@ export type ExecuteRequest = {
   steering?: boolean;
   /** Job shells are isolated; session scope preserves foreground shell state. */
   bashScope?: "job" | "session";
-  imageQuestionModel?: ImageQuestionModel;
 };
 
 export type InvokeMessage = {
@@ -164,7 +111,6 @@ export type Request =
   | { type: "steer"; id: string }
   | { type: "event-ack"; id: string }
   | InvokeReply
-  | ImageQuestionReply
   | ShutdownRequest;
 
 export type ToolManifest = {
@@ -212,9 +158,6 @@ export type Message =
   | ErrorMessage
   | InvokeMessage
   | { type: "invoke-cancel"; id: string }
-  | ImageQuestionMessage
-  | ImageQuestionTransfer
-  | { type: "image-question-cancel"; id: string }
   | EventMessage;
 
 function stringField(value: Record<string, unknown>, key: string): string {
@@ -297,8 +240,6 @@ export function parseRequest(raw: unknown): Request {
         throw new Error("Protocol bashScope is only valid for unnamed bash jobs");
       }
     }
-    if (value.imageQuestionModel !== undefined && value.tool !== "read")
-      throw new Error("Protocol imageQuestionModel is only valid for read");
     return {
       type,
       id: stringField(value, "id"),
@@ -308,13 +249,7 @@ export function parseRequest(raw: unknown): Request {
       ...(toolNames === undefined ? {} : { toolNames: toolNames as string[] }),
       ...(value.steering === undefined ? {} : { steering: value.steering as boolean }),
       ...(value.bashScope === "job" || value.bashScope === "session" ? { bashScope: value.bashScope } : {}),
-      ...(value.imageQuestionModel === undefined ? {} : { imageQuestionModel: parseImageQuestionModel(value.imageQuestionModel) }),
     };
-  }
-  if (type === "image-question-result") return { type, id: stringField(value, "id"), text: stringField(value, "text") };
-  if (type === "image-question-error") {
-    const error = asRecord(value.error, "error");
-    return { type, id: stringField(value, "id"), error: { name: stringField(error, "name"), message: stringField(error, "message") } };
   }
   if (type === "invoke-result" || type === "invoke-update") {
     if (!("result" in value)) throw new Error(`Protocol ${type} requires result`);
@@ -400,19 +335,6 @@ export function parseMessage(line: string): Message {
         : {}),
     };
   }
-  if (type === "image-question-begin") {
-    return { type, id: stringField(value, "id"), parentId: stringField(value, "parentId"),
-      resourceBinding: parseResourceBinding(value.resourceBinding), question: stringField(value, "question"),
-      mimeType: stringField(value, "mimeType"), length: numberField(value, "length") };
-  }
-  if (type === "image-question-chunk") return { type, id: stringField(value, "id"), offset: numberField(value, "offset"), data: stringField(value, "data") };
-  if (type === "image-question-commit") return { type, id: stringField(value, "id") };
-  if (type === "image-question") {
-    return { type, id: stringField(value, "id"), parentId: stringField(value, "parentId"),
-      resourceBinding: parseResourceBinding(value.resourceBinding), question: stringField(value, "question"),
-      data: stringField(value, "data"), mimeType: stringField(value, "mimeType") };
-  }
-  if (type === "image-question-cancel") return { type, id: stringField(value, "id") };
   if (type === "invoke") {
     return {
       type, id: stringField(value, "id"), parentId: stringField(value, "parentId"),

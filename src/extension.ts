@@ -14,7 +14,7 @@ import {
   parseConnectOptions,
   type RemoteConnectRequest,
 } from "./connect-options.ts";
-import { RemoteRuntimeClient } from "./client.ts";
+import { RemoteRuntimeClient, remoteErrorMessage } from "./client.ts";
 import { describeRemoteWorkerCacheAudit, prepareRemoteWorker, resolveRemoteHome, type PreparedRemoteWorker, type RemoteWorkerCacheAudit } from "./deploy.ts";
 import { REMOTE_TOOL_NAMES, type RemoteToolName, type ReadyMessage } from "./protocol.ts";
 import { createOmpRuntimeHandshake, captureOmpToolSnapshot } from "./omp/runtime-contract.ts";
@@ -58,8 +58,6 @@ import { resourceOwnershipTarget } from "./resource-ownership.ts";
 import type { ToolContextStore } from "@oh-my-pi/pi-coding-agent/tools/context";
 import { RemoteLspDiagnostics, mayMutateLsp, parseLspEvent, type LspDiagnostics } from "./omp/lsp-diagnostics.ts";
 import { remoteInputPolicy } from "./omp/input-policy.ts";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { prepareHostImageQuestion, imageQuestionFailure } from "./omp/image-question.ts";
 
 /**
  * Snapshot the execution-domain subset of the local session's settings.
@@ -649,29 +647,11 @@ async function executeWithTarget(
   const client = state.client;
   if (!client) throw new Error("Remote runtime is disconnected");
   const remoteParams = resolveRemoteResourceArgs(name, params, state.binding);
-  const owner = hostSessionFor(state, ctx);
-  const binding = state.binding;
-  const sessionFile = ctx.sessionManager.getSessionFile();
-  const assertImageQuestionCurrent = () => {
-    signal?.throwIfAborted();
-    if (!owner || hostSessionFor(state, ctx) !== owner || ctx.sessionManager.getSessionFile() !== sessionFile ||
-        state.client !== client || client.isClosed || state.binding !== binding)
-      throw new Error("Remote image question belongs to a closed or changed workspace/session binding");
-  };
-  const hostImageSession: ToolSession = {
-    cwd: ctx.cwd, hasUI: false, getSessionFile: () => sessionFile ?? null, getSessionSpawns: () => "",
-    settings: owner?.settings ?? findScopedSettings()!, modelRegistry: ctx.modelRegistry,
-    getActiveModelString: () => owner?.model ? `${owner.model.provider}/${owner.model.id}` : undefined,
-    getModelString: () => owner?.model ? `${owner.model.provider}/${owner.model.id}` : undefined,
-    getSessionId: () => owner?.sessionId ?? null, getTelemetry: () => owner?.agent.telemetry,
-    costGate: owner?.costGate,
-  };
-  const imageQuestion = name === "read" ? prepareHostImageQuestion(remoteParams.path, hostImageSession, assertImageQuestionCurrent) : {};
   const execute = async (steeringSignal?: AbortSignal) => {
     const endMutation = mayMutateLsp(name, remoteParams) ? state.lspDiagnostics?.beginMutation() : undefined;
     try {
       return await client.execute(name, toolCallId, remoteParams, signal, onUpdate,
-        { toolNames: state.activeToolNames(), steeringSignal, ...imageQuestion,
+        { toolNames: state.activeToolNames(), steeringSignal,
           ...(name === "eval" ? { onInvoke: hostEvalInvoker(state, client, ctx) } : {}) }) as AgentToolResult;
     } finally { endMutation?.(); }
   };
@@ -681,9 +661,12 @@ async function executeWithTarget(
     }
     return await execute();
   } catch (error) {
-    error = imageQuestionFailure(error, imageQuestion.resolutionError);
+    const message = error instanceof Error ? error.message : String(error);
+    const reason = name === "read" && message === remoteErrorMessage({ name: "ToolError", message: "Model registry is unavailable for image questions." })
+      ? "Remote image questions (?q=) are not supported. Read the image without ?q= and the model receives its pixels directly."
+      : message;
     throw new Error(
-      `Remote ${name} failed (${state.remoteCwd ?? "disconnected"}): ${error instanceof Error ? error.message : String(error)}`,
+      `Remote ${name} failed (${state.remoteCwd ?? "disconnected"}): ${reason}`,
     );
   }
 }

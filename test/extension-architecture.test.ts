@@ -7,6 +7,11 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { RemoteRuntimeClient } from "../src/client.ts";
+import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
 import { nestedDispatchScope } from "../src/nested-dispatch.ts";
 import remoteRuntimeExtension, {
   closeRemoteFamily,
@@ -158,6 +163,43 @@ describe("extension workspace architecture", () => {
       expect(await harness.emit("before_agent_start")).toBeUndefined();
     } finally {
       await harness.emit("session_shutdown");
+    }
+  });
+
+  test("native worker image questions explain direct reads without changing JSON queries", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-read-query-"));
+    const client = new RemoteRuntimeClient({ command: [process.execPath, join(import.meta.dir, "../src/worker.ts")] });
+    const ownerFile = `${cwd}/owner.jsonl`, root = ownerFile.slice(0, -".jsonl".length);
+    const family: Family = {
+      ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: cwd,
+      connection: { target: "fixture.invalid", displayTarget: "fixture", cwd, workerPath: "/fixture/worker" },
+      members: new Set(), closing: true,
+    };
+    const harness = await extensionHarness(`${root}/subagent/child.jsonl`, undefined, ["read"]);
+    const broker = (globalThis as unknown as Record<symbol, Map<string, Family>>)[Symbol.for("omp-ssh-remote/session-families")]!;
+    broker.set(ownerFile, family);
+    try {
+      await writeFile(join(cwd, "pixel.png"), Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1sAAAAASUVORK5CYII=", "base64"));
+      await writeFile(join(cwd, "data.json"), '{"a":42}');
+      await client.initialize(cwd, OMP_RUNTIME_HANDSHAKE);
+      await harness.emit("session_start");
+      const state = [...family.members][0]!;
+      state.connectionError = undefined;
+      // Keep the real worker transport, including its serialized ToolError reconstruction.
+      state.client = client;
+      const json = await harness.executeTool("read", { path: "data.json?q=.a" });
+      expect(json.content).toEqual([{ type: "text", text: "42" }]);
+      await expect(harness.executeTool("read", { path: "pixel.png?q=Describe" })).rejects.toThrow(
+        `Remote read failed (${cwd}): Remote image questions (?q=) are not supported. Read the image without ?q= and the model receives its pixels directly.`,
+      );
+      const image = await harness.executeTool("read", { path: "pixel.png" });
+      expect(image.content.some(part => part.type === "image")).toBe(true);
+    } finally {
+      await harness.emit("session_shutdown");
+      broker.delete(ownerFile);
+      await client.close();
+      await client.waitForExit();
+      await rm(cwd, { recursive: true, force: true });
     }
   });
 

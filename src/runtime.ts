@@ -16,7 +16,6 @@ import { GlobTool } from "@oh-my-pi/pi-coding-agent/tools/glob";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import type { ResolvedImageQuestionModel } from "@oh-my-pi/pi-coding-agent/utils/image-question";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import {
@@ -26,7 +25,6 @@ import {
   type RemoteToolName,
   type OmpEditMode,
   type ToolManifest,
-  type ImageQuestionModel,
 } from "./protocol.ts";
 import { assertNestedRemoteTool, NESTED_TOOL_NAMES } from "./nested-dispatch.ts";
 import { createRemoteArtifacts } from "./omp/artifacts.ts";
@@ -134,7 +132,6 @@ export type NativeWorkerRuntime = {
   session: ToolSession;
   executeEval: (invoke: NonNullable<NativeWorkerRuntimeOptions["invokeTool"]>, ...args: Parameters<RemoteNativeTool["execute"]>) => Promise<unknown>;
   createJobBash: (onCapture: JobCaptureSender, foreground?: boolean) => RemoteNativeTool;
-  createImageQuestionRead: (model: ImageQuestionModel, ask: (question: { question: string; data: string; mimeType: string }, signal?: AbortSignal) => Promise<string>) => RemoteNativeTool;
   stopService: (name: string, id: string) => Promise<ServiceStopReceipt>;
   /** Release runtime-owned host resources (the output artifact namespace). Idempotent. */
   dispose: () => Promise<void>;
@@ -306,12 +303,8 @@ export async function createNativeWorkerRuntime(
     eval: asRemoteNativeTool(new EvalTool(session)),
     debug: asRemoteNativeTool(new DebugTool(session)),
   };
-  const captureRead = (tool: RemoteNativeTool): RemoteNativeTool => {
-    const execute = tool.execute.bind(tool);
-    tool.execute = (...args) => conflictHistory.captureRead(() => execute(...args));
-    return tool;
-  };
-  captureRead(tools.read);
+  const read = tools.read.execute.bind(tools.read);
+  tools.read.execute = (...args) => conflictHistory.captureRead(() => read(...args));
   const publishTool = (tool: RemoteNativeTool): RemoteNativeTool => {
     const execute = tool.execute.bind(tool);
     const executeMutation = async (...args: Parameters<RemoteNativeTool["execute"]>) => {
@@ -373,41 +366,6 @@ export async function createNativeWorkerRuntime(
   const dispose = () => (disposed ??= (revisions.dispose(), artifacts.dispose()));
   return {
     cwd: absoluteCwd, sessionId, tools, session, editMode, resourceBinding, dispose,
-    createImageQuestionRead: (metadata, ask) => {
-      // Native selection sees exactly the host's choice. These worker-only defaults
-      // never reach a provider; host askImageQuestion owns thinking, limits and cost.
-      const model = { ...metadata, baseUrl: "", reasoning: false,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1, maxTokens: 1,
-      } as ResolvedImageQuestionModel["model"];
-      // Native Read lazily attaches editStore to its session. Forward all shared
-      // session state, including future lazy fields, to the original owner.
-      const overrides: Partial<ToolSession> = {
-        settings: Settings.isolated({ ...(options.settings ?? {}), ...WORKER_OVERRIDES, "edit.mode": editMode,
-          "images.blockImages": false, "images.questionTimeoutMs": 0,
-        }),
-        getActiveModelString: () => `${model.provider}/${model.id}`,
-        modelRegistry: {
-          getAvailable: () => [model], getApiKey: async () => "host-image-question-bridge",
-          resolver: () => "host-image-question-bridge",
-        } as unknown as ToolSession["modelRegistry"],
-      };
-      const readSession = new Proxy(session, {
-        get: (target, key) => Object.hasOwn(overrides, key) ? Reflect.get(overrides, key) : Reflect.get(target, key, target),
-        set: (target, key, value) => Reflect.set(target, key, value, target),
-      });
-      return publishTool(captureRead(asRemoteNativeTool(new ReadTool(readSession, async (_model, context, completeOptions) => {
-        const content = context.messages.flatMap(message => message.role === "user" && Array.isArray(message.content) ? message.content : []);
-        const image = content.find(part => part.type === "image");
-        const question = content.find(part => part.type === "text");
-        if (!image || !question) throw new Error("Native image question completion has no image or question");
-        const text = await ask({ data: image.data, mimeType: image.mimeType, question: question.text }, completeOptions?.signal);
-        return { role: "assistant", content: [{ type: "text", text }], api: model.api, provider: model.provider,
-          model: model.id, stopReason: "stop", timestamp: Date.now(),
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        };
-      }))));
-    },
     executeEval: async (invoke, ...args) => {
       // Eval is natively exclusive. Serialize only Eval runs, never the native
       // workspace requests that a leased Eval reenters through the host.
