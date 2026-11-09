@@ -18,6 +18,7 @@ import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { isLocalAgentSession, type AgentSessionHandle } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { finalizeSubagentLifecycle, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -25,6 +26,8 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { createNativeWorkerRuntime } from "../src/runtime.ts";
 import { captureOmpToolSnapshot, projectOmpBashExecutionSchema } from "../src/omp/runtime-contract.ts";
+import * as asyncBash from "../src/omp/async-bash.ts";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 
 function gate() {
   const entered = Promise.withResolvers<void>(), released = Promise.withResolvers<void>();
@@ -189,6 +192,7 @@ async function nativeExecutorChild(owner: Harness, family: Family, id: string) {
       { path: "<revival-observer>", resolvedPath: "<revival-observer>", error: null, factory: pi => {
         pi.on("session_start", () => {
           const ref = AgentRegistry.global().get(id)!, session = ref.session!;
+          if (!isLocalAgentSession(session)) throw new Error("Native revival observer must run on the session's home thread");
           // Hold delivery after native ensureLive without replacing the executor's reviver.
           session.holdIrcWakes();
           const errors: string[] = [];
@@ -211,7 +215,8 @@ async function harness(sessionFile = join(directory, "owner.jsonl"), agent: Exte
   const tools = new Map<string, ToolDefinition>(), commands = new Map<string, { handler: Function }>();
   const nativeReads: string[] = [];
   const activeTools = ["read", "bash"], aborts: string[] = [];
-  const ctx = { cwd: directory, model: undefined, agent, sessionManager: { getSessionFile: () => sessionFile, getBranch: () => [] },
+  const manager = await SessionManager.open(sessionFile, dirname(sessionFile), undefined, { initialCwd: directory, suppressBreadcrumb: true });
+  const ctx = { cwd: directory, model: undefined, agent, sessionManager: manager,
     abort() { aborts.push("abort"); },
     ui: { notify() {}, setStatus() {}, setWorkingMessage() {} },
     async invokeTool(params: { path?: string; command?: string }) {
@@ -220,7 +225,18 @@ async function harness(sessionFile = join(directory, "owner.jsonl"), agent: Exte
       return { content: [{ type: "text", text: "local fixture" }] };
     },
   } as unknown as ExtensionContext;
+  const session = {
+    instanceKey: `main:${crypto.randomUUID()}`, sessionManager: manager, settings: Settings.isolated(),
+    getToolByName: () => undefined, getAdvisorStats: () => ({ configured: false, advisors: [] }),
+    async runToolRegistryMutation(mutate: () => Promise<void>) { await mutate(); },
+  } as unknown as AgentSessionHandle;
+  const registry = AgentRegistry.global();
+  const ref = registry.register({
+    id: agent.id, displayName: agent.name, kind: agent.kind, parentId: agent.parentId,
+    session, sessionFile, status: "running",
+  });
   await extension({ registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
+    appendEntry: (customType: string, data?: unknown) => { manager.appendCustomEntry(customType, data); },
     registerCommand: (name: string, command: { handler: Function }) => commands.set(name, command),
     on: (name: string, hook: (event: unknown, ctx: ExtensionContext) => unknown) => hooks.set(name, hook),
     getActiveTools: () => activeTools, getAllTools: () => REMOTE_TOOL_NAMES.map(name => ({
@@ -229,7 +245,15 @@ async function harness(sessionFile = join(directory, "owner.jsonl"), agent: Exte
   } as unknown as ExtensionAPI);
   const h: Harness = { sessionFile, nativeReads, activeTools, context: ctx, aborts,
     setModel(model) { Object.assign(ctx, { model }); },
-    emit: async (name: string, event = {}) => await hooks.get(name)!(event, ctx),
+    async emit(name: string, event = {}) {
+      try { return await hooks.get(name)!(event, ctx); }
+      finally {
+        if (name === "session_shutdown") {
+          registry.unregister(agent.id, ref);
+          await manager.close();
+        }
+      }
+    },
     command: async (name: string, args = "") => await commands.get(name)!.handler(args, ctx),
     execute: async (name: string, args = {}) => await tools.get(name)!.execute(name, args, undefined, undefined, ctx),
     state: (family: Family): State => [...family.members].find(member => member.sessionFile === sessionFile)!,
@@ -310,10 +334,10 @@ test("slash exit cancels owner connect during SSH configuration discovery", asyn
   expect(broker.hasOwner(owner.sessionFile)).toBe(false);
 });
 
-test("session navigation cancels deployment before an old-session family is published", async () => {
+test.each(["session_before_switch", "session_before_branch", "session_before_tree"])("%s cancels deployment before an old-session family is published", async event => {
   const owner = await harness(); preparation = gate();
   const connecting = settle(owner.execute("remote_connect", { target: "fixture.invalid", cwd: "/remote" }));
-  await preparation.entered; await owner.emit("session_before_switch"); preparation.release();
+  await preparation.entered; await owner.emit(event); preparation.release();
   const error = await connecting;
   expect(error, "navigation must cancel deployment-stage connect").toBeInstanceOf(Error);
   expect(error?.message).toMatch(/cancel|abort|navigat|switch/i);
@@ -366,6 +390,7 @@ test("connect refuses running grandchildren through parked intermediates", async
   const ownerId = owner.context.agent.id;
   const child = `${ownerId}-child`, grandchild = `${ownerId}-grandchild`;
   registry.register({ id: ownerId, displayName: "owner", kind: "main", session: {
+    instanceKey: `main:${crypto.randomUUID()}`,
     sessionManager: owner.context.sessionManager, getToolByName: () => undefined, settings: Settings.isolated(),
     getAdvisorStats: () => ({ configured: false, advisors: [] }),
   } as never });
@@ -579,6 +604,7 @@ test("connect excludes its own native subagent ref", async () => {
   const registry = AgentRegistry.global();
   registry.register({ id: owner.context.agent.id, displayName: "sub owner", kind: "sub",
     sessionFile: owner.sessionFile, session: { sessionManager: owner.context.sessionManager,
+      instanceKey: `main:${crypto.randomUUID()}`,
       getToolByName: () => undefined, settings: Settings.isolated(),
       getAdvisorStats: () => ({ configured: false, advisors: [] }),
     } as never, status: "running" });
@@ -707,6 +733,7 @@ test("Cursor advisor effective models veto connect and bound turns", async () =>
   const owner = await harness(), registry = AgentRegistry.global(), id = owner.context.agent.id;
   const advisors = [{ name: "local-review", model: { provider: "cursor", api: "cursor-agent" } }];
   registry.register({ id, displayName: "owner", kind: "main", session: {
+    instanceKey: `main:${crypto.randomUUID()}`,
     sessionManager: owner.context.sessionManager, settings: Settings.isolated(), getToolByName: () => undefined,
     getAdvisorStats: () => ({ configured: true, advisors }),
   } as never });
@@ -773,7 +800,7 @@ test.each([false, true])("native IRC revival reattaches exactly once and contain
   expect(initial.ref.session).toBeNull();
   const workerCount = clients.length;
   if (exitDuringRevival) admission = gate();
-  const sending = new IrcBus().send({ from: "fixture-peer", to: id, body: "Wake the parked child." }, { suppressRelay: true });
+  const sending = new IrcBus().send({ from: "fixture-peer", to: id, body: "Wake the parked child." });
   let lateWorker: RemoteRuntimeClient | undefined;
   if (exitDuringRevival) {
     await Promise.race([admission!.entered, sending.then(receipt => {
@@ -831,3 +858,64 @@ test.each([false, true])("native IRC revival reattaches exactly once and contain
   await rebuilt.session.dispose();
   expect(family.members.size).toBe(0);
 });
+
+test("deferred native Bash callback observes revocation before issuing a remote request", async () => {
+  const { owner, family } = await connected(), client = owner.state(family).client!;
+  const manager = new AsyncJobManager({ maxRunningJobs: 1, retentionMs: 60_000 });
+  let deferred: asyncBash.RemoteAsyncBashJobOptions | undefined;
+  const localManager = spyOn(asyncBash, "resolveLocalAsyncJobManager").mockReturnValue(manager);
+  const localOwner = spyOn(asyncBash, "resolveJobOwnerId").mockReturnValue(owner.context.agent.id);
+  const schedule = spyOn(asyncBash, "startRemoteAsyncBashJob").mockImplementation(options => {
+    deferred = options;
+    return { content: [{ type: "text", text: "native callback retained" }] };
+  });
+  const requests = spyOn(client, "execute");
+  try {
+    await owner.execute("bash", { command: "printf remote-only", async: true });
+    expect(deferred).toBeDefined();
+    expect(requests).not.toHaveBeenCalled();
+    broker.revoke(family);
+    // Deliberately do not close the transport: the shared fence must win
+    // before asynchronous cleanup or native job-callback delivery catches up.
+    expect(client.isClosed).toBe(false);
+    await expect(deferred!.execute({ command: "printf remote-only" }, new AbortController().signal, () => {}, () => {}))
+      .rejects.toThrow(/revoked|local fallback is disabled/i);
+    expect(requests).not.toHaveBeenCalled();
+  } finally {
+    requests.mockRestore(); schedule.mockRestore(); localOwner.mockRestore(); localManager.mockRestore();
+    await manager.dispose({ timeoutMs: 1_000 });
+  }
+});
+
+test("disabled edit stays unwrapped and read mode changes require reconnect in both directions", async () => {
+  const { cfgEditMode } = await import("@oh-my-pi/pi-coding-agent/edit/settings");
+  const owner = await harness();
+  const local = AgentRegistry.global().get(owner.context.agent.id)!.session!;
+  if (!isLocalAgentSession(local)) throw new Error("Expected local harness session");
+  cfgEditMode.override(local.settings, "none");
+  owner.activeTools.push("edit");
+  await owner.emit("session_start");
+  const disabled = await createNativeWorkerRuntime(directory, { editMode: "none" });
+  const disabledMetadata = { ...captureOmpToolSnapshot(disabled.tools.edit), description: disabled.tools.edit.description };
+  await disabled.dispose();
+  const configureReady = (mode: "none" | "hashline") => {
+    nativeToolManifests = mode === "none" ? REMOTE_TOOL_NAMES.map(name =>
+      name === "edit" ? disabledMetadata : { name, description: name, parameters: { type: "object" } }) : undefined;
+  };
+  configureReady("none");
+  await owner.execute("remote_connect", { target: "fixture.invalid", cwd: "/remote" });
+  const family = active.get(owner.sessionFile)!, state = owner.state(family);
+  expect(state.editMode).toBe("none");
+  expect(state.wrappedTools.has("edit")).toBe(false);
+  await expect(owner.execute("read", { path: "/remote/disabled" })).resolves.toHaveProperty("details");
+  await expect(owner.execute("bash", { command: "printf available" })).resolves.toHaveProperty("details");
+  for (const mode of ["hashline", "none"] as const) {
+    cfgEditMode.override(local.settings, mode);
+    await expect(owner.execute("read", { path: "/remote/stale-mode" })).rejects.toThrow(/edit mode changed.*Reconnect/);
+    configureReady(mode);
+    await owner.execute("remote_reconnect", { force: true });
+    expect(state.editMode).toBe(mode);
+    await expect(owner.execute("read", { path: "/remote/fresh-mode" })).resolves.toHaveProperty("details");
+  }
+  expect(state.wrappedTools.has("edit")).toBe(false);
+}, 30_000);

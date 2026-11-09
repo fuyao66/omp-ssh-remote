@@ -1,5 +1,5 @@
 /** Build-time SDK contract; companion admission uses runtime version and wire schemas instead. */
-export const SUPPORTED_SDK_VERSION = "18.16.0";
+export const SUPPORTED_SDK_VERSION = "18.18.3";
 
 export const SDK_ADAPTATIONS = {
   lspConfig: {

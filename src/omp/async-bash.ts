@@ -1,13 +1,13 @@
 import { raceJobSettlement, resolveAutoBackgroundWaitMs } from "@oh-my-pi/pi-coding-agent/async";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
-import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import type { AsyncJobManagerApi } from "@oh-my-pi/pi-coding-agent/async";
 import { clampTimeout } from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import { formatBackgroundNotice } from "@oh-my-pi/pi-tui/tools/bash";
-import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID, type AgentRegistryApi } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { RemoteJobCapture } from "./remote-capture.ts";
 import type { JobCapturePayload } from "./job-capture.ts";
-import { resolveHostSessionRef } from "./host-session.ts";
+import { resolveHostSessionRef, resolveLocalHostSession } from "./host-session.ts";
 
 /**
  * Bridge OMP `bash async:true` onto the remote companion.
@@ -32,7 +32,7 @@ export interface RemoteAsyncBashExecutor {
 }
 
 export interface RemoteAsyncBashJobOptions {
-  manager: AsyncJobManager;
+  manager: AsyncJobManagerApi;
   ownerId: string | undefined;
   command: string;
   params: Record<string, unknown>;
@@ -64,7 +64,7 @@ function textOf(result: unknown): string {
  */
 export function resolveJobOwnerId(
   sessionFile: string | undefined,
-  registry: AgentRegistry = AgentRegistry.global(),
+  registry: AgentRegistryApi = AgentRegistry.global(),
 ): string | undefined {
   const refs = registry.list();
   const match = resolveHostSessionRef(sessionFile, undefined, registry);
@@ -76,9 +76,9 @@ export function resolveJobOwnerId(
 
 export function resolveLocalAsyncJobManager(
   sessionFile: string | undefined,
-  registry: AgentRegistry = AgentRegistry.global(),
-): AsyncJobManager | undefined {
-  return resolveHostSessionRef(sessionFile, undefined, registry)?.session?.asyncJobManager;
+  registry: AgentRegistryApi = AgentRegistry.global(),
+): AsyncJobManagerApi | undefined {
+  return resolveLocalHostSession(sessionFile, undefined, registry)?.asyncJobManager;
 }
 
 type RemoteJobCompletion =

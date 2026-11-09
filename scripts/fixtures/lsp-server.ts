@@ -43,7 +43,7 @@ while True:
     result = None
     error = None
     if method == 'initialize':
-        result = dict(capabilities=dict(textDocumentSync=dict(openClose=True,change=1,save=True),hoverProvider=True))
+        result = dict(capabilities=dict(textDocumentSync=dict(openClose=True,change=1,save=True),hoverProvider=True,codeActionProvider=dict(codeActionKinds=['source.organizeImports'])))
     elif method in ('textDocument/didOpen','textDocument/didChange'):
         doc = params['textDocument']
         text = doc.get('text') if method.endswith('didOpen') else params['contentChanges'][-1]['text']
@@ -71,6 +71,20 @@ while True:
         error = dict(code=-32603,message='intentional fixture failure')
     elif method == 'textDocument/hover':
         result = dict(contents='fixture hover')
+    elif method == 'textDocument/codeAction':
+        uri = params['textDocument']['uri']
+        context = params.get('context',{})
+        only = context.get('only')
+        log('code-action',uri=uri,only=only,diagnostics=context.get('diagnostics',[]))
+        # Deliberately absent from the ordinary response: native code_actions
+        # must explicitly request source actions, then apply the workspace edit.
+        if only and any(kind in ('source','source.organizeImports') for kind in only):
+            versions = documents[uri]
+            text = versions[max(versions)]
+            edit = dict(range=dict(start=dict(line=0,character=0),end=dict(line=len(text.splitlines()),character=0)),newText='CLEAN_SOURCE_APPLIED\n')
+            result = [dict(title='Fixture organize imports',kind='source.organizeImports',edit=dict(changes={uri:[edit]}))]
+        else:
+            result = []
     elif method == 'shutdown':
         result = None
     elif method == 'exit':

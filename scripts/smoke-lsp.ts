@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { lookup, type AnySetting } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { resolveHostSessionRef } from "../src/omp/host-session.ts";
+import { resolveLocalHostSession } from "../src/omp/host-session.ts";
 import { parseConnectArgs } from "../src/connect-options.ts";
 import { lspFixtureSource } from "./fixtures/lsp-server.ts";
 import { bootstrapSmokeHost } from "./smoke-host.ts";
@@ -32,8 +32,8 @@ export default async function lspSmoke(pi: ExtensionAPI) {
   if (!args) throw new Error("REMOTE_CONNECT_ARGS must select an SSH test host; use an alias with Python/TypeScript LSP opt-ins");
   const commands = await bootstrapSmokeHost(pi);
   pi.registerCommand("remote-lsp-smoke", { description: "Native LSP semantic and deferred-delivery acceptance (scratch only)", async handler(_, ctx) {
-    const session = resolveHostSessionRef(ctx.sessionManager.getSessionFile(), ctx)?.session;
-    assert(session, "Native session not registered");
+    const session = resolveLocalHostSession(ctx.sessionManager.getSessionFile(), ctx);
+    assert(session, "Native session must be registered on its home thread");
     const rows: { check: string; outcome: string; evidence: unknown }[] = [];
     const report = (check: string, evidence: unknown, outcome = "positive") => {
       rows.push({ check, outcome, evidence });
@@ -107,6 +107,7 @@ export default async function lspSmoke(pi: ExtensionAPI) {
         "actions.ts": "export const actionResult = marker;\n",
         "sample.py": "def add(a: int, b: int) -> int:\n    return a + b\n\nfirst = add(1, 2)\nsecond = add(3, 4)\n",
         "fixture.py": lspFixtureSource,
+        "source.smoke": "CLEAN_SOURCE_BEFORE\n",
         "lsp.json": JSON.stringify({ servers: { "smoke-fixture": { command: "python3", args: ["-u", `${scratch}/fixture.py`, `${scratch}/fixture.log`], fileTypes: [".smoke"], rootMarkers: ["lsp.json"], languageId: "plaintext" } } }),
       };
       for (const [name, content] of Object.entries(files)) await shell(`printf %s ${quote(content)} > ${quote(`${scratch}/${name}`)}`);
@@ -158,6 +159,24 @@ export default async function lspSmoke(pi: ExtensionAPI) {
       await write(`${scratch}/invalid.py`, 'def broken(:\n    pass\n');
       const pyDiagnostics = text(await lsp("diagnostics", { file: `${scratch}/invalid.py` })); assert.match(pyDiagnostics, /error|Expected|expected/);
       // Deterministic fixture results below are transport contracts, not TS/Pyright semantics.
+      const sourceFile = `${scratch}/source.smoke`;
+      const sourceBefore = files["source.smoke"];
+      const sourceActions = text(await lsp("code_actions", { file: sourceFile, line: 1 }));
+      assert.match(sourceActions, /^1 code action\(s\):/); assert.match(sourceActions, /Fixture organize imports/);
+      const narrowedSourceActions = text(await lsp("code_actions", { file: sourceFile, line: 1, query: "source.organizeImports" }));
+      assert.match(narrowedSourceActions, /^1 code action\(s\):/); assert.equal(await disk(sourceFile), sourceBefore);
+      const sourceApplied = text(await lsp("code_actions", { file: sourceFile, line: 1, query: "Fixture organize imports", apply: true }));
+      assert.match(sourceApplied, /Applied "Fixture organize imports"/);
+      assert.equal(await disk(sourceFile), "CLEAN_SOURCE_APPLIED\n");
+      assert.equal(text(await lsp("diagnostics", { file: sourceFile })).trim(), "OK");
+      const sourceRequests = (await disk(`${scratch}/fixture.log`)).trim().split("\n").map(line => JSON.parse(line))
+        .filter(row => row.event === "code-action" && row.uri === `file://${sourceFile}`);
+      assert.equal(sourceRequests.length, 5);
+      assert.equal(sourceRequests.filter(row => row.only == null).length, 2);
+      assert.equal(sourceRequests.filter(row => JSON.stringify(row.only) === '["source"]').length, 2);
+      assert.equal(sourceRequests.filter(row => JSON.stringify(row.only) === '["source.organizeImports"]').length, 1);
+      assert(sourceRequests.every(row => row.diagnostics.length === 0), "Source actions must work without quick-fix diagnostics");
+      report("source_code_action", { source: "deterministic-fixture", listed: 1, previewUnchanged: true, appliedExactBytes: true, ordinaryRequests: 2, sourceRequests: 2, narrowedRequests: 1, diagnosticsAfter: "OK" });
       const inline = await write(fixture, "INLINE_ERROR\n"); assert.match(JSON.stringify(inline.details), /INLINE_ERROR/);
       const explicitDiagnostics = text(await lsp("diagnostics", { file: fixture })); assert.match(explicitDiagnostics, /1 error\(s\)/); assert.match(explicitDiagnostics, /INLINE_ERROR/);
       report("write_diagnostics", { source: "deterministic-fixture-inline-and-real-servers", inline: true, explicitDiagnostics, tsDiagnostics, pyDiagnostics });
@@ -189,13 +208,19 @@ export default async function lspSmoke(pi: ExtensionAPI) {
       await until("stale candidate queued", () => session.yieldQueue.has(LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE));
       const staleThunks = session.yieldQueue.drainLazy();
       await write(fixture, "CLEAN\n");
-      assert.equal(lateFiles(staleThunks.map(build => build()).filter(Boolean)).length, 0); assert.equal(lateFiles(drain()).length, 0); report("stale_generation", "queued old diagnostic dropped after clean mutation at lazy delivery");
+      assert.equal(lateFiles(staleThunks.map(build => build()).filter(Boolean)).length, 0); assert.equal(lateFiles(drain()).length, 0);
+      await write(fixture, "HOLD_SOURCE_STALE_ERROR\n"); await release();
+      await until("source-action stale candidate queued", () => session.yieldQueue.has(LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE));
+      const sourceStaleThunks = session.yieldQueue.drainLazy();
+      await lsp("code_actions", { file: fixture, line: 1, query: "Fixture organize imports", apply: true });
+      assert.equal(await disk(fixture), "CLEAN_SOURCE_APPLIED\n");
+      assert.equal(lateFiles(sourceStaleThunks.map(build => build()).filter(Boolean)).length, 0); assert.equal(lateFiles(drain()).length, 0); report("stale_generation", { cleanWriteDroppedOldDiagnostic: true, sourceActionDroppedOldDiagnostic: true });
       await write(fixture, "HOLD_DISCONNECT_ERROR\n"); await release();
       await until("disconnect candidate queued", () => session.yieldQueue.has(LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE));
       const disconnectThunks = session.yieldQueue.drainLazy();
       await exit();
       assert.equal(lateFiles(disconnectThunks.map(build => build()).filter(Boolean)).length, 0); report("binding_ownership", "old binding diagnostic rejected after remote-exit");
-      assert.equal(modelTurns, 0); assert.equal(rows.length, 25, `Expected 25 checks, got ${rows.length}`);
+      assert.equal(modelTurns, 0); assert.equal(rows.length, 26, `Expected 26 checks, got ${rows.length}`);
       console.log("LSP_SMOKE_PASS", JSON.stringify({ checks: rows.length, positive: rows.filter(row => row.outcome === "positive").length, classifications: rows.filter(row => row.outcome !== "positive"), modelTurns,
         limitations: ["Host read-only/device-only policy forwarding has no supported native getter; this smoke does not claim coverage"] }));
     } catch (error) {

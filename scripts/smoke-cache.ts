@@ -3,7 +3,7 @@ import { readFile, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
 import assert from "node:assert/strict";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { resolveLocalHostSession } from "../src/omp/host-session.ts";
 import { bootstrapSmokeHost } from "./smoke-host.ts";
 
 export default async function cacheSmoke(pi: ExtensionAPI) {
@@ -78,8 +78,8 @@ export default async function cacheSmoke(pi: ExtensionAPI) {
   pi.registerProvider("remote-cache-smoke", { baseUrl: `http://127.0.0.1:${server.port}/v1`, apiKey: "smoke-local-only", api: providerApi, models: [{ id: "cache-probe", name: "Cache probe", reasoning: responsesApi, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 32 }] });
   pi.on("session_shutdown", () => { server.stop(true); });
   pi.registerCommand("remote-cache-smoke", { description: "Verify actual OMP wire prefixes without a paid model", async handler(_, ctx) {
-    const session = AgentRegistry.global().list().find(ref => ref.sessionFile === ctx.sessionManager.getSessionFile())?.session;
-    if (!session) throw new Error("Native session not registered");
+    const session = resolveLocalHostSession(ctx.sessionManager.getSessionFile(), ctx);
+    assert(session, "Native session must be registered on its home thread");
     let connected = false;
     const fixture = `/tmp/omp-cache-smoke-${process.pid}.txt`;
     const invoke = async (name: string, input: object, onUpdate?: (result: any) => void) => {

@@ -17,6 +17,7 @@ export function assertNestedRemoteTool(name: string, args: Record<string, unknow
   if (!NESTED_TOOL_NAMES.includes(name as (typeof NESTED_TOOL_NAMES)[number])) {
     throw new Error(`Eval tool.${name} is unavailable in the remote runtime`);
   }
+  if (name === "edit" && editMode === "none") throw new Error("The edit tool is disabled by edit.mode=none");
   if (isOutReplyWrite(name, args)) return;
   const resource = resourceExecutionTarget(name as RemoteToolName, args, binding);
   if (!resource && pathShouldStayLocal(name as RemoteToolName, args, editMode)) {

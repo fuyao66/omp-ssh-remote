@@ -10,6 +10,7 @@ import {
   startRemoteAsyncBashJob,
 } from "../src/omp/async-bash.ts";
 import type { JobCapturePayload } from "../src/omp/job-capture.ts";
+import { hostSessionHandle } from "./fixtures/host-session-handle.ts";
 
 function textResult(text: string, isError = false): AgentToolResult {
   return { content: [{ type: "text", text }], isError };
@@ -511,10 +512,10 @@ describe("job owner resolution", () => {
     const previous = AsyncJobManager.instance();
     AsyncJobManager.setInstance(first);
     const registry = new AgentRegistry();
-    type Session = Parameters<AgentRegistry["register"]>[0]["session"];
-    registry.register({ id: "First", displayName: "first", kind: "main", sessionFile: "/s/first.jsonl", session: { sessionManager: { getSessionFile: () => "/s/first.jsonl" }, asyncJobManager: first } as Session });
-    registry.register({ id: "Second", displayName: "second", kind: "main", sessionFile: "/s/second.jsonl", session: { sessionManager: { getSessionFile: () => "/s/second.jsonl" }, asyncJobManager: second } as Session });
-    registry.register({ id: "Child", displayName: "child", kind: "sub", parentId: "Second", sessionFile: "/s/second/Child.jsonl", session: { sessionManager: { getSessionFile: () => "/s/second/Child.jsonl" }, asyncJobManager: second } as Session });
+    const session = (file: string, manager: AsyncJobManager) => ({ ...hostSessionHandle(() => file), asyncJobManager: manager });
+    registry.register({ id: "First", displayName: "first", kind: "main", sessionFile: "/s/first.jsonl", session: session("/s/first.jsonl", first) });
+    registry.register({ id: "Second", displayName: "second", kind: "main", sessionFile: "/s/second.jsonl", session: session("/s/second.jsonl", second) });
+    registry.register({ id: "Child", displayName: "child", kind: "sub", parentId: "Second", sessionFile: "/s/second/Child.jsonl", session: session("/s/second/Child.jsonl", second) });
     try {
       for (const sessionFile of ["/s/second.jsonl", "/s/second/Child.jsonl"]) {
         const manager = resolveLocalAsyncJobManager(sessionFile, registry);
@@ -536,14 +537,14 @@ describe("job owner resolution", () => {
       id: "Main",
       displayName: "main",
       kind: "main",
-      session: { sessionManager: { getSessionFile: () => "/s/main.jsonl" } } as unknown as Parameters<AgentRegistry["register"]>[0]["session"],
+      session: hostSessionHandle(() => "/s/main.jsonl"),
       sessionFile: "/s/main.jsonl",
     });
     registry.register({
       id: "Worker",
       displayName: "sub",
       kind: "sub",
-      session: { sessionManager: { getSessionFile: () => "/s/main/Worker.jsonl" } } as unknown as Parameters<AgentRegistry["register"]>[0]["session"],
+      session: hostSessionHandle(() => "/s/main/Worker.jsonl"),
       sessionFile: "/s/main/Worker.jsonl",
     });
     expect(resolveJobOwnerId("/s/main/Worker.jsonl", registry)).toBe("Worker");

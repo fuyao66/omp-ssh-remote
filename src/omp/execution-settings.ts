@@ -31,6 +31,7 @@ export const FORWARDED_EXECUTION_SETTINGS = {
   "bash.gitGuard": { type: "boolean" },
   "bash.direnv": { type: "enum", values: ["auto", "off"] },
   "bash.direnvLoadTimeoutMs": { type: "number", min: 0 },
+  "display.shellVisualization": { type: "boolean" },
   "bashInterceptor.enabled": { type: "boolean" },
   "bashInterceptor.patterns": { type: "interceptor-rules" },
   "grep.contextBefore": { type: "number", min: 0 },

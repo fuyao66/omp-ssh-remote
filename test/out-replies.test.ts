@@ -67,10 +67,10 @@ test("worker initialize preserves native out replies and refusal without changin
             expect(frames.some(frame => toolResultReplies(frame.details).includes("REMOTE_REPLY_SENTINEL"))).toBe(true);
           } else {
             expect(refusal).toBeDefined();
-            // The native embedded shell surfaces the gate's EROFS as a redirect failure;
+            // The native embedded shell surfaces the gate's EROFS for the reply URI;
             // the refusal reason itself is asserted through the bridged write below.
             expect(result.isError).toBe(true);
-            expect(JSON.stringify(result)).toContain("failed to redirect to out://");
+            expect(JSON.stringify(result)).toContain("out://: Read-only file system");
             expect(toolResultReplies(result.details)).toEqual([]);
           }
         }

@@ -29,12 +29,14 @@ describe("execution settings whitelist", () => {
     const settings = Settings.isolated({
       "tools.maxTimeout": 123,
       "edit.enforceSeenLines": false,
+      "display.shellVisualization": false,
       "read.defaultLimit": 321,
       "edit.mode": "replace",
     });
     expect(captureExecutionSettings(settings)).toMatchObject({
       "tools.maxTimeout": 123,
       "edit.enforceSeenLines": false,
+      "display.shellVisualization": false,
       "read.defaultLimit": 321,
     });
     expect(captureExecutionSettings(settings)).not.toHaveProperty("edit.mode");
@@ -82,6 +84,20 @@ describe("execution settings whitelist", () => {
     expect(parseExecutionSettings({ "lsp.requestTimeout": 0 })).toEqual({ "lsp.requestTimeout": 0 });
     expect(() => parseExecutionSettings({ "lsp.requestTimeout": -1 })).toThrow(/lsp.requestTimeout/);
     expect(() => parseExecutionSettings({ "lsp.requestTimeout": "45" })).toThrow(/lsp.requestTimeout/);
+  });
+
+  test("shell visualization preserves native booleans, including an explicit false", () => {
+    expect(captureExecutionSettings(Settings.isolated())).not.toHaveProperty("display.shellVisualization");
+    for (const enabled of [true, false]) {
+      expect(captureExecutionSettings(Settings.isolated({ "display.shellVisualization": enabled })))
+        .toMatchObject({ "display.shellVisualization": enabled });
+      expect(parseExecutionSettings({ "display.shellVisualization": enabled }))
+        .toEqual({ "display.shellVisualization": enabled });
+    }
+    for (const value of ["false", 0, null]) {
+      expect(captureExecutionSettings({ get: key => key === "display.shellVisualization" ? value : undefined })).toEqual({});
+      expect(() => parseExecutionSettings({ "display.shellVisualization": value })).toThrow(/display\.shellVisualization/);
+    }
   });
 });
 

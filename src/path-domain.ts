@@ -1,6 +1,6 @@
 import { editInspect, type EditInspection } from "@oh-my-pi/pi-natives";
 import { recoverConflictUriPrefix } from "@oh-my-pi/pi-coding-agent/tools/conflict-detect";
-import { unwrapHashlineHeaderPath } from "@oh-my-pi/pi-coding-agent/tools/plan-mode-guard";
+import { unwrapHashlineHeaderPath } from "@oh-my-pi/pi-coding-agent/tools/hashline-header-path";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import type { OmpEditMode, RemoteToolName } from "./protocol.ts";
 
@@ -42,6 +42,7 @@ export function resourcePathOperands(
     return paths;
   }
   if (tool === "edit") {
+    if (editMode === "none") throw new Error("The edit tool is disabled by edit.mode=none");
     if (!["replace", "patch", "apply_patch", "hashline", "sloppy"].includes(editMode)) {
       throw new Error(`Cannot classify edit paths for unsupported mode: ${editMode}`);
     }

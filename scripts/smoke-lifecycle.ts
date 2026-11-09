@@ -1,7 +1,7 @@
 // Bundle and run inside native OMP; no model requests are made.
 import assert from "node:assert/strict";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { resolveHostSessionRef } from "../src/omp/host-session.ts";
+import { resolveLocalHostSession } from "../src/omp/host-session.ts";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { bootstrapSmokeHost } from "./smoke-host.ts";
 
@@ -10,8 +10,8 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
   if (!args) throw new Error("REMOTE_CONNECT_ARGS must specify a test host and scratch cwd");
   const commands = await bootstrapSmokeHost(pi);
   pi.registerCommand("remote-lifecycle-smoke", { description: "Verify upgrade lifecycle in native OMP", async handler(_, ctx) {
-    const session = resolveHostSessionRef(ctx.sessionManager.getSessionFile(), ctx)?.session;
-    if (!session) throw new Error("Native session not registered");
+    const session = resolveLocalHostSession(ctx.sessionManager.getSessionFile(), ctx);
+    assert(session, "Native session must be registered on its home thread");
     // Exercise real jobs without allowing their completion callbacks to start
     // an unrelated model turn while this model-free command owns the session.
     const originalBridge = session.clientBridge;

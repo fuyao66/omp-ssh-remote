@@ -1,5 +1,8 @@
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { AgentSessionHandle } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { describe, expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import { getRemoteFamilyBroker, sessionBelongsToFamily } from "../src/family-broker.ts";
@@ -16,13 +19,27 @@ async function extensionHarness(module: ExtensionModule, sessionFile: string) {
   const hooks = new Map<string, Hook>();
   const tools = new Map<string, ToolDefinition>();
   const manager = SessionManager.inMemory("/local/workspace");
+  const agent = { id: `family-fixture-${crypto.randomUUID()}`, name: "family fixture", kind: "sub" as const, depth: 1 };
+  const sessionManager = {
+    getSessionFile: () => sessionFile, getSessionId: () => manager.getSessionId(),
+    getBranch: () => manager.getBranch(), getEntries: () => manager.getEntries(),
+    ensureOnDisk: () => manager.ensureOnDisk(), flush: () => manager.flush(),
+  };
+  const session = {
+    instanceKey: `main:${crypto.randomUUID()}`, sessionManager, settings: Settings.isolated(),
+    getToolByName: () => undefined, getAdvisorStats: () => ({ configured: false, advisors: [] }),
+    async runToolRegistryMutation(mutate: () => Promise<void>) { await mutate(); },
+  } as unknown as AgentSessionHandle;
+  const registry = AgentRegistry.global();
+  const ref = registry.register({ id: agent.id, displayName: agent.name, kind: agent.kind, session, sessionFile });
   const ctx = {
     cwd: "/local/workspace",
-    sessionManager: { getSessionFile: () => sessionFile, getBranch: () => manager.getBranch() },
+    agent, sessionManager,
     ui: { notify() {}, setStatus() {} },
   } as unknown as ExtensionContext;
   await module.default({
     registerCommand() {},
+    appendEntry(customType: string, data?: unknown) { manager.appendCustomEntry(customType, data); },
     registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
     on(name: string, handler: Hook) { hooks.set(name, handler); },
     getActiveTools: () => [],
@@ -32,7 +49,8 @@ async function extensionHarness(module: ExtensionModule, sessionFile: string) {
     async emit(name: string, event: Record<string, unknown> = {}) {
       const hook = hooks.get(name);
       if (!hook) throw new Error(`Missing extension hook: ${name}`);
-      return await hook(event, ctx);
+      try { return await hook(event, ctx); }
+      finally { if (name === "session_shutdown") registry.unregister(agent.id, ref); }
     },
     async status(): Promise<RemoteWorkspaceStatus> {
       const tool = tools.get("remote_workspace_status");
@@ -93,12 +111,13 @@ describe("process-global remote family lifecycle", () => {
       second.getRemoteFamilyBroker<Family>().revoke(family);
       expect(legacy.has(family.ownerSessionFile)).toBe(false);
       expect(broker.find(descendant(child.sessionFile!, "grandchild"))).toBe(family);
+      expect(broker.find(child.sessionFile!)).toBe(family);
       expect(broker.find(otherChild.sessionFile!)).toBe(other);
       expect(broker.hasOwner(other.ownerSessionFile)).toBe(true);
       broker.revoke(other);
       expect(broker.find(descendant(otherChild.sessionFile!, "grandchild"))).toBe(other);
       second.getRemoteFamilyBroker<Family>().detach(family, child);
-      expect(broker.find(descendant(child.sessionFile!, "grandchild"))).toBeUndefined();
+      expect(broker.find(descendant(child.sessionFile!, "grandchild"))).toBe(family);
       expect(broker.hasOwner(other.ownerSessionFile)).toBe(false);
       expect(broker.find(descendant(otherChild.sessionFile!, "grandchild"))).toBe(other);
     } finally {
@@ -109,7 +128,7 @@ describe("process-global remote family lifecycle", () => {
     }
   });
 
-  test("revoked descendants in two extension instances stay unavailable until the final member shuts down", async () => {
+  test("revoked descendants in two extension instances stay unavailable after the final member shuts down", async () => {
     // Use the extension loader's native-path query form: Bun collapses file:
     // URL query imports. Static imports would hide the module loading boundary.
     const modulePath = fileURLToPath(new URL("../src/extension.ts", import.meta.url));
@@ -151,8 +170,8 @@ describe("process-global remote family lifecycle", () => {
       expect(await unrelated.status()).toMatchObject({ mode: "local", transport: "not-selected" });
       broker.detach(family, child);
       await cross.emit("session_shutdown");
-      // A departed descendant's root is retained while any family member is
-      // alive: shutdown order cannot reopen its subtree to local execution.
+      // Revoked lineage outlives every transport: a parked child must never
+      // become local merely because the final live member shut down.
       await retained.emit("session_start");
       expect((await retained.status()).mode).toBe("unavailable");
       await same.emit("session_shutdown");
@@ -160,13 +179,13 @@ describe("process-global remote family lifecycle", () => {
       expect(broker.find(descendant(childFile, "still-revoked"))).toBe(family);
       await retained.emit("session_shutdown");
       expect(family.members.size).toBe(0);
-      expect(broker.find(descendant(childFile, "same-module"))).toBeUndefined();
-      expect(broker.find(descendant(crossFile, "retained"))).toBeUndefined();
+      expect(broker.find(descendant(childFile, "same-module"))).toBe(family);
+      expect(broker.find(descendant(crossFile, "retained"))).toBe(family);
       for (const module of [first, second]) {
         const afterShutdown = await extensionHarness(module, descendant(childFile, "after-shutdown"));
         try {
           await afterShutdown.emit("session_start");
-          expect((await afterShutdown.status()).mode).toBe("local");
+          expect((await afterShutdown.status()).mode).toBe("unavailable");
         } finally {
           await afterShutdown.emit("session_shutdown");
         }

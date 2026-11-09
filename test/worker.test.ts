@@ -843,12 +843,16 @@ describe("forwarded execution settings", () => {
       });
       // A forwarded value must never change the admitted tool set or schemas.
       expect(ready.tools.map((tool) => tool.name)).toContain("bash");
-      const result = JSON.stringify(
-        await worker.execute("bash", "capped", { command: "sleep 5; echo finished", timeout: 30 }).catch((error: Error) => error.message),
-      );
-      expect(result).toContain("Command timed out after 1 seconds");
-      expect(result).toContain("Timeout clamped to 1s (requested 30s; global tools.maxTimeout ceiling 1s).");
-      expect(result).not.toContain("finished");
+      const result = await worker.execute("bash", "capped", {
+        command: "sleep 5; printf completed > timeout-completed.txt; echo finished", timeout: 30,
+      }) as AgentToolResult;
+      // Native traces retain source text, including commands never reached.
+      // Assert rendered output and filesystem effects, not metadata substrings.
+      const output = result.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+      expect(output).toContain("Command timed out after 1 seconds");
+      expect(output).toContain("Timeout clamped to 1s (requested 30s; global tools.maxTimeout ceiling 1s).");
+      expect(output).not.toContain("finished");
+      expect(await Bun.file(join(settingsCwd, "timeout-completed.txt")).exists()).toBe(false);
     } finally {
       await worker.close().catch(() => {});
       await rm(settingsCwd, { recursive: true, force: true });

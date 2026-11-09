@@ -171,7 +171,7 @@ export async function createNativeWorkerRuntime(
     enableLsp: true,
     enableIrc: false,
     enableMCP: false,
-    hasEditTool: true,
+    hasEditTool: resolveEditMode({ settings }) !== "none",
     restrictToolNames: true,
     settings,
     taskDepth: options.taskDepth ?? 0,
@@ -206,7 +206,8 @@ export async function createNativeWorkerRuntime(
     ...(options.onDeferredDiagnostics ? {
       queueDeferredDiagnostics: entry => { if (!entry.isStale()) revisions.diagnostics(entry); },
     } : {}),
-    isToolActive: (name) => REMOTE_TOOL_NAMES.includes(name as (typeof REMOTE_TOOL_NAMES)[number]),
+    isToolActive: (name) => (name !== "edit" || resolveEditMode(session) !== "none") &&
+      REMOTE_TOOL_NAMES.includes(name as (typeof REMOTE_TOOL_NAMES)[number]),
     getToolByName: name => {
       const bareName = stripXdUrlPrefix(name);
       const tool = callableTools.get(bareName) ?? [...callableTools.values()].find(tool => tool.customWireName === bareName);
@@ -238,10 +239,23 @@ export async function createNativeWorkerRuntime(
     throw new Error(`Remote edit mode ${editMode} conflicts with negotiated ${options.editMode}; pin PI_EDIT_VARIANT before creating the worker runtime`);
   }
 
+  // The fixed handshake inventory retains metadata for setting-gated tools.
+  // Native EditTool already uses replace metadata while edit.mode=none; keep
+  // that schema without ever publishing its executable parser or Eval bridge.
+  const nativeEdit = new EditTool(session, editMode === "none" ? undefined : editMode);
+  const edit: RemoteNativeTool = editMode === "none" ? {
+    name: "edit",
+    mode: "none",
+    description: nativeEdit.description,
+    parameters: nativeEdit.parameters,
+    concurrency: nativeEdit.concurrency,
+    execute: async () => { throw new Error("The edit tool is disabled by edit.mode=none"); },
+  } : nativeEdit as unknown as RemoteNativeTool;
+
   const tools: Record<RemoteToolName, RemoteNativeTool> = {
     read: new ReadTool(session),
     write: new WriteTool(session),
-    edit: new EditTool(session, editMode) as unknown as RemoteNativeTool,
+    edit,
     bash: new BashTool(session) as unknown as RemoteNativeTool,
     grep: new GrepTool(session),
     glob: new GlobTool(session, { rootPathAlias: true }),
@@ -303,6 +317,7 @@ export async function createNativeWorkerRuntime(
   Object.values(tools).forEach(publishTool);
   const evalCallableNames = NESTED_TOOL_NAMES;
   for (const name of evalCallableNames) {
+    if (name === "edit" && editMode === "none") continue;
     const tool = tools[name];
     callableTools.set(name, { name: tool.name, description: tool.description,
       parameters: tool.parameters, customWireName: tool.customWireName,

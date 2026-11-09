@@ -7,12 +7,17 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { AgentSessionHandle } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
 import { nestedDispatchScope } from "../src/nested-dispatch.ts";
+import * as ssh from "../src/ssh.ts";
+import * as identity from "../src/omp/host-identity.ts";
+import { SUPPORTED_SDK_VERSION } from "../src/omp/sdk-contract.ts";
+import { createNativeWorkerRuntime, type RemoteNativeTool } from "../src/runtime.ts";
 import remoteRuntimeExtension, {
   closeRemoteFamily,
   consumedResolution,
@@ -21,6 +26,7 @@ import remoteRuntimeExtension, {
 
 type Family = Parameters<typeof closeRemoteFamily>[0];
 type Member = Family["members"] extends Set<infer State> ? State : never;
+type NativeToolMetadata = Pick<RemoteNativeTool, "name" | "description" | "parameters" | "customFormat" | "customWireName" | "concurrency">;
 type Hook = (event: Record<string, unknown>, ctx: ExtensionContext) => unknown;
 
 async function extensionHarness(
@@ -31,21 +37,37 @@ async function extensionHarness(
 ) {
   const handlers = new Map<string, Hook>();
   const tools = new Map<string, ToolDefinition>();
+  let nativeMetadata: { name: string; description: string; parameters: unknown; sourceInfo: { source: string } }[] | undefined;
+  let nativeTools: Readonly<Partial<Record<string, NativeToolMetadata>>> = {};
+  const agent = { id: `architecture-fixture-${crypto.randomUUID()}`, name: "architecture fixture", kind: "sub" as const, depth: 1 };
   const ctx = {
     cwd: "/local/workspace",
+    agent,
     sessionManager: {
       getSessionFile: () => sessionFile,
       getBranch: () => manager.getBranch(),
+      getSessionId: () => manager.getSessionId(),
+      getEntries: () => manager.getEntries(),
+      ensureOnDisk: () => manager.ensureOnDisk(),
+      flush: () => manager.flush(),
     },
     ui: { notify() {}, setStatus() {} },
     invokeTool,
   } as unknown as ExtensionContext;
+  const session = {
+    instanceKey: `main:${crypto.randomUUID()}`, sessionManager: ctx.sessionManager, settings: Settings.isolated(),
+    getToolByName: (name: string) => nativeTools[name], getAdvisorStats: () => ({ configured: false, advisors: [] }),
+    async runToolRegistryMutation(mutate: () => Promise<void>) { await mutate(); },
+  } as unknown as AgentSessionHandle;
+  const registry = AgentRegistry.global();
+  const ref = registry.register({ id: agent.id, displayName: agent.name, kind: agent.kind, session, sessionFile });
   const api = {
     registerCommand() {},
+    appendEntry(customType: string, data?: unknown) { manager.appendCustomEntry(customType, data); },
     registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
     on(event: string, handler: Hook) { handlers.set(event, handler); },
     getActiveTools: () => activeTools,
-    getAllTools: () => activeTools.map((name) => ({
+    getAllTools: () => nativeMetadata ?? activeTools.map((name) => ({
       name,
       description: `Native ${name}`,
       parameters: {},
@@ -56,6 +78,13 @@ async function extensionHarness(
   return {
     ctx,
     handlers,
+    getNativeTool(name: string) { return nativeTools[name]; },
+    useNativeTools(next: Readonly<Record<string, NativeToolMetadata>>) {
+      nativeTools = next;
+      nativeMetadata = Object.values(next).map(tool => ({
+        name: tool.name, description: tool.description, parameters: tool.parameters, sourceInfo: { source: "builtin" },
+      }));
+    },
     useSession(next: SessionManager) { manager = next; },
     accept(result: unknown) {
       const { message } = result as { message: CustomMessage };
@@ -69,7 +98,8 @@ async function extensionHarness(
     async emit(name: string, event: Record<string, unknown> = {}) {
       const handler = handlers.get(name);
       if (!handler) throw new Error(`Missing extension event: ${name}`);
-      return await handler(event, ctx);
+      try { return await handler(event, ctx); }
+      finally { if (name === "session_shutdown") registry.unregister(agent.id, ref); }
     },
     async status(): Promise<RemoteWorkspaceStatus> {
       const tool = tools.get("remote_workspace_status");
@@ -78,6 +108,29 @@ async function extensionHarness(
       return result.details as RemoteWorkspaceStatus;
     },
   };
+}
+
+/** Admit an active family through the real lifecycle; replace only its SSH process. */
+async function admitFixtureMember(harness: Awaited<ReturnType<typeof extensionHarness>>, family: Family): Promise<Member> {
+  Object.assign(harness.ctx, { cwd: import.meta.dir });
+  family.localCwd = import.meta.dir;
+  const native = await createNativeWorkerRuntime(import.meta.dir);
+  try {
+    harness.useNativeTools(native.tools);
+  } finally { await native.dispose(); }
+  const transport = spyOn(ssh, "buildSshWorkerCommand")
+    .mockReturnValue([process.execPath, join(import.meta.dir, "../src/worker.ts")]);
+  const hostIdentity = spyOn(identity, "resolveOmpHostVersion").mockResolvedValue(SUPPORTED_SDK_VERSION);
+  try {
+    await harness.emit("session_start");
+    const state = [...family.members].find(member => member.sessionFile === harness.ctx.sessionManager.getSessionFile())!;
+    expect(state.connectionError).toBeUndefined();
+    expect(state.client?.isClosed).toBe(false);
+    // Dispatch tests install their own transport after native admission settles.
+    await state.client!.close();
+    await state.client!.waitForExit();
+    return state;
+  } finally { hostIdentity.mockRestore(); transport.mockRestore(); }
 }
 
 describe("extension workspace architecture", () => {
@@ -95,7 +148,7 @@ describe("extension workspace architecture", () => {
     }
   });
 
-  test.each(["legacy", "native"])("corrects restored %s remote history only after native acceptance", async (kind) => {
+  test.each(["legacy", "native"])("restores %s remote history as unavailable until an explicit intent clears migration", async (kind) => {
     const manager = SessionManager.inMemory("/local/workspace");
     if (kind === "legacy") manager.appendCustomEntry("remote-workspace-context-v1", { mode: "remote", target: "old-host", cwd: "/old/remote" });
     else manager.appendCustomMessageEntry("remote-workspace-binding", "Previous remote binding", false, {
@@ -112,31 +165,32 @@ describe("extension workspace architecture", () => {
           customType: "remote-workspace-binding",
           display: false,
           details: {
-            mode: "local",
+            mode: "unavailable",
             target: null,
-            cwd: "/local/workspace",
+            cwd: null,
           },
-          content: expect.stringContaining("Workspace binding: local; local host;"),
+          content: expect.stringContaining("Remote execution is unavailable; no local fallback."),
         },
       });
       // A cancelled first attempt never entered native history: retry it.
       const retry = await harness.emit("before_agent_start");
-      expect(retry).toMatchObject({ message: { details: { mode: "local", target: null, cwd: "/local/workspace" } } });
+      expect(retry).toMatchObject({ message: { details: { mode: "unavailable", target: null, cwd: null } } });
       harness.accept(retry);
       expect(await harness.emit("before_agent_start")).toBeUndefined();
       expect(await harness.emit("before_agent_start")).toBeUndefined();
       expect(manager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "remote-workspace-binding")).toHaveLength(kind === "native" ? 2 : 1);
-      expect(manager.getBranch().at(-1)).toMatchObject({ type: "custom_message", details: { mode: "local" } });
+      expect(manager.getBranch().at(-1)).toMatchObject({ type: "custom_message", details: { mode: "unavailable" } });
     } finally {
       await harness.emit("session_shutdown");
     }
   });
 
-  test("hot switch and native branch navigation do not inherit a previous notice decision", async () => {
+  test("hot switch and branch navigation preserve explicit local intent despite previous remote notices", async () => {
     const manager = SessionManager.inMemory("/local/workspace");
     const remoteId = manager.appendCustomMessageEntry("remote-workspace-binding", "Remote history", false, {
       binding: "previous-remote", mode: "remote", target: "old-host", cwd: "/old/remote",
     });
+    manager.appendCustomEntry("remote-workspace-intent-v1", { version: 1, remote: false });
     const harness = await extensionHarness(`/tmp/navigation-${crypto.randomUUID()}.jsonl`, manager);
     try {
       await harness.emit("session_start");
@@ -153,6 +207,7 @@ describe("extension workspace architecture", () => {
       restored.appendCustomMessageEntry("remote-workspace-binding", "Other session remote history", false, {
         binding: "another-remote", mode: "remote", target: "other-host", cwd: "/other/remote",
       });
+      restored.appendCustomEntry("remote-workspace-intent-v1", { version: 1, remote: false });
       harness.useSession(restored);
       const correction = await harness.emit("before_agent_start");
       expect(correction).toMatchObject({ message: { details: { mode: "local" } } });
@@ -173,7 +228,7 @@ describe("extension workspace architecture", () => {
     const family: Family = {
       ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: cwd,
       connection: { target: "fixture.invalid", displayTarget: "fixture", cwd, workerPath: "/fixture/worker" },
-      members: new Set(), closing: true,
+      members: new Set(), closing: false,
     };
     const harness = await extensionHarness(`${root}/subagent/child.jsonl`, undefined, ["read"]);
     const broker = (globalThis as unknown as Record<symbol, Map<string, Family>>)[Symbol.for("omp-ssh-remote/session-families")]!;
@@ -182,9 +237,7 @@ describe("extension workspace architecture", () => {
       await writeFile(join(cwd, "pixel.png"), Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1sAAAAASUVORK5CYII=", "base64"));
       await writeFile(join(cwd, "data.json"), '{"a":42}');
       await client.initialize(cwd, OMP_RUNTIME_HANDSHAKE);
-      await harness.emit("session_start");
-      const state = [...family.members][0]!;
-      state.connectionError = undefined;
+      const state = await admitFixtureMember(harness, family);
       // Keep the real worker transport, including its serialized ToolError reconstruction.
       state.client = client;
       const json = await harness.executeTool("read", { path: "data.json?q=.a" });
@@ -208,9 +261,9 @@ describe("extension workspace architecture", () => {
     const root = ownerFile.slice(0, -".jsonl".length);
     const childFile = `${root}/subagent/child.jsonl`;
     const family: Family = {
-      ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: "/remote/workspace",
-      connection: { target: "test@example.invalid", displayTarget: "test-remote", cwd: "/remote/workspace", workerPath: "/remote/worker.mjs" },
-      members: new Set(), closing: true,
+      ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: import.meta.dir,
+      connection: { target: "test@example.invalid", displayTarget: "test-remote", cwd: import.meta.dir, workerPath: "/remote/worker.mjs" },
+      members: new Set(), closing: false,
     };
     const reader = new ReadTool({
       cwd: "/local/workspace", settings: Settings.isolated({ "launch.enabled": false }), hasUI: false,
@@ -229,10 +282,7 @@ describe("extension workspace architecture", () => {
     const broker = (globalThis as unknown as Record<symbol, Map<string, Family>>)[key]!;
     broker.set(ownerFile, family);
     try {
-      // Attach without opening SSH; substitute only the transport boundary.
-      await harness.emit("session_start");
-      const state = [...family.members][0]!;
-      state.connectionError = undefined;
+      const state = await admitFixtureMember(harness, family);
       state.client = {
         isClosed: false,
         async execute(_name: string, _id: string, params: Record<string, unknown>) {
@@ -265,9 +315,9 @@ describe("extension workspace architecture", () => {
     const root = ownerFile.slice(0, -".jsonl".length);
     const childFile = `${root}/subagent/child.jsonl`;
     const family: Family = {
-      ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: "/remote/workspace",
-      connection: { target: "test@example.invalid", displayTarget: "test-remote", cwd: "/remote/workspace", workerPath: "/remote/worker.mjs" },
-      members: new Set(), closing: true,
+      ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: import.meta.dir,
+      connection: { target: "test@example.invalid", displayTarget: "test-remote", cwd: import.meta.dir, workerPath: "/remote/worker.mjs" },
+      members: new Set(), closing: false,
     };
     const localPaths: unknown[] = [];
     const remotePaths: unknown[] = [];
@@ -279,17 +329,17 @@ describe("extension workspace architecture", () => {
     broker.set(ownerFile, family);
     const registry = spyOn(AgentRegistry, "global").mockReturnValue({ list: () => [
       { id: "Main", sessionFile: childFile, session: {
+        instanceKey: `main:${crypto.randomUUID()}`,
         sessionManager: harness.ctx.sessionManager,
-        getToolByName: () => undefined,
+        settings: Settings.isolated(),
+        getToolByName: (name: string) => harness.getNativeTool(name),
         runToolRegistryMutation: async <T>(mutation: () => Promise<T>): Promise<T> => await mutation(),
         asyncJobManager: { getAllJobs: () => [{ id: "bg_1" }] },
       } },
       { id: "Scout" },
     ] } as never);
     try {
-      await harness.emit("session_start");
-      const state = [...family.members][0]!;
-      state.connectionError = undefined;
+      const state = await admitFixtureMember(harness, family);
       state.client = {
         isClosed: false,
         async execute(_name: string, _id: string, params: Record<string, unknown>) {
@@ -332,9 +382,9 @@ describe("extension workspace architecture", () => {
     const root = ownerFile.slice(0, -".jsonl".length);
     const childFile = `${root}/subagent/child.jsonl`;
     const family: Family = {
-      ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: "/remote/workspace",
-      connection: { target: "test@example.invalid", displayTarget: "test-remote", cwd: "/remote/workspace", workerPath: "/remote/worker.mjs" },
-      members: new Set(), closing: true,
+      ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: import.meta.dir,
+      connection: { target: "test@example.invalid", displayTarget: "test-remote", cwd: import.meta.dir, workerPath: "/remote/worker.mjs" },
+      members: new Set(), closing: false,
     };
     const localPaths: unknown[] = [];
     const harness = await extensionHarness(childFile, undefined, ["write"], async input => {
@@ -345,15 +395,14 @@ describe("extension workspace architecture", () => {
     broker.set(ownerFile, family);
     const registry = spyOn(AgentRegistry, "global").mockReturnValue({ list: () => [{
       id: "Main", sessionFile: childFile, session: {
+        instanceKey: `main:${crypto.randomUUID()}`,
         settings: Settings.isolated(), sessionManager: harness.ctx.sessionManager,
-        getToolByName: () => undefined,
+        getToolByName: (name: string) => harness.getNativeTool(name),
         runToolRegistryMutation: async <T>(mutation: () => Promise<T>): Promise<T> => await mutation(),
       },
     }] } as never);
     try {
-      await harness.emit("session_start");
-      const state = [...family.members][0]!;
-      state.connectionError = undefined;
+      const state = await admitFixtureMember(harness, family);
       state.client = { isClosed: false, async close() {}, execute() { throw new Error("Reply reached remote filesystem"); } } as unknown as Member["client"];
       await nestedDispatchScope.run({ assertCurrent() {} }, () => harness.executeTool("write", { path: "out://", content: "reply" }));
       expect(localPaths).toEqual(["out://"]);
@@ -367,7 +416,7 @@ describe("extension workspace architecture", () => {
     }
   });
 
-  test("revoked child artifact trees keep new descendants unavailable until shutdown", async () => {
+  test("revoked child artifact trees keep new descendants unavailable after shutdown", async () => {
     const ownerFile = `/tmp/remote-family-${crypto.randomUUID()}.jsonl`;
     const root = ownerFile.slice(0, -".jsonl".length);
     const childFile = `${root}/subagent/child.jsonl`;
@@ -468,8 +517,8 @@ describe("extension workspace architecture", () => {
       expect((await grandchild.status()).mode).toBe("unavailable");
       expect(child.selected).toBe(true);
     } finally {
-      // Remove only the seeded fake child; the real descendant shutdown removes
-      // the last live member and exercises production tombstone cleanup.
+      // Remove only the seeded fake child; the descendant shutdown removes the
+      // last live member, but must not erase its revoked lineage.
       family.members.delete(child);
       child.selected = false;
       child.family = undefined;
@@ -481,9 +530,14 @@ describe("extension workspace architecture", () => {
     const afterShutdown = await extensionHarness(grandchildFile);
     try {
       await afterShutdown.emit("session_start");
-      expect((await afterShutdown.status()).mode).toBe("local");
-      expect(await afterShutdown.emit("tool_call", { toolName: "task", input: { task: "local" } }))
-        .toBeUndefined();
+      expect(await afterShutdown.status()).toMatchObject({
+        mode: "unavailable", connectionError: expect.stringContaining("revoked"),
+      });
+      expect(await afterShutdown.emit("tool_call", { toolName: "task", input: { task: "continue" } }))
+        .toMatchObject({ block: true, reason: expect.stringContaining("cannot fall back locally") });
+      await expect(afterShutdown.executeTool("remote_exit", { force: true }))
+        .rejects.toThrow("Only the owning OMP session can disconnect");
+      expect((await afterShutdown.status()).mode).toBe("unavailable");
     } finally {
       await afterShutdown.emit("session_shutdown");
     }

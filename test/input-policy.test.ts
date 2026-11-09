@@ -1,7 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { generateFileMentionMessages } from "@oh-my-pi/pi-coding-agent/utils/file-mentions";
 import type { ExtensionAPI, ExtensionContext, InputEvent, InputEventResult } from "@oh-my-pi/pi-coding-agent";
 import { extractFileMentions } from "@oh-my-pi/pi-coding-agent/utils/file-mentions";
@@ -16,6 +16,9 @@ import { z } from "@oh-my-pi/omptype/zod";
 import { handleTodoAcp } from "@oh-my-pi/pi-coding-agent/slash-commands/helpers/todo";
 import { executeSearchRepos, resolveSearchRepoScope } from "@oh-my-pi/pi-coding-agent/tools/gh-search";
 import { github } from "@oh-my-pi/pi-coding-agent/utils/github";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { AgentSessionHandle } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
 
 type Family = Parameters<typeof closeRemoteFamily>[0];
 type Hook = (event: Record<string, unknown>, ctx: ExtensionContext) => unknown;
@@ -33,14 +36,25 @@ async function harness(selected: boolean, bareSlashCommands = false, cwd = "/loc
     members: new Set(), closing: true,
   };
   const families = (globalThis as unknown as Record<symbol, Map<string, Family>>)[Symbol.for("omp-ssh-remote/session-families")]!;
+  const manager = await SessionManager.open(sessionFile, dirname(sessionFile), undefined, { initialCwd: cwd, suppressBreadcrumb: true });
   const ctx = {
     cwd,
     agent: { kind: "main", id: "owner", name: "owner", depth: 0 },
-    sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "input-fixture", getBranch: () => [], getCwd: () => cwd },
+    sessionManager: manager,
     ui: { notify(message: string, level: string) { notifications.push({ message, level }); }, setStatus() {} },
   } as unknown as ExtensionContext;
+  const registry = AgentRegistry.global();
+  const session = {
+    instanceKey: `main:${crypto.randomUUID()}`, sessionManager: manager, settings,
+    getToolByName: () => undefined, getAdvisorStats: () => ({ configured: false, advisors: [] }),
+    async runToolRegistryMutation(mutate: () => Promise<void>) { await mutate(); },
+  } as unknown as AgentSessionHandle;
+  const ref = registry.register({
+    id: ctx.agent.id, displayName: ctx.agent.name, kind: ctx.agent.kind, session, sessionFile,
+  });
   await remoteRuntimeExtension({
     registerCommand() {}, registerTool() {},
+    appendEntry(customType: string, data?: unknown) { manager.appendCustomEntry(customType, data); },
     on(name: string, handler: Hook) { handlers.set(name, handler); },
     getActiveTools: () => [], getAllTools: () => [],
   } as unknown as ExtensionAPI);
@@ -75,7 +89,14 @@ async function harness(selected: boolean, bareSlashCommands = false, cwd = "/loc
       await tool.execute("advisor-direct-cursor-exec", { path: "README.md" });
       return executed;
     },
-    async close() { await handlers.get("session_shutdown")!({}, ctx); },
+    async close() {
+      try { await handlers.get("session_shutdown")!({}, ctx); }
+      finally {
+        registry.unregister(ref.id, ref);
+        await manager.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
   };
 }
 
@@ -338,7 +359,7 @@ describe("remote native input policy", () => {
     let phases: unknown[] = [];
     const runtime = {
       sessionManager: { getBranch: () => [], getCwd: () => cwd, appendCustomEntry() {} },
-      session: { getTodoPhases: () => phases, setTodoPhases(next: unknown[]) { phases = next; } },
+      session: { getTodoPhases: () => phases, commitTodoPhases(next: unknown[]) { phases = next; } },
       async output() {},
     };
     const run = (args: string) => handleTodoAcp(parseSlashCommand(`/todo ${args}`)!, runtime as never);

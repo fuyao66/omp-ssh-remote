@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { lookup, type AnySetting } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { resolveHostSessionRef } from "../src/omp/host-session.ts";
+import { resolveLocalHostSession } from "../src/omp/host-session.ts";
 import { parseConnectArgs } from "../src/connect-options.ts";
 import { bootstrapSmokeHost } from "./smoke-host.ts";
 
@@ -29,8 +29,8 @@ export default async function cppLspSmoke(pi: ExtensionAPI) {
   if (!args) throw new Error("REMOTE_CONNECT_ARGS must select an SSH alias with lsp.cpp:true");
   const commands = await bootstrapSmokeHost(pi);
   pi.registerCommand("remote-cpp-lsp-smoke", { description: "Native packaged clangd acceptance (scratch plus optional read-only project)", async handler(_, ctx) {
-    const session = resolveHostSessionRef(ctx.sessionManager.getSessionFile(), ctx)?.session;
-    assert(session, "Native session not registered");
+    const session = resolveLocalHostSession(ctx.sessionManager.getSessionFile(), ctx);
+    assert(session, "Native session must be registered on its home thread");
     const rows: { check: string; outcome: string; evidence: unknown }[] = [];
     const report = (check: string, evidence: unknown, outcome = "positive") => {
       rows.push({ check, outcome, evidence }); console.log("CPP_LSP_CHECK", JSON.stringify(rows.at(-1)));

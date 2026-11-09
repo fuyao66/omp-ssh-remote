@@ -1,5 +1,5 @@
 import type { RemoteRuntimeClient } from "../client.ts";
-import type { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import type { AsyncJobManagerApi } from "@oh-my-pi/pi-coding-agent/async";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 
 /** Reserve local ownership before sending any remote launch request. */
@@ -26,7 +26,7 @@ export async function startRemoteService(
   client: RemoteRuntimeClient,
   name: string,
   ownerId: string,
-  manager: AsyncJobManager,
+  manager: AsyncJobManagerApi,
   execute: (signal: AbortSignal) => Promise<AgentToolResult>,
   signal?: AbortSignal,
 ): Promise<AgentToolResult> {

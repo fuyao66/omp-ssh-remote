@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { currentThreadId } from "@oh-my-pi/pi-coding-agent/thread/identity";
 import { describe, expect, test } from "bun:test";
 import remoteRuntimeExtension, {
   remoteWrapperRenderer,
@@ -134,7 +135,11 @@ describe("OMP extension loading", () => {
       },
     };
     const sessionFile = `/tmp/approval-metadata-${crypto.randomUUID()}.jsonl`;
-    const sessionManager = { getSessionFile: () => sessionFile };
+    const sessionManager = {
+      getSessionFile: () => sessionFile,
+      getEntries: () => [],
+      getBranch: () => [],
+    };
     const registry = AgentRegistry.global();
     const ref = registry.register({
       id: `ApprovalMetadata-${crypto.randomUUID()}`,
@@ -142,6 +147,7 @@ describe("OMP extension loading", () => {
       kind: "main",
       sessionFile,
       session: {
+        instanceKey: `${currentThreadId()}:approval-metadata`,
         sessionManager,
         getToolByName: () => native,
         async runToolRegistryMutation(mutate: () => Promise<void>) { await mutate(); },

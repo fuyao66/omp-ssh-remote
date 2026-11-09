@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { resolveLocalHostSession } from "../src/omp/host-session.ts";
 // build-smoke.ts bundles registry: the compiled host does not expose that subpath.
 import { JobWidgets } from "@oh-my-pi/pi-coding-agent/job-widgets/registry";
 import { renderJobWidgetLines } from "@oh-my-pi/pi-tui/tools/job-widget";
@@ -13,10 +14,10 @@ export default async function captureSmoke(pi: ExtensionAPI) {
   if (!args) throw new Error("REMOTE_CONNECT_ARGS must specify a host and scratch cwd");
   const commands = await bootstrapSmokeHost(pi);
   pi.registerCommand("remote-capture-smoke", { description: "Check real SSH capture, widgets and automatic backgrounding", async handler(_, ctx) {
-    const session = AgentRegistry.global().list().find(ref => ref.sessionFile === ctx.sessionManager.getSessionFile())?.session;
-    assert(session, "Native session is required");
+    const session = resolveLocalHostSession(ctx.sessionManager.getSessionFile(), ctx);
+    assert(session, "Native session must be registered on its home thread");
     const manager = session.asyncJobManager;
-    assert(manager, "Native session job manager is required");
+    assert(manager instanceof AsyncJobManager, "Capture author injection requires the concrete native root job manager");
     // This command consumes its own results; it must never start a model turn.
     const originalBridge = session.clientBridge;
     session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });

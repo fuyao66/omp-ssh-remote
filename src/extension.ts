@@ -42,16 +42,17 @@ import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/ses
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { isLocalAgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
 import { sessionFileBelongsToRoot } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
-import { resolveHostSessionRef } from "./omp/host-session.ts";
+import { resolveHostSessionRef, resolveLocalHostSession } from "./omp/host-session.ts";
 import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { captureExecutionSettings, type RemoteExecutionSettings } from "./omp/execution-settings.ts";
 import { WORKSPACE_RULES, workspaceAnnouncement, type WorkspaceBindingNotice } from "./omp/workspace-context.ts";
 import { resolveRemoteResourceArgs } from "./resource-routing.ts";
 import { resolveEditMode } from "@oh-my-pi/pi-coding-agent/utils/edit-mode";
-import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
+import type { EditModeSetting } from "@oh-my-pi/pi-coding-agent/edit/settings";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
-import { getRemoteFamilyBroker, sessionFamilyRoot } from "./family-broker.ts";
+import { assertFamilyLeaseActive, getRemoteFamilyBroker, sessionFamilyRoot } from "./family-broker.ts";
 export { sessionBelongsToFamily } from "./family-broker.ts";
 import { assertNestedRemoteTool, isOutReplyWrite, nestedDispatchScope } from "./nested-dispatch.ts";
 import type { HostToolInvoker } from "./client.ts";
@@ -61,6 +62,8 @@ import type { ToolContextStore } from "@oh-my-pi/pi-coding-agent/tools/context";
 import { RemoteLspDiagnostics, mayMutateLsp, parseLspEvent, type LspDiagnostics } from "./omp/lsp-diagnostics.ts";
 import { remoteInputPolicy } from "./omp/input-policy.ts";
 import { REPO_SCOPE_QUALIFIER_PATTERN } from "@oh-my-pi/pi-coding-agent/tools/gh-search";
+import { getThreadFamilyBridge, isFamilyAuthorityThread, type ThreadFamilySource, type ThreadMemberIdentity } from "./thread-family.ts";
+import { inheritedRemoteIntent, persistRemoteIntent, REMOTE_INTENT_ENTRY } from "./remote-intent.ts";
 
 /**
  * Snapshot the execution-domain subset of the local session's settings.
@@ -280,23 +283,37 @@ type RemoteExtensionState = {
   selected: boolean;
   owner: boolean;
   family?: RemoteFamily;
+  threadAttachment?: { token: string; identity: ThreadMemberIdentity };
+  persistIntent?: (remote: boolean) => Promise<void>;
   connectionError?: string;
-  editMode?: EditMode;
+  editMode?: EditModeSetting;
   /** Active tool names of the local session; forwarded so the remote bash interceptor sees the real tool set. */
   activeToolNames: () => string[] | undefined;
 };
-type RemoteFamily = {
-  ownerSessionFile: string;
+type RemoteFamily = Omit<ThreadFamilySource, "members"> & {
   root: string;
-  localCwd: string;
-  remoteCwd: string;
-  connection: RemoteConnectOptions & { workerPath: string };
-  cacheAudit?: RemoteWorkerCacheAudit;
   members: Set<RemoteExtensionState>;
-  closing: boolean;
 };
 
 const remoteFamilyBroker = getRemoteFamilyBroker<RemoteFamily>();
+const threadFamilies = getThreadFamilyBridge();
+
+function familyMemberCount(family: RemoteFamily): number {
+  threadFamilies.reap();
+  return family.members.size + (family.threadMembers?.size ?? 0);
+}
+
+function assertStateFamily(state: RemoteExtensionState): void {
+  if (state.family) assertFamilyLeaseActive(state.family);
+  const identity = state.threadAttachment?.identity;
+  if (!identity) return;
+  const ref = resolveHostSessionRef(state.sessionFile, state.hostContext);
+  const file = ref?.session?.sessionManager.getSessionFile();
+  if (ref?.id !== identity.agentId || ref.generation !== identity.registryGeneration ||
+      ref.session?.instanceKey !== identity.instanceKey || !file || resolvePath(file) !== identity.sessionFile) {
+    throw new Error("Remote family member session was replaced or detached; local fallback is disabled");
+  }
+}
 
 const SESSION_SHUTDOWN_REMOTE_CLOSE_TIMEOUT_MS = 1_000;
 
@@ -335,10 +352,10 @@ function endConnectionTransaction(state: RemoteExtensionState, transaction: Conn
 }
 
 function hostSessionFor(state: RemoteExtensionState, ctx?: ExtensionContext) {
-  return resolveHostSessionRef(state.sessionFile, ctx ?? state.hostContext)?.session;
+  return resolveLocalHostSession(state.sessionFile, ctx ?? state.hostContext);
 }
 
-function effectiveHostEditMode(state: RemoteExtensionState, ctx?: ExtensionContext): EditMode {
+function effectiveHostEditMode(state: RemoteExtensionState, ctx?: ExtensionContext): EditModeSetting {
   const host = hostSessionFor(state, ctx);
   const settings = host?.settings ?? findScopedSettings();
   if (!settings) return state.editMode ?? "hashline";
@@ -676,6 +693,7 @@ async function executionTarget(
         : innerOwner ?? (pathShouldStayLocal(device as RemoteToolName, inner, effectiveHostEditMode(state, ctx)) ? "local" : "remote");
     }
   }
+  if (target === "remote" && state.family) assertStateFamily(state);
   if (target === "remote" && (name === "read" || name === "edit") &&
       state.editMode !== effectiveHostEditMode(state, ctx)) {
     throw new Error("The host edit mode changed after connection. Reconnect before reading or editing the remote workspace.");
@@ -700,6 +718,7 @@ function hostEvalInvoker(state: RemoteExtensionState, client: RemoteRuntimeClien
   return async (invocation, signal, onUpdate) => {
     const assertCurrent = () => {
       signal.throwIfAborted();
+      if (state.family) assertStateFamily(state);
       if (!owner || hostSessionFor(state, ctx) !== owner || ctx.sessionManager.getSessionFile() !== sessionFile ||
           state.client !== client || client.isClosed || state.binding !== binding || invocation.resourceBinding !== binding) {
         throw new Error("Remote Eval invocation belongs to a closed or changed workspace/session binding");
@@ -745,10 +764,12 @@ async function executeWithTarget(
       throw new Error(`OMP native fallback is unavailable for ${name}`);
     return ctx.invokeTool(params, { signal, onUpdate });
   }
+  if (state.family) assertStateFamily(state);
   const client = state.client;
   if (!client) throw new Error("Remote runtime is disconnected");
   const remoteParams = resolveRemoteResourceArgs(name, params, state.binding);
   const execute = async (steeringSignal?: AbortSignal) => {
+    if (state.family) assertStateFamily(state);
     const endMutation = mayMutateLsp(name, remoteParams) ? state.lspDiagnostics?.beginMutation() : undefined;
     try {
       return await client.execute(name, toolCallId, remoteParams, signal, onUpdate,
@@ -814,6 +835,7 @@ function remoteBashJobOptions(
     maxTimeout: captureLocalExecutionSettings()["tools.maxTimeout"] as number | undefined,
     onUpdate,
     execute: async (remoteParams, signal, onUpdate, onCapture, scope = "job") => {
+      assertStateFamily(state);
       if (state.client !== client || client.isClosed) {
         throw new Error(
           `Remote bash job lost its runtime (${remoteCwd}); the connection was closed`,
@@ -868,6 +890,8 @@ function registerWrapper(
     approvalCacheTargets: approval.approvalCacheTargets,
     formatApprovalDetails: approval.formatApprovalDetails,
     async execute(toolCallId, rawParams, signal, rawOnUpdate, ctx) {
+      if (name === "edit" && effectiveHostEditMode(state, ctx) === "none")
+        throw new Error("The edit tool is disabled by edit.mode=none");
       const nested = nestedDispatchScope.getStore();
       nested?.assertCurrent();
       if (nested) assertNestedRemoteTool(name, rawParams as Record<string, unknown>, state.binding, effectiveHostEditMode(state, ctx));
@@ -876,6 +900,7 @@ function registerWrapper(
       const binding = state.binding;
       const ensureCurrent = () => {
         nested?.assertCurrent();
+        if (target === "remote" && state.family) assertStateFamily(state);
         if (state.binding !== binding) throw new Error("Workspace binding changed during this call; execution was not retried in the new workspace. Recheck the current workspace before continuing.");
       };
       const target = await executionTarget(name, params, state, ctx, signal);
@@ -950,15 +975,15 @@ export async function captureOmpHandshake(pi: ExtensionAPI, state: RemoteExtensi
   const editMode = effectiveHostEditMode(state, ctx);
   const host = hostSessionFor(state, ctx);
   const metadata = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
-  const missing = REMOTE_TOOL_NAMES.filter((name) => !metadata.has(name));
-  // Only setting-gated tools absent from the actual registry need a fallback.
-  // Never substitute a default editor for the editor advertised by the host.
+  const missing = REMOTE_TOOL_NAMES.filter((name) => !metadata.has(name) || (name === "edit" && editMode === "none"));
+  // Setting-gated tools need stable handshake metadata, never execution exposure.
+  // A disabled edit uses native inert fallback metadata even during reconciliation.
   const fallback = missing.length ? await createNativeWorkerRuntime(ctx?.cwd ?? state.localCwd ?? process.cwd(), { editMode, settings: host ? captureExecutionSettings(host.settings) : captureLocalExecutionSettings() }) : undefined;
   try {
     const localTools = REMOTE_TOOL_NAMES.map((name) => {
       const live = host?.getToolByName(name);
       const info = metadata.get(name);
-      const native = info ? {
+      const native = name === "edit" && editMode === "none" ? fallback?.tools.edit : info ? {
         name, parameters: live?.parameters ?? info.parameters,
         customFormat: live?.customFormat, customWireName: live?.customWireName,
       } : fallback?.tools[name];
@@ -986,6 +1011,7 @@ async function registerActiveWrappers(
   }) : undefined;
   try {
     for (const name of REMOTE_TOOL_NAMES) {
+      if (name === "edit" && effectiveHostEditMode(state) === "none") continue;
       if (!active.has(name) || state.wrappedTools.has(name)) continue;
       const native = metadata.get(name);
       if (!native)
@@ -1030,7 +1056,14 @@ async function closeRemoteState(
   timeoutMs?: number,
 ): Promise<void> {
   const current = detachRemoteState(state, true);
-  if (current) await current.close(timeoutMs);
+  const attachment = state.threadAttachment;
+  state.threadAttachment = undefined;
+  const cleanup = await Promise.allSettled([
+    ...(attachment ? [threadFamilies.detach(attachment.token, attachment.identity)] : []),
+    ...(current ? [current.close(timeoutMs)] : []),
+  ]);
+  const failures = cleanup.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Remote member cleanup failed");
 }
 
 export async function closeRemoteFamily(
@@ -1038,11 +1071,12 @@ export async function closeRemoteFamily(
   timeoutMs?: number,
 ): Promise<void> {
   remoteFamilyBroker.revoke(family);
+  threadFamilies.reap();
   const clients = [...family.members]
     .map((member) => detachRemoteState(member, member.owner))
     .filter((client): client is RemoteRuntimeClient => client !== undefined);
   const settled = await Promise.allSettled(
-    clients.map((client) => client.close(timeoutMs)),
+    [...clients.map((client) => client.close(timeoutMs)), ...[...family.threadMembers ?? []].map(member => member.close())],
   );
   const failures = settled.filter(
     (result): result is PromiseRejectedResult => result.status === "rejected",
@@ -1167,6 +1201,7 @@ export type RemoteReconnectOutcome = {
 /** Revalidate a member transaction after an await: exit, shutdown and family revocation all cancel it. */
 function assertFamilyTransaction(state: RemoteExtensionState, family: RemoteFamily, transaction: ConnectionTransaction): void {
   assertConnectionTransaction(state, transaction);
+  assertStateFamily(state);
   if (family.closing || state.family !== family || !family.members.has(state)) {
     throw new Error("Remote session family was closed during connection");
   }
@@ -1192,7 +1227,7 @@ async function reconnectRemoteRuntime(
     throw new Error("No remote runtime is selected; use /remote-connect <target> [cwd]");
   }
   const family = state.family;
-  if (!family || family.closing) throw new Error("Remote runtime family state is missing");
+  if (!family || family.closing) throw new Error("Remote connection settings are unavailable. Explicitly exit remote mode, then connect again with a target.");
   options.signal?.throwIfAborted();
   const live = state.client !== undefined && !state.client.isClosed;
   if (live && !options.force) {
@@ -1210,6 +1245,8 @@ async function reconnectRemoteRuntime(
   let prepared: PreparedRemoteWorker | undefined;
   let opened: OpenedTransport | undefined;
   try {
+    await state.persistIntent?.(true);
+    assertFamilyTransaction(state, family, transaction);
     prepared = await prepareRemoteWorker({ ...family.connection, signal: transaction.signal, onProgress: (stage) => ctx?.ui?.setWorkingMessage(stage) });
     assertFamilyTransaction(state, family, transaction);
     const connection = { ...family.connection, cwd: family.remoteCwd, workerPath: prepared.workerPath,
@@ -1222,6 +1259,10 @@ async function reconnectRemoteRuntime(
     }
     await prepared.commitUsage();
     assertFamilyTransaction(state, family, transaction);
+    if (state.threadAttachment) {
+      await threadFamilies.commit(state.threadAttachment.token, family.generation!, state.threadAttachment.identity);
+      assertFamilyTransaction(state, family, transaction);
+    }
     if (state.owner) family.connection = connection;
     publishTransport(state, opened, remoteCwd);
     family.cacheAudit = prepared.cacheAudit;
@@ -1260,32 +1301,37 @@ async function attachFamilyMember(
   state: RemoteExtensionState,
   family: RemoteFamily,
   ctx?: ExtensionContext,
+  admission?: ConnectionTransaction,
 ): Promise<void> {
-  if (state.selected) return;
+  if (state.selected && state.family === family) return;
   state.selected = true;
   state.binding = crypto.randomUUID();
   state.owner = false;
   state.family = family;
   state.remoteCwd = family.remoteCwd;
   remoteFamilyBroker.attach(family, state);
-  if (family.closing) {
-    state.connectionError = "Remote runtime family was revoked; descendants cannot fall back locally";
-    return;
-  }
 
-  if (
-    !state.localCwd ||
-    resolvePath(state.localCwd) !== resolvePath(family.localCwd)
-  ) {
-    state.connectionError = `Remote subagent inheritance rejected: local cwd ${state.localCwd ?? "unknown"} differs from owner cwd ${family.localCwd}. Local isolated worktrees are not supported.`;
-    return;
-  }
-
-  const transaction = beginConnectionTransaction(state);
+  const transaction = admission ?? beginConnectionTransaction(state);
   let opened: OpenedTransport | undefined;
   try {
+    await state.persistIntent?.(true);
+    assertConnectionTransaction(state, transaction);
+    if (family.closing) {
+      state.connectionError = "Remote runtime family was revoked; descendants cannot fall back locally";
+      return;
+    }
+    assertStateFamily(state);
+    if (!state.localCwd || resolvePath(state.localCwd) !== resolvePath(family.localCwd)) {
+      state.connectionError = `Remote subagent inheritance rejected: local cwd ${state.localCwd ?? "unknown"} differs from owner cwd ${family.localCwd}. Local isolated worktrees are not supported.`;
+      return;
+    }
     opened = await openRemoteTransport(pi, family.connection, family.remoteCwd, state, ctx, transaction.signal);
     assertFamilyTransaction(state, family, transaction);
+    const attachment = state.threadAttachment;
+    if (attachment) {
+      await threadFamilies.commit(attachment.token, family.generation!, attachment.identity);
+      assertFamilyTransaction(state, family, transaction);
+    }
     publishTransport(state, opened, opened.ready.cwd ?? family.remoteCwd);
   } catch (error) {
     opened?.client.kill();
@@ -1295,6 +1341,48 @@ async function attachFamilyMember(
     throw error;
   } finally {
     endConnectionTransaction(state, transaction);
+  }
+}
+
+async function attachThreadFamily(pi: ExtensionAPI, state: RemoteExtensionState, ctx: ExtensionContext, transaction: ConnectionTransaction): Promise<boolean> {
+  state.selected = true;
+  state.connectionError = "Remote family ownership has not been admitted; local fallback is disabled";
+  const ref = resolveHostSessionRef(state.sessionFile, state.hostContext);
+  const session = hostSessionFor(state, ctx);
+  if (!ref || !session || !state.sessionFile) throw new Error(state.connectionError);
+  const identity: ThreadMemberIdentity = {
+    agentId: ref.id, registryGeneration: ref.generation, instanceKey: session.instanceKey, sessionFile: state.sessionFile,
+  };
+  try {
+    const decision = await threadFamilies.reserve(identity, async () => {
+      const client = detachRemoteState(state, false);
+      if (client) await client.close(SESSION_SHUTDOWN_REMOTE_CLOSE_TIMEOUT_MS);
+    });
+    if (decision.kind === "active") state.threadAttachment = { token: decision.token, identity };
+    assertConnectionTransaction(state, transaction);
+    if (decision.kind === "unavailable") {
+      await state.persistIntent?.(true);
+      assertConnectionTransaction(state, transaction);
+      state.connectionError = decision.reason;
+      return true;
+    }
+    if (decision.kind === "local") return false;
+    const family: RemoteFamily = {
+      ...decision.family, root: sessionFamilyRoot(decision.family.ownerSessionFile), members: new Set(), closing: false,
+    };
+    assertFamilyLeaseActive(family);
+    state.connectionError = undefined;
+    await attachFamilyMember(pi, state, family, ctx, transaction);
+    return true;
+  } catch (error) {
+    const attachment = state.threadAttachment;
+    let recoverable = state.selected && state.family !== undefined && state.sessionFile === identity.sessionFile;
+    if (recoverable) { try { assertStateFamily(state); } catch { recoverable = false; } }
+    if (attachment && !recoverable) {
+      state.threadAttachment = undefined;
+      await threadFamilies.detach(attachment.token, identity).catch(() => {});
+    }
+    throw error;
   }
 }
 
@@ -1316,6 +1404,7 @@ async function connectOwner(
   ctx: ExtensionContext | undefined,
   input: OwnerConnectInput,
 ): Promise<{ request: RemoteConnectRequest; ready: ReadyMessage; remoteCwd: string; cacheAudit: RemoteWorkerCacheAudit }> {
+  if (!isFamilyAuthorityThread) throw new Error("A native worker-thread session cannot create a remote family. Connect from the main session before spawning remote tasks.");
   if (state.transaction) throw new Error(`Remote connection is already in progress${input.inProgressHint}`);
   if (state.selected) throw new Error(`A remote runtime is already selected; ${input.alreadySelectedHint}`);
   if (!input.sessionFile) {
@@ -1328,6 +1417,9 @@ async function connectOwner(
   const assertAdmission = () => {
     const cursorReason = cursorBlockReason(state, ctx);
     if (cursorReason) throw new Error(cursorReason);
+    const workerDescendants = liveDescendants(state, normalizedSessionFile, ctx)
+      .filter(ref => ref.session && !isLocalAgentSession(ref.session));
+    if (workerDescendants.length) throw descendantAdmissionError(workerDescendants, "live worker-thread descendants; stop them before connecting");
     const running = liveDescendants(state, normalizedSessionFile, ctx)
       .filter(ref => ref.status !== "idle" || !ref.sessionFile || ref.session?.ircWakesPending);
     if (running.length) throw descendantAdmissionError(running);
@@ -1383,6 +1475,12 @@ async function connectOwner(
       members: new Set([state]),
       closing: false,
     };
+    await state.persistIntent?.(true);
+    assertConnectionTransaction(state, transaction);
+    assertAdmission();
+    const afterPersistence = liveDescendants(state, normalizedSessionFile, ctx);
+    if (afterPersistence.length) throw descendantAdmissionError(afterPersistence);
+    if (remoteFamilyBroker.hasOwner(normalizedSessionFile)) throw new Error("This session already owns a remote runtime family");
     publishTransport(state, opened, resolvedRemoteCwd);
     state.localCwd = input.localCwd;
     state.sessionFile = normalizedSessionFile;
@@ -1423,6 +1521,12 @@ export default async function remoteRuntimeExtension(
       }
     },
   };
+  state.persistIntent = async remote => {
+    if (!pi.appendEntry) throw new Error("OMP native session extension persistence is unavailable; remote execution is disabled");
+    const session = hostSessionFor(state);
+    if (!session) throw new Error("Remote intent cannot be persisted without the current home-thread session");
+    await persistRemoteIntent(() => pi.appendEntry(REMOTE_INTENT_ENTRY, { version: 1, remote }), session.sessionManager);
+  };
   // Compare the running host against the version this bundle (and its
   // companion workers) were compiled for. A mismatch is the usual root cause of
   // "schema is incompatible" handshake rejections after `omp update`.
@@ -1438,6 +1542,11 @@ export default async function remoteRuntimeExtension(
     loadMode: "essential",
     approval: "read",
     async execute() {
+      threadFamilies.reap();
+      if (state.family) {
+        try { assertStateFamily(state); }
+        catch (error) { state.connectionError = error instanceof Error ? error.message : "Remote runtime family was revoked"; }
+      }
       const snapshot = workspaceStatus({
         selected: state.selected,
         clientPresent: state.client !== undefined,
@@ -1528,6 +1637,7 @@ export default async function remoteRuntimeExtension(
       const force = p.force === true;
       if (!state.selected) {
         const cancelled = cancelConnectionTransaction(state, "Remote connection cancelled by remote_exit");
+        await state.persistIntent?.(false);
         return {
           content: [
             {
@@ -1546,7 +1656,11 @@ export default async function remoteRuntimeExtension(
         );
       }
       const family = state.family;
-      if (!family) throw new Error("Remote runtime family state is missing");
+      if (!family) {
+        detachRemoteState(state, true);
+        await state.persistIntent?.(false);
+        return { content: [{ type: "text", text: "Remote intent cleared; workspace tools are local." }], details: { success: true, mode: "local" } };
+      }
       if (!force) {
         const remoteProposalCount = [...family.members].reduce(
           (count, member) =>
@@ -1560,13 +1674,14 @@ export default async function remoteRuntimeExtension(
             "Remote staged proposals are pending; resolve/reject them first, or pass force: true",
           );
         }
-        if (family.members.size > 1) {
+        if (familyMemberCount(family) > 1) {
           throw new Error(
             "Remote subagent sessions are still active; wait for them or pass force: true",
           );
         }
       }
       await closeRemoteFamily(family);
+      await state.persistIntent?.(false);
       ctx?.ui?.setStatus?.("remote-runtime", undefined);
       ctx?.ui?.notify?.(
         "Disconnected from remote runtime; workspace tools restored to local",
@@ -1669,6 +1784,7 @@ export default async function remoteRuntimeExtension(
       const force = args.trim() === "--force";
       if (!state.selected) {
         const cancelled = cancelConnectionTransaction(state, "Remote connection cancelled by /remote-exit");
+        await state.persistIntent?.(false);
         ctx.ui.notify(
           cancelled
             ? "Cancelled the pending remote connection; workspace tools are local"
@@ -1682,7 +1798,12 @@ export default async function remoteRuntimeExtension(
           "Only the owning OMP session can disconnect the remote runtime family",
         );
       const family = state.family;
-      if (!family) throw new Error("Remote runtime family state is missing");
+      if (!family) {
+        detachRemoteState(state, true);
+        await state.persistIntent?.(false);
+        ctx.ui.notify("Remote intent cleared; workspace tools are local.", "info");
+        return;
+      }
       if (!force) {
         const remoteProposalCount = [...family.members].reduce(
           (count, member) =>
@@ -1696,13 +1817,14 @@ export default async function remoteRuntimeExtension(
             "Remote staged proposals are pending; resolve/reject them first, or run /remote-exit --force",
           );
         }
-        if (family.members.size > 1) {
+        if (familyMemberCount(family) > 1) {
           throw new Error(
             "Remote subagent sessions are still active; wait for them or run /remote-exit --force",
           );
         }
       }
       await closeRemoteFamily(family);
+      await state.persistIntent?.(false);
       ctx.ui.setStatus("remote-runtime", undefined);
       ctx.ui.notify(
         "Remote runtime disconnected; workspace tools are local",
@@ -1723,10 +1845,36 @@ export default async function remoteRuntimeExtension(
     const normalized = resolvePath(sessionFile);
     state.sessionFile = normalized;
     state.editMode = effectiveHostEditMode(state, ctx);
-    await registerActiveWrappers(pi, state);
-    const family = remoteFamilyBroker.find(normalized);
-    if (!family) return;
-    await attachFamilyMember(pi, state, family, ctx);
+    state.selected = true;
+    state.connectionError = "Workspace ownership is being restored; local fallback is disabled";
+    const transaction = beginConnectionTransaction(state);
+    try {
+      await registerActiveWrappers(pi, state);
+      assertConnectionTransaction(state, transaction);
+      if (!isFamilyAuthorityThread) {
+        if (await attachThreadFamily(pi, state, ctx, transaction)) return;
+        assertConnectionTransaction(state, transaction);
+      } else {
+        const family = remoteFamilyBroker.find(normalized);
+        if (family) { await attachFamilyMember(pi, state, family, ctx, transaction); return; }
+      }
+      const remoteIntent = await inheritedRemoteIntent(normalized, ctx.sessionManager.getEntries?.() ?? ctx.sessionManager.getBranch());
+      assertConnectionTransaction(state, transaction);
+      state.selected = remoteIntent === true;
+      state.owner = remoteIntent === true && ctx.agent?.kind !== "sub";
+      state.connectionError = remoteIntent
+        ? "This session previously selected a remote workspace. Connection settings were not persisted. Explicitly exit remote mode, then connect again; local fallback is disabled."
+        : undefined;
+    } catch (error) {
+      if (state.transaction === transaction) {
+        state.selected = true;
+        state.owner = ctx.agent?.kind !== "sub";
+        state.connectionError = error instanceof Error ? error.message : "Remote workspace ownership could not be restored; local fallback is disabled";
+      }
+      throw error;
+    } finally {
+      endConnectionTransaction(state, transaction);
+    }
   });
 
   const closeBeforeSessionNavigation = async (
@@ -1740,7 +1888,7 @@ export default async function remoteRuntimeExtension(
     const blockReason = remoteSessionNavigationBlockReason({
       selected: state.selected,
       owner: state.owner,
-      familyMemberCount: family?.members.size ?? 0,
+      familyMemberCount: family ? familyMemberCount(family) : 0,
       remoteProposalCount:
         family && state.owner
           ? [...family.members].reduce(
@@ -1782,6 +1930,9 @@ export default async function remoteRuntimeExtension(
   pi.on("session_before_branch", async (_event, ctx) => {
     return closeBeforeSessionNavigation(ctx);
   });
+  pi.on("session_before_tree", async (_event, ctx) => {
+    return closeBeforeSessionNavigation(ctx);
+  });
   // Returning an explicit result is required: OMP may swallow hook exceptions
   // and otherwise continue with its local shell/Python runner.
   const blockedUserExecution = () => {
@@ -1820,6 +1971,10 @@ export default async function remoteRuntimeExtension(
     if (ctx.agent?.kind === "sub" && ctx.agent.id === "advisor" && ctx.agent.depth === 0 &&
         ownerId !== undefined && ctx.agent.parentId === ownerId && REMOTE_TOOL_SET.has(event.toolName)) {
       return { block: true, reason: "Advisor tools run locally and are not routed to the remote workspace. Use the session's remote workspace tools instead." };
+    }
+    if (event.toolName === "task" && state.family) {
+      try { assertStateFamily(state); }
+      catch { return { block: true, reason: "Remote runtime family was revoked; spawning a task cannot fall back locally." }; }
     }
     if (event.toolName === "task" && (!state.client || state.client.isClosed || state.connectionError)) {
       return { block: true, reason: "Remote runtime is unavailable; spawning a new task cannot fall back locally. Reconnect first." };

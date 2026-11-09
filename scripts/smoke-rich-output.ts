@@ -1,7 +1,7 @@
 // Native-local versus SSH output comparison, without model calls or extra packages.
 import assert from "node:assert/strict";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { resolveLocalHostSession } from "../src/omp/host-session.ts";
 import { bootstrapSmokeHost } from "./smoke-host.ts";
 
 export default async function(pi: ExtensionAPI) {
@@ -9,8 +9,8 @@ export default async function(pi: ExtensionAPI) {
   pi.registerCommand("remote-rich-output-smoke", { description: "Compare native print views and literal data across SSH", async handler(_, ctx) {
     const connectArgs = Bun.env.REMOTE_CONNECT_ARGS;
     assert(typeof connectArgs === "string" && connectArgs.trim().length > 0, "Set REMOTE_CONNECT_ARGS to an SSH target and remote scratch directory");
-    const session = AgentRegistry.global().list().find(ref => ref.sessionFile === ctx.sessionManager.getSessionFile())?.session;
-    assert(session, "Native session missing");
+    const session = resolveLocalHostSession(ctx.sessionManager.getSessionFile(), ctx);
+    assert(session, "Native session must be registered on its home thread");
     session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
     const invoke = async (name: string, args: object): Promise<any> => {
       const tool = session.getToolByName(name); assert(tool, `Missing ${name}`);

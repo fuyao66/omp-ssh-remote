@@ -32,7 +32,7 @@ export const REMOTE_TOOL_NAMES = [
 ] as const;
 export type RemoteToolName = (typeof REMOTE_TOOL_NAMES)[number];
 
-export const OMP_EDIT_MODES = ["replace", "patch", "apply_patch", "hashline", "sloppy"] as const;
+export const OMP_EDIT_MODES = ["replace", "patch", "apply_patch", "hashline", "sloppy", "none"] as const;
 export type OmpEditMode = (typeof OMP_EDIT_MODES)[number];
 
 export function parseOmpEditMode(value: unknown): OmpEditMode {

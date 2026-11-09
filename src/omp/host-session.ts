@@ -1,12 +1,13 @@
 import { resolve } from "node:path";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, type AgentRegistryApi } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { isLocalAgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
 
 /** Resolve live ownership, not AgentRef.sessionFile's registration-time snapshot. */
 export function resolveHostSessionRef(
   sessionFile: string | undefined,
   ctx?: Pick<ExtensionContext, "agent" | "sessionManager">,
-  registry: AgentRegistry = AgentRegistry.global(),
+  registry: AgentRegistryApi = AgentRegistry.global(),
 ) {
   const refs = registry.list();
   if (ctx) {
@@ -21,4 +22,14 @@ export function resolveHostSessionRef(
     const liveFile = ref.session?.sessionManager?.getSessionFile();
     return liveFile !== undefined && resolve(liveFile) === file;
   });
+}
+
+/** Full tool/session APIs are available only on the session's actual home thread. */
+export function resolveLocalHostSession(
+  sessionFile: string | undefined,
+  ctx?: Pick<ExtensionContext, "agent" | "sessionManager">,
+  registry: AgentRegistryApi = AgentRegistry.global(),
+) {
+  const session = resolveHostSessionRef(sessionFile, ctx, registry)?.session;
+  return session && isLocalAgentSession(session) ? session : undefined;
 }

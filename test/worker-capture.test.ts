@@ -12,9 +12,11 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import type { JobWidgetView } from "@oh-my-pi/pi-tui/tools/job-widget";
+import type { BashToolDetails } from "@oh-my-pi/pi-tui/tools/bash";
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
 import { startRemoteAsyncBashJob } from "../src/omp/async-bash.ts";
+import { RemoteJobCapture } from "../src/omp/remote-capture.ts";
 
 let cwd: string;
 let client: RemoteRuntimeClient;
@@ -143,4 +145,64 @@ describe("real worker capture through native local consumers", () => {
       expect(out.text).not.toContain("NEVER_REACH");
     } finally { await manager.dispose({ timeoutMs: 2000 }); }
   }, 12_000);
+});
+
+describe("forwarded native shell visualization", () => {
+  for (const enabled of [true, false]) {
+    test(`visualization=${enabled} retains native traces independently of output and pipe capture`, async () => {
+      const scratch = await mkdtemp(join(tmpdir(), "omp-worker-trace-"));
+      const worker = new RemoteRuntimeClient({ command: [process.execPath, join(import.meta.dir, "../src/worker.ts")] });
+      try {
+        await worker.initialize(scratch, OMP_RUNTIME_HANDSHAKE, undefined, {
+          settings: { "display.shellVisualization": enabled },
+        });
+        // Foreground-backed and immediately backgrounded shells share the capture
+        // transport, but use distinct native execution paths and shell ownership.
+        for (const scope of ["session", "job"] as const) {
+          const fifo = join(scratch, `${scope}.fifo`);
+          expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+          const gate = await open(fifo, constants.O_RDWR | constants.O_NONBLOCK);
+          const capture = new RemoteJobCapture();
+          const pipeReady = Promise.withResolvers<void>();
+          const traceReady = Promise.withResolvers<void>();
+          const updates: AgentToolResult<Pick<BashToolDetails, "trace">>[] = [];
+          let released = false;
+          const release = async () => {
+            if (!released) { released = true; await gate.write("release\n"); }
+          };
+          try {
+            const command = `{ printf 'step=1\\nstep=2\\nstep=3\\n'; read -r _ < ${scope}.fifo; } | tail -1`;
+            const running = worker.execute("bash", `trace-${scope}`, { command, timeout: 10 }, undefined, value => {
+              const update = value as AgentToolResult<Pick<BashToolDetails, "trace">>;
+              updates.push(update);
+              if (update.details?.trace) traceReady.resolve();
+            }, {
+              bashScope: scope,
+              onCapture: payload => {
+                capture.apply(payload);
+                if (payload.kind === "pipe" && Buffer.from(payload.dataBase64, "base64").includes(Buffer.from("step=1"))) pipeReady.resolve();
+              },
+            }) as Promise<AgentToolResult<Pick<BashToolDetails, "trace">>>;
+            const ready = enabled ? Promise.all([pipeReady.promise, traceReady.promise]) : pipeReady.promise;
+            await Promise.race([ready, running.then(() => { throw new Error("Shell completed before live capture/trace was observed"); })]);
+            if (enabled) expect(updates.some(update => update.details?.trace !== undefined)).toBe(true);
+            await release();
+            const result = await running;
+            expect(result.isError).not.toBe(true);
+            expect(result.details?.trace !== undefined).toBe(enabled);
+            if (!enabled) expect(updates.every(update => update.details?.trace === undefined)).toBe(true);
+            expect(text(result).trim()).toBe("step=3");
+            expect(capture.sources().find(source => source.id === "out")!.read(0)).toMatchObject({ text: "step=3\n", open: false });
+            const pipes = capture.streams.list();
+            expect(pipes).toHaveLength(1);
+            expect(capture.streams.read(pipes[0]!.id)).toMatchObject({ data: Buffer.from("step=1\nstep=2\nstep=3\n"), open: false });
+          } finally {
+            try { await release(); } finally { capture.close(); await gate.close(); }
+          }
+        }
+      } finally {
+        try { await worker.close(); } finally { await rm(scratch, { recursive: true, force: true }); }
+      }
+    }, 30_000);
+  }
 });
