@@ -7,6 +7,15 @@ import { basename, join, resolve } from "node:path";
 import { formatTitleUserMessage } from "@oh-my-pi/pi-coding-agent/tiny/message-preproc";
 
 type Proc = { pid: number; ppid: number; start: string; state: string; stdinOpen: boolean; marker: boolean; crash: boolean; ssh: boolean; runtime: boolean; runtimeMode: "companion" | "daemon-broker" | "js-eval" | "unknown" | "none"; threads: number };
+type CleanupEvidence = {
+  remoteCleanup: boolean;
+  sshExitObserved: boolean;
+  sshStdinClosed: boolean;
+  localReaped: boolean;
+  parentAlive: boolean;
+  sshIdentities: string[];
+  remainingSsh: Proc[];
+};
 const bundle = resolve(import.meta.dir, "../.cache/smoke/task-smoke.js");
 assert(await Bun.file(bundle).exists(), "Build helper first: bun scripts/build-smoke.ts task");
 assert(Bun.env.REMOTE_CONNECT_ARGS, "REMOTE_CONNECT_ARGS is required");
@@ -70,7 +79,7 @@ async function remoteProcesses(marker: string): Promise<Proc[]> {
     return JSON.parse(out);
   } finally { clearTimeout(timer); }
 }
-let completed = false, limitedRounds = 0;
+let completed = false;
 try {
   for (let round = 0; round < rounds; round++) {
     const run = crypto.randomUUID().replaceAll("-", ""), roundDir = join(directory, String(round));
@@ -102,13 +111,18 @@ try {
     let crashedRemote = new Set<string>(), crashSsh = new Set<string>();
     let crashCompanion: string | undefined;
     let requests = 0, labelRequests = 0, admitted = false, passed = false, revokedToolDenied = false;
-    let roundLimited = false;
-    let cleanupEvidence: { remoteCleanup: boolean; sshStdinClosed: boolean; localReaped: boolean; unreapedSsh: Proc[] } | undefined;
+    let cleanupEvidence: CleanupEvidence | undefined;
+    let revivalSshBaseline: Set<string> | undefined;
+    let revivedOwner: { id: string; instanceKey: string; companion: string } | undefined;
+    let reconnectVerified = false, nestedEvalVerified = false, parentConnectionUsable = false;
+    let reconnectDetails: any, reconnectCompanion: any, captureEvidence: any, normalTransportEvidence: any;
+    let normalSshBaseline: Set<string> | undefined;
+    let normalOldCompanion: string | undefined;
     let exitedRemote = new Set<string>();
     const localMarker = join(roundDir, `revoked_${run}`);
     const initial = new Set<string>();
     const fixtureIds = Array.from({ length: 9 }, (_, index) => `accept_${run}_${index}`);
-    const fixturePhases = ["initial", "revived", "interrupt", "after-interrupt", "crash-service", "revoked"];
+    const fixturePhases = ["initial", "reconnect", "revived", "interrupt", "after-interrupt", "crash-service", "revoked"];
     const allowedLabels = new Set(fixtureIds.map(id => formatTitleUserMessage(`ACCEPTANCE_TURN=${id}:initial`)));
     const workerStops = new Map<string, { id: string; threadId: number; release: (value: { stop: boolean }) => void }>();
     const server = Bun.serve({ hostname: "127.0.0.1", port: 0, idleTimeout: 180, async fetch(request) {
@@ -148,31 +162,78 @@ try {
         }
         if (route === "/checkpoint") {
           const accounting = await snapshot(body.phase);
+          if (body.phase === "before-normal-worker-reconnect") {
+            const observer = observations.slice().reverse().find(row => row.round === round && row.id === body.id);
+            assert(observer && !observer.isMainThread);
+            normalSshBaseline = new Set(accounting.local.filter(row => row.ssh).map(key));
+            normalOldCompanion = `${observer.companion.pid}:${observer.companion.start}`;
+          }
+          if (body.phase === "normal-worker-reconnect") {
+            assert(reconnectVerified && nestedEvalVerified && captureEvidence?.sentinelRetained,
+              "Normal native-worker reconnect, nested Eval callback and measured capture windows must all complete");
+            const baselineSsh = normalSshBaseline;
+            assert(baselineSsh && normalOldCompanion && reconnectCompanion);
+            // A zombie has no readable exe symlink and no longer classifies as
+            // `ssh`; identity absence must therefore use every procfs row.
+            const currentIdentities = new Set(accounting.local.map(key));
+            const added = accounting.local.filter(row => row.ssh && !baselineSsh.has(key(row)));
+            const removed = [...baselineSsh].filter(identity => !currentIdentities.has(identity));
+            assert.equal(added.length, 1, "Normal child reconnect must create exactly one identifiable SSH transport");
+            assert.equal(removed.length, 1, "The replaced child SSH PID/start must be absent, not a zombie");
+            assert(!accounting.remote.some(row => key(row) === normalOldCompanion), "Replaced child companion survived normal reconnect");
+            assert(accounting.remote.some(row => key(row) === `${reconnectCompanion.pid}:${reconnectCompanion.start}` && row.runtimeMode === "companion"),
+              "The reconnected child's fresh ReadTool identity must name a live companion");
+            assert(omp!.exitCode === null && added[0].ppid === omp!.pid && added[0].state !== "Z");
+            normalTransportEvidence = { replacedSsh: removed[0], replacementSsh: key(added[0]),
+              replacedCompanion: normalOldCompanion, replacementCompanion: `${reconnectCompanion.pid}:${reconnectCompanion.start}`, parentAlive: true };
+            await writeFile(join(roundDir, "normal-worker-reconnect.json"),
+              JSON.stringify({ reconnectDetails, normalTransportEvidence, nestedEvalVerified, captureEvidence }, null, 2));
+          }
+          if (body.phase === "parked") revivalSshBaseline = new Set(accounting.local.filter(row => row.ssh).map(key));
+          if (body.phase === "revived") {
+            const baselineSsh = revivalSshBaseline;
+            assert(baselineSsh, "Missing isolated pre-revival transport snapshot");
+            // All siblings are idle and the audit SSH has exited. This boundary
+            // performs exactly one connection-creating operation: native revive.
+            const added = accounting.local.filter(row => row.ssh && !baselineSsh.has(key(row)));
+            assert.equal(added.length, 1, `Cannot attribute the revived worker's SSH transport uniquely: ${JSON.stringify(added)}`);
+            assert(added[0].ppid === omp!.pid && added[0].state !== "Z" && added[0].stdinOpen,
+              "The uniquely created SSH transport must be live and owned by the OMP parent");
+            const observer = observations.slice().reverse().find(row => row.round === round && row.id === body.id);
+            assert(observer && !observer.isMainThread, "Revival must retain actual native-worker execution");
+            crashSsh = new Set([key(added[0])]);
+            revivedOwner = { id: body.id, instanceKey: observer.instanceKey, companion: `${observer.companion.pid}:${observer.companion.start}` };
+            checkpoints.push({ round, phase: "revived-worker-transport-correlation", ...revivedOwner,
+              localSsh: added[0], preRevivalSsh: [...baselineSsh] });
+            await writeFile(join(directory, "process-accounting.json"), JSON.stringify(checkpoints, null, 2));
+          }
+          if (body.phase === "parent-connection-usable") {
+            assert(cleanupEvidence?.parentAlive && cleanupEvidence.localReaped && omp!.exitCode === null);
+            parentConnectionUsable = true;
+          }
           let forceWorkerCleanup = false;
           if (body.phase === "worker-terminated") {
+            assert.equal(crashSsh.size, 1, "Strict cleanup requires one attributed SSH PID/start, not any disappearing transport");
             const deadline = Date.now() + 5000;
             let current = accounting;
             while (true) {
-              const goneSsh = [...crashSsh].filter(identity => !current.local.some(row => key(row) === identity));
-              const closedSsh = [...crashSsh].filter(identity => {
-                const row = current.local.find(candidate => key(candidate) === identity);
-                return !row || (row.state === "Z" && !row.stdinOpen);
-              });
+              const remainingSsh = current.local.filter(row => crashSsh.has(key(row)));
+              const parentAlive = omp!.exitCode === null && current.local.some(row => row.pid === omp!.pid && row.state !== "Z");
               const companionGone = !!crashCompanion && !current.remote.some(row => key(row) === crashCompanion);
               const remoteCleanup = companionGone && crashedRemote.size > 0 && !current.remote.some(row => crashedRemote.has(key(row)));
-              const sshStdinClosed = closedSsh.length === 1, localReaped = goneSsh.length === 1;
-              const unreapedSsh = current.local.filter(row => crashSsh.has(key(row)) && row.state === "Z" && !row.stdinOpen);
-              cleanupEvidence = { remoteCleanup, sshStdinClosed, localReaped, unreapedSsh };
+              const sshExitObserved = remainingSsh.every(row => row.state === "Z");
+              const sshStdinClosed = remainingSsh.every(row => !row.stdinOpen);
+              const localReaped = remainingSsh.length === 0;
+              cleanupEvidence = { remoteCleanup, sshExitObserved, sshStdinClosed, localReaped, parentAlive,
+                sshIdentities: [...crashSsh], remainingSsh };
+              // Retain the pre-parent-exit observation even if the strict gate
+              // fails and later CLI teardown finally reaps a zombie.
+              await writeFile(join(roundDir, "worker-cleanup.json"), JSON.stringify(cleanupEvidence, null, 2));
+              assert(parentAlive, "The OMP parent exited before worker-owned SSH cleanup was observed");
               forceWorkerCleanup = remoteCleanup && localReaped;
-              if (remoteCleanup && sshStdinClosed) {
-                if (!localReaped) {
-                  assert.equal(unreapedSsh.length, 1, "Only a measured closed-fd SSH zombie permits limited continuation");
-                  roundLimited = true;
-                  console.log("TASK_NATIVE_REAPING_LIMITATION", JSON.stringify(cleanupEvidence));
-                }
-                break;
-              }
-              assert(Date.now() < deadline, "Abrupt worker exit left an open SSH transport or live companion/nonpersistent service");
+              if (forceWorkerCleanup) break;
+              assert(Date.now() < deadline,
+                `Abrupt worker cleanup failed while the OMP parent stayed alive: ${JSON.stringify(cleanupEvidence)}; closed stdin or zombie exit is not reaping`);
               const retry = Promise.withResolvers<void>(); setTimeout(retry.resolve, 100); await retry.promise;
               current = await snapshot("worker-termination-drain");
             }
@@ -182,7 +243,8 @@ try {
           const noNewRemoteWorkers = accounting.remote.every(row => exitedRemote.has(key(row)));
           const localMarkerAbsent = !await Bun.file(localMarker).exists();
           if (body.phase === "revoked-turn") assert(revokedToolDenied && localMarkerAbsent && noNewRemoteWorkers, "Revoked child wrote locally or spawned a new remote worker");
-          return Response.json({ observations: observations.filter(row => row.round === round), requests, revokedToolDenied, localMarkerAbsent, noNewRemoteWorkers, forceWorkerCleanup, ...cleanupEvidence });
+          return Response.json({ observations: observations.filter(row => row.round === round), requests, revokedToolDenied, localMarkerAbsent,
+            noNewRemoteWorkers, forceWorkerCleanup, reconnectVerified, nestedEvalVerified, captureEvidence, parentConnectionUsable, ...cleanupEvidence });
         }
         if (route === "/await-interrupt") { await interruptEntered.promise; return Response.json({ ok: true }); }
         if (route === "/release-interrupt") { interruptRelease.resolve(); return Response.json({ ok: true }); }
@@ -194,6 +256,8 @@ try {
           assert(observer && !observer.isMainThread, "Crash service has no actual worker-thread observer");
           const companion = before.remote.find(row => key(row) === `${observer.companion.pid}:${observer.companion.start}`);
           assert(companion?.runtimeMode === "companion", "ReadTool's exact remote PID/start-time is not a live companion-mode process");
+          assert(revivedOwner && revivedOwner.id === body.id && revivedOwner.instanceKey === observer.instanceKey &&
+            revivedOwner.companion === key(companion), "Crash owner changed after the isolated SSH attribution boundary");
           crashCompanion = key(companion);
           const roots = new Set<number>([companion.pid]);
           const ancestry: string[][] = [];
@@ -216,12 +280,14 @@ try {
             assert(chain.some(identity => before.remote.some(candidate => key(candidate) === identity && ["daemon-broker", "companion"].includes(candidate.runtimeMode))), "Marked service has no separately identified native launcher/companion");
             ancestry.push(chain); roots.add(row.pid);
           }
-          checkpoints.push({ round, phase: "crash-owner-correlation", companion: key(companion), ancestry });
+          checkpoints.push({ round, phase: "crash-owner-correlation", companion: key(companion), localSsh: [...crashSsh], ancestry });
           let changed = true;
           while (changed) { changed = false; for (const row of before.remote) if (roots.has(row.ppid) && !roots.has(row.pid)) { roots.add(row.pid); changed = true; } }
           crashedRemote = new Set(before.remote.filter(row => roots.has(row.pid)).map(key));
           assert(crashedRemote.has(crashCompanion), "Companion identity was omitted from the forced-death accounting set");
-          crashSsh = new Set(before.local.filter(row => row.ssh).map(key)); assert(crashSsh.size > 0, "No local test-owned SSH transport observed");
+          assert.equal(crashSsh.size, 1, "Missing exact revived SSH transport identity");
+          assert(before.local.some(row => crashSsh.has(key(row)) && row.ssh && row.state !== "Z" && row.stdinOpen),
+            "The attributed worker SSH transport is not live immediately before forced thread exit");
           return Response.json({ ok: true, instanceKey: observer.instanceKey });
         }
         assert.equal(route, "/v1/chat/completions", "Unexpected provider endpoint");
@@ -248,9 +314,59 @@ try {
         assert(turn && fixtureIds.includes(turn[1]) && fixturePhases.includes(turn[2]), "Unexpected model consumer: only explicit deterministic task turns are authorized");
         const [, id, phase] = turn;
         const last = body.messages.at(-1);
+        const previous = body.messages.findLast((message: any) => message.role === "assistant" && message.tool_calls)?.tool_calls?.at(-1)?.function?.name;
         const toolCall = (name: string, input: object) => chunk({ role: "assistant", tool_calls: [{ index: 0, id: `probe_${requests}`, type: "function", function: { name, arguments: JSON.stringify(input) } }] }, null) + chunk({}, "tool_calls");
         let stream: string;
-        if (phase === "crash-service") {
+        if (phase === "reconnect") {
+          const observer = observations.slice().reverse().find(row => row.round === round && row.id === id);
+          assert(observer && !observer.isMainThread, "Reconnect must execute on an observed actual native worker");
+          if (last.role !== "tool") {
+            assert(body.tools.some((tool: any) => tool.function.name === "remote_reconnect"), "Worker must expose the production reconnect tool");
+            stream = toolCall("remote_reconnect", { force: true });
+          } else if (previous === "remote_reconnect") {
+            reconnectDetails = JSON.parse(messageText(last));
+            assert(reconnectDetails.success && reconnectDetails.mode === "remote" && reconnectDetails.replacedLiveTransport === true,
+              "The actual worker must replace its live remote transport, not just report feature availability");
+            reconnectVerified = true;
+            stream = toolCall("read", { path: "/proc/self/stat:raw" });
+          } else if (previous === "read") {
+            const stat = messageText(last).match(/(?:^|\n)(\d+) \((.*)\) (\S) ([^\n]+)/);
+            assert(stat, "Reconnected worker ReadTool did not identify its fresh companion");
+            const fields = [stat[3], ...stat[4].trim().split(/\s+/)];
+            reconnectCompanion = { pid: Number(stat[1]), start: fields[19] };
+            assert(reconnectCompanion.pid > 1 && /^\d+$/.test(reconnectCompanion.start));
+            const command = `printf 'TASK_NESTED_${run}\\n'; pwd; printf 'SESSION=%s\\n' "$PI_SESSION_ID"`;
+            stream = toolCall("eval", { language: "js", title: "Native worker reconnect callback",
+              code: `print((await tool.bash(${JSON.stringify({ command })})).text);` });
+          } else if (previous === "eval") {
+            const output = messageText(last);
+            assert(output.includes(`TASK_NESTED_${run}`) && output.includes(observer.status.remoteCwd) && output.includes(observer.sessionId),
+              "Nested Eval must return through the reconnected child's host-mediated Bash callback with its remote cwd and session identity");
+            nestedEvalVerified = true;
+            assert(body.tools.some((tool: any) => tool.function.name === "task_acceptance_capture"));
+            stream = toolCall("task_acceptance_capture", {});
+          } else {
+            assert.equal(previous, "task_acceptance_capture");
+            captureEvidence = JSON.parse(messageText(last));
+            assert(captureEvidence.id === id && captureEvidence.instanceKey === observer.instanceKey &&
+              captureEvidence.isMainThread === false && captureEvidence.threadId === observer.threadId);
+            const emitted = 3 * 1024 * 1024 + Buffer.byteLength(`\nTASK_CAPTURE_END_${run}\n`, "utf8");
+            assert.equal(captureEvidence.emittedBytes, emitted);
+            assert.equal(captureEvidence.emittedUnits, emitted); // This fixture emits only ASCII.
+            assert.equal(captureEvidence.output.start, emitted - 256 * 1024);
+            assert.equal(captureEvidence.output.end, emitted);
+            assert.equal(captureEvidence.output.retainedUnits, 256 * 1024);
+            assert.equal(captureEvidence.pipe.start, emitted - 1024 * 1024);
+            assert.equal(captureEvidence.pipe.end, emitted);
+            assert.equal(captureEvidence.pipe.retainedBytes, 1024 * 1024);
+            assert.match(captureEvidence.output.sha256, /^[a-f0-9]{64}$/);
+            assert.match(captureEvidence.pipe.sha256, /^[a-f0-9]{64}$/);
+            assert.equal(captureEvidence.output.sha256, captureEvidence.output.expected.sha256);
+            assert.equal(captureEvidence.pipe.sha256, captureEvidence.pipe.expected.sha256);
+            assert(captureEvidence.sentinelRetained);
+            stream = chunk({ role: "assistant", content: "NORMAL_WORKER_RECONNECT_VERIFIED" }, null) + chunk({}, "stop");
+          }
+        } else if (phase === "crash-service") {
           if (last.role !== "tool") {
             const marker = `TASK_CRASH_${run}`;
             stream = toolCall("bash", { name: `accept_crash_${run}`, command: `printf '${marker}\\n'; exec python3 -c 'import time; time.sleep(600)' ${marker}`, pty: false, ready: { log: marker, timeout: 10 } });
@@ -259,7 +375,6 @@ try {
             stream = chunk({ role: "assistant", content: "CRASH_SERVICE_OBSERVED" }, null) + chunk({}, "stop");
           }
         } else if (phase === "revoked") {
-          const previous = body.messages.findLast((message: any) => message.role === "assistant" && message.tool_calls)?.tool_calls?.at(-1)?.function?.name;
           if (last.role !== "tool") {
             assert(body.tools.some((tool: any) => tool.function.name === "remote_workspace_status"), "Child does not expose the native remote status tool");
             stream = toolCall("remote_workspace_status", {});
@@ -297,7 +412,9 @@ try {
     }});
     const config = join(roundDir, "config.json");
     const loopback = "remote-task-smoke/probe";
-    await writeFile(config, JSON.stringify({ async: { enabled: false }, task: { batch: true, maxConcurrency: 9, workerThreads: 1, structured: false, perCallModel: "on", perCallModelAllow: [loopback], agentIdleTtlMs: 0, completionProbe: false, softRequestBudget: 0, prewalk: false }, modelRoles: { default: loopback, tiny: loopback, smol: loopback, commit: loopback }, retry: { modelFallback: false }, advisor: { enabled: false }, memory: { enabled: false }, autolearn: { enabled: false }, compaction: { enabled: false } }));
+    // Disable model-authored widgets at the root. A worker borrows a remote
+    // manager whose `widgets` property is intentionally getter-only.
+    await writeFile(config, JSON.stringify({ async: { enabled: false, widgets: false }, task: { batch: true, maxConcurrency: 9, workerThreads: 1, structured: false, perCallModel: "on", perCallModelAllow: [loopback], agentIdleTtlMs: 0, completionProbe: false, softRequestBudget: 0, prewalk: false }, modelRoles: { default: loopback, tiny: loopback, smol: loopback, commit: loopback }, retry: { modelFallback: false }, advisor: { enabled: false }, memory: { enabled: false }, autolearn: { enabled: false }, compaction: { enabled: false } }));
     const env: Record<string, string | undefined> = {};
     for (const [name, value] of Object.entries(Bun.env)) {
       if (["PATH", "HOME", "SHELL", "USER", "LOGNAME", "LANG", "LC_ALL", "TERM", "SSH_AUTH_SOCK", "SSH_AGENT_PID"].includes(name) || /^(REMOTE_|OMP_REMOTE_)/.test(name)) env[name] = value;
@@ -316,7 +433,7 @@ try {
         const reader = omp.stdout.getReader(), decoder = new TextDecoder();
         let buffer = "";
         const consume = async (line: string) => {
-          if (line.includes(passMarker) || (!restart && roundLimited && line.includes("TASK_SMOKE_PARTIAL"))) passed = true;
+          if (line.includes(passMarker)) passed = true;
           let frame: any; try { frame = JSON.parse(line); } catch { if (line) console.log(line); return; }
           if (frame.type === "response" && frame.id === "admission") {
             assert(!admitted && frame.success && frame.data.commands.some((entry: any) => entry.name === command && entry.source === "extension")); admitted = true;
@@ -354,12 +471,11 @@ try {
     };
     try { await execute(false); await execute(true); }
     finally { server.stop(true); }
-    if (roundLimited) limitedRounds++;
-    console.log(roundLimited ? "TASK_ACCEPTANCE_ROUND_PARTIAL" : "TASK_ACCEPTANCE_ROUND_PASS", JSON.stringify({ round, nativeTasks: initial.size, actualWorkerThread: observations.some(row => row.round === round && !row.isMainThread), taskProviderRequests: requests - labelRequests, nativeLabelRequests: labelRequests, remoteCleanup: cleanupEvidence?.remoteCleanup, sshStdinClosed: cleanupEvidence?.sshStdinClosed, localReaped: cleanupEvidence?.localReaped, finalSurvivors: 0 }));
+    console.log("TASK_ACCEPTANCE_ROUND_PASS", JSON.stringify({ round, nativeTasks: initial.size, actualWorkerThread: observations.some(row => row.round === round && !row.isMainThread), normalWorkerReconnect: reconnectVerified, nestedEvalCallback: nestedEvalVerified, boundedCapture: captureEvidence, taskProviderRequests: requests - labelRequests, nativeLabelRequests: labelRequests, remoteCleanup: cleanupEvidence?.remoteCleanup, sshExitObserved: cleanupEvidence?.sshExitObserved, sshStdinClosed: cleanupEvidence?.sshStdinClosed, localReaped: cleanupEvidence?.localReaped, parentAliveDuringCleanup: cleanupEvidence?.parentAlive, parentConnectionUsable, finalSurvivors: 0 }));
   }
   completed = true;
-  console.log(limitedRounds ? "TASK_ACCEPTANCE_PARTIAL" : "TASK_ACCEPTANCE_PASS", JSON.stringify({ rounds, limitedRounds, limitation: limitedRounds ? "Native Bun worker exit leaves a closed-fd SSH zombie until parent exit; remote cleanup succeeds, local reaping fails" : undefined, restartMeaning: "real native process restart from a flushed connected-session snapshot; persisted intent unavailable, no automatic reconnect", finalSurvivors: 0 }));
+  console.log("TASK_ACCEPTANCE_PASS", JSON.stringify({ rounds, restartMeaning: "real native process restart from a flushed connected-session snapshot; persisted intent unavailable, no automatic reconnect", finalSurvivors: 0 }));
 } finally {
-  if (completed && limitedRounds === 0 && Bun.env.SMOKE_KEEP_ARTIFACTS !== "1") await rm(directory, { recursive: true, force: true });
+  if (completed && Bun.env.SMOKE_KEEP_ARTIFACTS !== "1") await rm(directory, { recursive: true, force: true });
   else console.error(`Retained private acceptance artifacts: ${directory}`);
 }

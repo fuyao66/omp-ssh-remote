@@ -31,7 +31,7 @@ const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 
 
 const deploymentContext = new AsyncLocalStorage<Pick<WorkerDeploymentOptions, "signal" | "onProgress">>();
-const deployments = new Map<string, Promise<unknown>>();
+const deployments = new Map<string, Promise<void>>();
 
 async function run(command: string[], description: string, timeoutMs = 120_000): Promise<string> {
   const { signal, onProgress } = deploymentContext.getStore() ?? {};
@@ -56,8 +56,7 @@ async function run(command: string[], description: string, timeoutMs = 120_000):
     proc.stdout?.on("data", collect(chunks));
     proc.stderr?.on("data", collect(errors));
     const timer = setTimeout(() => stop(new Error(`${description} timed out after ${timeoutMs}ms`)), timeoutMs);
-    proc.on("error", (error) => { failure ??= error; });
-    proc.on("close", (code) => {
+    const finish = (code: number | null) => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
       const stdout = Buffer.concat(chunks).toString("utf8").trim();
@@ -65,7 +64,21 @@ async function run(command: string[], description: string, timeoutMs = 120_000):
       if (failure) rejectPromise(failure);
       else if (code !== 0) rejectPromise(new Error(`${description} failed (${code}): ${stderr || stdout}`));
       else resolvePromise(stdout);
+      proc.stdout?.destroy();
+      proc.stderr?.destroy();
+    };
+    let finishing = false;
+    const drain = (code: number | null) => {
+      if (finishing) return;
+      finishing = true;
+      setImmediate(() => finish(code));
+    };
+    proc.on("error", (error) => {
+      failure ??= error;
+      // A failed spawn has no child exit event to wait for.
+      if (proc.pid === undefined) drain(null);
     });
+    proc.on("exit", drain);
   });
 }
 export const SUPPORTED_PLATFORMS: Record<string, "arm64" | "x64"> = {
@@ -135,6 +148,13 @@ export type PreparedRemoteWorker = {
   dispose(): Promise<void>;
 };
 
+export interface RemoteWorkerPreparation {
+  /** Resolves on delivery; cancellation can reject before producer cleanup finishes. */
+  ready: Promise<PreparedRemoteWorker>;
+  /** Completes producer/undelivered-lease cleanup, not a successfully delivered lease. */
+  settled: Promise<void>;
+}
+
 export async function resolveRemoteHome(
   options: WorkerDeploymentOptions,
 ): Promise<string> {
@@ -148,13 +168,13 @@ export async function resolveRemoteHome(
   return output;
 }
 
-export async function prepareRemoteWorker(
+export function startRemoteWorkerPreparation(
   options: WorkerDeploymentOptions,
   bundle: RemoteWorkerBundle = OMP_WORKER_BUNDLE,
-): Promise<PreparedRemoteWorker> {
+): RemoteWorkerPreparation {
   const key = JSON.stringify([options.target, options.port, options.identityFile, options.knownHostsFile, bundle.cacheNamespace]);
   const previous = deployments.get(key);
-  const result = (async () => {
+  const producer = (async () => {
     if (previous) {
       options.onProgress?.("Waiting for existing deployment to finish");
       await previous.catch(() => {});
@@ -162,20 +182,44 @@ export async function prepareRemoteWorker(
     options.signal?.throwIfAborted();
     return deploymentContext.run(options, () => deployRemoteWorker(options, bundle));
   })();
-  deployments.set(key, result);
-  void result.finally(() => { if (deployments.get(key) === result) deployments.delete(key); }).catch(() => {});
-  if (!options.signal) return result;
-  const cancelled = Promise.withResolvers<never>();
-  const abort = () => cancelled.reject(new Error("Remote deployment cancelled", { cause: options.signal?.reason }));
-  options.signal.addEventListener("abort", abort, { once: true });
-  if (options.signal.aborted) abort();
-  // A queued cancellation returns promptly; the producer retains ownership until delivery.
-  const deliver = result.then(async prepared => {
-    if (options.signal?.aborted) { await prepared.dispose(); options.signal.throwIfAborted(); }
-    return prepared;
+  const ready = Promise.withResolvers<PreparedRemoteWorker>();
+  let deliveredOrCancelled = false;
+  const abort = () => {
+    if (deliveredOrCancelled) return;
+    deliveredOrCancelled = true;
+    ready.reject(new Error("Remote deployment cancelled", { cause: options.signal?.reason }));
+  };
+  options.signal?.addEventListener("abort", abort, { once: true });
+  if (options.signal?.aborted) abort();
+  // Cancellation releases the caller promptly, not the producer's ownership.
+  // After delivery the caller owns the prepared lease independently of settlement.
+  const settled = producer.then(async prepared => {
+    if (deliveredOrCancelled) {
+      await prepared.dispose();
+      return;
+    }
+    deliveredOrCancelled = true;
+    ready.resolve(prepared);
+  }, error => {
+    deliveredOrCancelled = true;
+    ready.reject(error);
+  }).finally(() => {
+    options.signal?.removeEventListener("abort", abort);
+    if (deployments.get(key) === settled) deployments.delete(key);
   });
-  try { return await Promise.race([deliver, cancelled.promise]); }
-  finally { options.signal.removeEventListener("abort", abort); }
+  deployments.set(key, settled);
+  // Consume unhandled rejection reporting without changing the owner's promise.
+  void settled.catch(() => {});
+  return { ready: ready.promise, settled };
+}
+
+export async function prepareRemoteWorker(
+  options: WorkerDeploymentOptions,
+  bundle: RemoteWorkerBundle = OMP_WORKER_BUNDLE,
+): Promise<PreparedRemoteWorker> {
+  const preparation = startRemoteWorkerPreparation(options, bundle);
+  void preparation.settled.catch(() => {});
+  return await preparation.ready;
 }
 
 async function deployRemoteWorker(options: WorkerDeploymentOptions, bundle: RemoteWorkerBundle): Promise<PreparedRemoteWorker> {
@@ -297,13 +341,14 @@ async function acquireDeploymentLease(options: WorkerDeploymentOptions, root: st
   const command = [...buildSshBaseCommand(options), getSshDestination(options), buildWorkerDeploymentLeaseCommand(root, namespace, hash)];
   const [file, ...args] = command;
   const proc = spawn(file, args, { stdio: ["pipe", "pipe", "pipe"] });
+  let disposal: Promise<void> | undefined;
   let disposed = false;
   let ready = false;
   let output = "";
   let errors = "";
   proc.stdin.on("error", () => {});
   const acquired = Promise.withResolvers<void>();
-  const closed = Promise.withResolvers<void>();
+  const exited = Promise.withResolvers<void>();
   const abort = () => { proc.stdin.end(); proc.kill("SIGKILL"); acquired.reject(new Error("Worker deployment lease cancelled", { cause: signal.reason })); };
   signal.addEventListener("abort", abort, { once: true });
   if (signal.aborted) abort();
@@ -313,19 +358,39 @@ async function acquireDeploymentLease(options: WorkerDeploymentOptions, root: st
     else if (output.length > 1024 || output.includes("\n") && output !== "READY\n") failed.abort(new Error("Invalid worker deployment lease response"));
   });
   proc.stderr.on("data", (chunk: Buffer) => { errors = (errors + chunk.toString()).slice(-4096); });
-  proc.on("error", error => { acquired.reject(error); if (!disposed) failed.abort(error); });
-  proc.on("close", () => {
-    closed.resolve();
-    if (!disposed) { const error = new Error(`Worker deployment lease lost: ${errors || "SSH channel closed"}`); acquired.reject(error); failed.abort(error); }
+  let finishing = false;
+  const drain = () => {
+    if (finishing) return;
+    finishing = true;
+    setImmediate(() => {
+      proc.stdin.destroy();
+      proc.stdout.destroy();
+      proc.stderr.destroy();
+      exited.resolve();
+      if (!disposed) {
+        const error = new Error(`Worker deployment lease lost: ${errors || "SSH channel closed"}`);
+        acquired.reject(error);
+        failed.abort(error);
+      }
+    });
+  };
+  proc.on("error", error => {
+    acquired.reject(error);
+    if (!disposed) failed.abort(error);
+    if (proc.pid === undefined) drain();
   });
+  proc.on("exit", drain);
   const timer = setTimeout(() => failed.abort(new Error("Worker deployment lease acquisition timed out")), 20_000);
-  const dispose = async () => {
-    if (disposed) return;
+  const dispose = (): Promise<void> => {
+    if (disposal) return disposal;
     disposed = true;
     signal.removeEventListener("abort", abort);
     proc.stdin.end();
-    const kill = setTimeout(() => proc.kill("SIGKILL"), 2000);
-    try { await closed.promise; } finally { clearTimeout(kill); }
+    disposal = (async () => {
+      const kill = setTimeout(() => proc.kill("SIGKILL"), 2000);
+      try { await exited.promise; } finally { clearTimeout(kill); }
+    })();
+    return disposal;
   };
   try { await acquired.promise; signal.throwIfAborted(); return { signal, dispose }; }
   catch (error) { await dispose(); throw error; }

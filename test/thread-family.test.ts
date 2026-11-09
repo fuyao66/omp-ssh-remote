@@ -1,9 +1,10 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { BroadcastChannel } from "node:worker_threads";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSessionHandle } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
 import { getRemoteFamilyBroker } from "../src/family-broker.ts";
 import { ThreadFamilyBridge, type ThreadFamilyDecision, type ThreadFamilySource, type ThreadMemberIdentity } from "../src/thread-family.ts";
+import { ThreadRuntimeOwner } from "../src/thread-runtime.ts";
 import type { WorkerCommand } from "./fixtures/thread-family-worker.ts";
 
 type ActiveDecision = Extract<ThreadFamilyDecision, { kind: "active" }>;
@@ -30,6 +31,22 @@ afterEach(async () => {
   const failures = settled.filter((result): result is PromiseRejectedResult => result.status === "rejected");
   if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Thread-family fixture cleanup failed");
 });
+
+function observeRuntimeOwners() {
+  const entries: Array<{ owner?: ThreadRuntimeOwner; disposed: boolean }> = [];
+  const create = ThreadRuntimeOwner.create;
+  const observer = spyOn(ThreadRuntimeOwner, "create").mockImplementation(async (connection, assertActive, onDisposed) => {
+    const entry: (typeof entries)[number] = { disposed: false };
+    entries.push(entry);
+    entry.owner = await create.call(ThreadRuntimeOwner, connection, assertActive, () => {
+      entry.disposed = true;
+      onDisposed?.();
+    });
+    return entry.owner;
+  });
+  cleanups.push(async () => { observer.mockRestore(); });
+  return entries;
+}
 
 async function harness(options: { remote?: boolean; authority?: boolean } = {}) {
   const key = crypto.randomUUID();
@@ -174,6 +191,101 @@ test("real worker reserve distinguishes local sessions from active remote famili
   await remote.rpc({ op: "commit", token: decision.token, generation: decision.family.generation, identity: remote.identity });
   await remote.rpc({ op: "detach", token: decision.token, identity: remote.identity });
   expect(remote.family.threadMembers?.size).toBe(0);
+}, 15_000);
+
+test("live-worker IPC loss renews only after explicit detach under the same family generation", async () => {
+  const owners = observeRuntimeOwners();
+  const h = await harness();
+  const workerIdentity = await h.rpc<{ pid: number; threadId: number }>({ op: "worker-identity" });
+  expect(workerIdentity.pid).toBe(process.pid);
+  expect(workerIdentity.threadId).toBeGreaterThan(0);
+  expect(await h.rpc<boolean>({ op: "runtime-closed", token: "never-reserved" })).toBe(true);
+  const old = await h.active();
+  await h.rpc({ op: "commit", token: old.token, generation: old.family.generation, identity: h.identity });
+  expect(owners).toHaveLength(1);
+  expect(await h.rpc<boolean>({ op: "runtime-closed", token: old.token })).toBe(false);
+  await h.rpc({ op: "watch-runtime-close", token: old.token });
+  const closed = h.nextEvent("runtime-closed");
+  // Close the actual owner socket, not the worker or its registry identity.
+  const disposing = owners[0]!.owner!.dispose();
+  await closed;
+  expect(await h.rpc<boolean>({ op: "runtime-closed", token: old.token })).toBe(true);
+  expect(await h.rpc<typeof workerIdentity>({ op: "worker-identity" })).toEqual(workerIdentity);
+  expect(owners).toHaveLength(1); // IPC loss must not renew automatically.
+  expect(h.registry.get(h.identity.agentId)).toBe(h.ref);
+  expect(h.family.generation).toBe(old.family.generation);
+  expect(Atomics.load(new Int32Array(old.family.revocation), 0)).toBe(0);
+
+  // Match extension reconnect: await detach, revalidate, then reserve with the
+  // previous family generation. A failed admission remains explicitly retryable.
+  await h.rpc({ op: "detach", token: old.token, identity: h.identity });
+  expect(owners[0]!.disposed).toBe(true);
+  await disposing;
+  expect(h.family.threadMembers?.size).toBe(0);
+  expect(h.broker.find(h.identity.sessionFile)).toBe(h.family);
+  expect(h.family.closing).toBe(false);
+  expect((await workerRejection(h.rpc({
+    op: "reserve", identity: h.identity, generation: `${old.family.generation}-stale`,
+  }))).message).toContain("generation changed before reconnect");
+  expect(owners).toHaveLength(1);
+  expect(h.family.threadMembers?.size).toBe(0);
+
+  const fresh = await h.rpc<ThreadFamilyDecision>({
+    op: "reserve", identity: h.identity, generation: old.family.generation,
+  });
+  expect(fresh.kind).toBe("active");
+  if (fresh.kind !== "active") throw new Error("Expected a fresh active family reservation");
+  expect(owners).toHaveLength(2);
+  expect(owners[1]!.disposed).toBe(false);
+  expect(fresh.token).not.toBe(old.token);
+  expect(fresh.runtime.path).not.toBe(old.runtime.path);
+  expect(fresh.runtime.capability).not.toBe(old.runtime.capability);
+  expect(fresh.family.generation).toBe(old.family.generation);
+  expect(await h.rpc<boolean>({ op: "runtime-closed", token: old.token })).toBe(true);
+  expect(await h.rpc<boolean>({ op: "runtime-closed", token: fresh.token })).toBe(false);
+  await h.rpc({ op: "commit", token: fresh.token, generation: fresh.family.generation, identity: h.identity });
+  // This error comes from the main owner's work handler before SSH admission,
+  // proving the fresh authenticated socket can carry work-control calls.
+  expect((await workerRejection(h.rpc({ op: "probe-runtime", token: fresh.token }))).message)
+    .toContain("Remote thread transport settings changed");
+  expect(await h.rpc<boolean>({ op: "runtime-closed", token: fresh.token })).toBe(false);
+  await h.rpc({ op: "detach", token: old.token, identity: h.identity });
+  expect([...h.family.threadMembers!].map(member => member.token)).toEqual([fresh.token]);
+  expect(await h.rpc<typeof workerIdentity>({ op: "worker-identity" })).toEqual(workerIdentity);
+  expect(await h.rpc<Stats>({ op: "stats" })).toEqual({ closeStarted: 0, closeFinished: 0 });
+  await h.rpc({ op: "detach", token: fresh.token, identity: h.identity });
+  expect(owners[1]!.disposed).toBe(true);
+  expect(await h.rpc<boolean>({ op: "runtime-closed", token: fresh.token })).toBe(true);
+  expect(h.family.threadMembers?.size).toBe(0);
+}, 15_000);
+
+test("revoked-family explicit renewal admits no owner and never falls back locally", async () => {
+  const owners = observeRuntimeOwners();
+  const h = await harness();
+  const workerIdentity = await h.rpc<{ pid: number; threadId: number }>({ op: "worker-identity" });
+  const old = await h.active();
+  await h.rpc({ op: "watch-runtime-close", token: old.token });
+  const closed = h.nextEvent("runtime-closed");
+  const disposing = owners[0]!.owner!.dispose();
+  await closed;
+  await h.rpc({ op: "detach", token: old.token, identity: h.identity });
+  await disposing;
+  expect(owners[0]!.disposed).toBe(true);
+  h.broker.revoke(h.family);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await h.rpc<ThreadFamilyDecision>({
+      op: "reserve", identity: h.identity, generation: old.family.generation,
+    });
+    expect(result).toEqual({
+      kind: "unavailable", reason: "Remote runtime family was revoked; local fallback is disabled",
+    });
+    expect(owners).toHaveLength(1);
+    expect(h.family.threadMembers?.size).toBe(0);
+    expect(await h.rpc<boolean>({ op: "runtime-closed", token: old.token })).toBe(true);
+  }
+  expect(h.registry.get(h.identity.agentId)).toBe(h.ref);
+  expect(await h.rpc<typeof workerIdentity>({ op: "worker-identity" })).toEqual(workerIdentity);
+  expect(await h.rpc<Stats>({ op: "stats" })).toEqual({ closeStarted: 0, closeFinished: 0 });
 }, 15_000);
 
 test("reserve rejects stale registry generation, instance identity, and transcript path", async () => {

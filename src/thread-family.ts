@@ -4,6 +4,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import type { RemoteConnectRequest } from "./connect-options.ts";
 import type { RemoteWorkerCacheAudit } from "./deploy.ts";
 import { assertFamilyLeaseActive, familyLease, getRemoteFamilyBroker, type FamilyBrokerFamily } from "./family-broker.ts";
+import { ThreadRuntime, ThreadRuntimeOwner, type ThreadRuntimeAddress } from "./thread-runtime.ts";
 
 export { isMainThread as isFamilyAuthorityThread };
 export type FamilyConnection = Omit<RemoteConnectRequest, "cwd"> & {
@@ -27,7 +28,7 @@ export interface ThreadMemberIdentity {
 export interface ThreadMemberControl {
   readonly token: string;
   readonly identity: ThreadMemberIdentity;
-  close(): Promise<void>;
+  close(timeoutMs?: number): Promise<void>;
 }
 export interface ThreadFamilySource extends FamilyBrokerFamily {
   localCwd: string;
@@ -37,9 +38,9 @@ export interface ThreadFamilySource extends FamilyBrokerFamily {
   threadMembers?: Set<ThreadMemberControl>;
 }
 export type ThreadFamilyDecision = { kind: "local" } | { kind: "unavailable"; reason: string } |
-  { kind: "active"; token: string; family: ThreadFamilyDescriptor };
+  { kind: "active"; token: string; family: ThreadFamilyDescriptor; runtime: ThreadRuntimeAddress };
 
-type Request = { op: "reserve"; identity: ThreadMemberIdentity } |
+type Request = { op: "reserve"; identity: ThreadMemberIdentity; generation?: string } |
   { op: "commit"; token: string; generation: string; identity: ThreadMemberIdentity } |
   { op: "detach"; token: string; identity: ThreadMemberIdentity } | { op: "close"; token: string };
 type Frame = { protocol: 1; from: string; to: string; id: string } &
@@ -55,6 +56,8 @@ export class ThreadFamilyBridge {
   readonly #pending = new Map<string, { resolve(value: unknown): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
   readonly #callbacks = new Map<string, () => Promise<void>>();
   readonly #reservations = new Map<string, Reservation>();
+  readonly #owners = new Map<string, Reservation & { owner: ThreadRuntimeOwner }>();
+  readonly #runtimes = new Map<string, ThreadRuntime>();
   #stopRegistry?: () => void;
   #closed = false;
   #disposing = false;
@@ -105,7 +108,7 @@ export class ThreadFamilyBridge {
     try {
       const result = frame.request.op === "close"
         ? await this.#closeMember(frame.request.token)
-        : this.#authorityRequest(frame.from, frame.request);
+        : await this.#authorityRequest(frame.from, frame.request);
       this.#send({ protocol: 1, from: this.#peer, to: frame.from, id: frame.id, kind: "reply", value: result });
     } catch (error) {
       try { this.#send({ protocol: 1, from: this.#peer, to: frame.from, id: frame.id, kind: "reply", error: error instanceof Error ? error.message : "Remote family control failed" }); } catch {}
@@ -129,7 +132,7 @@ export class ThreadFamilyBridge {
     }
   }
 
-  #authorityRequest(peer: string, request: Exclude<Request, { op: "close" }>): unknown {
+  async #authorityRequest(peer: string, request: Exclude<Request, { op: "close" }>): Promise<unknown> {
     if (this.#disposing && request.op !== "detach") throw new Error("Remote family authority is shutting down");
     if (!isMainThread) throw new Error("Remote family authority is not available on this thread");
     this.reap();
@@ -140,24 +143,46 @@ export class ThreadFamilyBridge {
       if (!family) return { kind: "local" } satisfies ThreadFamilyDecision;
       try { assertFamilyLeaseActive(family); }
       catch { return { kind: "unavailable", reason: "Remote runtime family was revoked; local fallback is disabled" } satisfies ThreadFamilyDecision; }
+      if (request.generation !== undefined && family.generation !== request.generation) throw new Error("Remote family generation changed before reconnect");
       const token = crypto.randomUUID();
       const identity = { ...request.identity, sessionFile: resolve(request.identity.sessionFile) };
-      const control: ThreadMemberControl = { token, identity, close: async () => {
+      const control: ThreadMemberControl = { token, identity, close: async timeoutMs => {
         this.reap();
-        if (!this.#reservations.has(token)) return;
-        await this.#call(peer, { op: "close", token });
+        const owner = this.#owners.get(token)?.owner;
+        const results = await Promise.allSettled([
+          ...(this.#reservations.has(token) && !owner?.peerClosed ? [this.#call(peer, { op: "close", token })] : []),
+          ...(owner ? [owner.close(timeoutMs)] : []),
+        ]);
         family.threadMembers?.delete(control); this.#reservations.delete(token);
+        const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+        if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Remote thread member cleanup failed");
       } };
+      const owner = await ThreadRuntimeOwner.create(() => ({ ...family.connection, cwd: family.remoteCwd }), () => {
+        if (this.#closed || this.#disposing || !this.#reservations.has(token) || !this.#current(identity)) {
+          throw new Error("Remote family member session was replaced or detached");
+        }
+        assertFamilyLeaseActive(family);
+      }, () => {
+        family.threadMembers?.delete(control);
+        this.#reservations.delete(token);
+        this.#owners.delete(token);
+      });
+      try {
+        if (this.#closed || this.#disposing || !this.#current(identity)) throw new Error("Remote family member session was replaced or detached");
+        if (request.generation !== undefined && family.generation !== request.generation) throw new Error("Remote family generation changed during reconnect");
+        assertFamilyLeaseActive(family);
+      } catch (error) { await owner.dispose(); throw error; }
       (family.threadMembers ??= new Set()).add(control);
       broker.retain(family, identity.sessionFile);
       this.#reservations.set(token, { peer, identity, family, control });
+      this.#owners.set(token, { peer, identity, family, control, owner });
       const descriptor: ThreadFamilyDescriptor = {
         ownerSessionFile: family.ownerSessionFile, localCwd: family.localCwd, remoteCwd: family.remoteCwd,
         connection: family.connection, cacheAudit: family.cacheAudit, ...familyLease(family),
       };
-      return { kind: "active", token, family: descriptor } satisfies ThreadFamilyDecision;
+      return { kind: "active", token, family: descriptor, runtime: owner.address } satisfies ThreadFamilyDecision;
     }
-    const entry = this.#reservations.get(request.token);
+    const entry = this.#reservations.get(request.token) ?? this.#owners.get(request.token);
     if (!entry) {
       if (request.op === "detach") return;
       throw new Error("Remote family attachment no longer exists");
@@ -166,15 +191,18 @@ export class ThreadFamilyBridge {
         entry.identity.registryGeneration !== request.identity.registryGeneration || entry.identity.agentId !== request.identity.agentId ||
         entry.identity.sessionFile !== resolve(request.identity.sessionFile)) throw new Error("Remote family member identity changed");
     if (request.op === "detach") {
-      entry.family.threadMembers?.delete(entry.control); this.#reservations.delete(request.token); return;
+      entry.family.threadMembers?.delete(entry.control); this.#reservations.delete(request.token);
+      await this.#owners.get(request.token)?.owner.dispose();
+      return;
     }
+    if (!this.#reservations.has(request.token)) throw new Error("Remote family attachment no longer exists");
     assertFamilyLeaseActive(entry.family);
     if (entry.family.generation !== request.generation) throw new Error("Remote family generation changed during attachment");
   }
 
-  async reserve(identity: ThreadMemberIdentity, close: () => Promise<void>): Promise<ThreadFamilyDecision> {
+  async reserve(identity: ThreadMemberIdentity, close: () => Promise<void>, generation?: string): Promise<ThreadFamilyDecision> {
     if (isMainThread) throw new Error("Main-thread members use the authoritative local broker directly");
-    const result = await this.#call("main", { op: "reserve", identity }) as ThreadFamilyDecision;
+    const result = await this.#call("main", { op: "reserve", identity, ...(generation !== undefined ? { generation } : {}) }) as ThreadFamilyDecision;
     if (!result || !["local", "unavailable", "active"].includes(result.kind)) throw new Error("Invalid remote family decision; local fallback is disabled");
     if (result.kind === "active") {
       if (typeof result.token !== "string" || !(result.family?.revocation instanceof SharedArrayBuffer) ||
@@ -182,8 +210,34 @@ export class ThreadFamilyBridge {
         throw new Error("Invalid remote family lease; local fallback is disabled");
       }
       this.#callbacks.set(result.token, close);
+      try {
+        const runtime = await ThreadRuntime.connect(result.runtime);
+        if (this.#disposing || this.#closed) { await runtime.dispose(); throw new Error("Remote family control is closing"); }
+        this.#runtimes.set(result.token, runtime);
+      } catch (error) {
+        this.#callbacks.delete(result.token);
+        await this.#call("main", { op: "detach", token: result.token, identity }).catch(() => {});
+        throw error;
+      }
     }
     return result;
+  }
+
+  runtime(token: string): ThreadRuntime {
+    const runtime = this.#runtimes.get(token);
+    if (!runtime) throw new Error("Remote thread transport is unavailable; local fallback is disabled");
+    return runtime;
+  }
+
+  runtimeClosed(token: string): boolean {
+    return this.#runtimes.get(token)?.isClosed ?? true;
+  }
+
+  async closeFamilyResources(family: ThreadFamilySource, timeoutMs?: number): Promise<void> {
+    const results = await Promise.allSettled([...this.#owners.values()]
+      .filter(entry => entry.family === family).map(entry => entry.owner.close(timeoutMs)));
+    const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Remote thread family cleanup failed");
   }
 
   async commit(token: string, generation: string, identity: ThreadMemberIdentity): Promise<void> {
@@ -192,7 +246,15 @@ export class ThreadFamilyBridge {
 
   async detach(token: string, identity: ThreadMemberIdentity): Promise<void> {
     this.#callbacks.delete(token);
-    await this.#call("main", { op: "detach", token, identity });
+    const runtime = this.#runtimes.get(token);
+    this.#runtimes.delete(token);
+    const results = await Promise.allSettled([
+      ...(runtime ? [runtime.dispose()] : []),
+    ]);
+    try { await this.#call("main", { op: "detach", token, identity }); }
+    catch (error) { results.push({ status: "rejected", reason: error }); }
+    const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Remote thread detach failed");
   }
 
   async #closeMember(token: string): Promise<void> {
@@ -213,13 +275,19 @@ export class ThreadFamilyBridge {
   async #dispose(): Promise<void> {
     if (this.#closed) return;
     this.#disposing = true;
-    const entries = [...this.#reservations.values()];
+    const entries = [...new Map([...this.#reservations.values(), ...this.#owners.values()]
+      .map(entry => [entry.control.token, entry])).values()];
     if (isMainThread) for (const family of new Set(entries.map(entry => entry.family))) {
       getRemoteFamilyBroker<ThreadFamilySource>().revoke(family);
     }
     const settled = await Promise.allSettled(isMainThread
       ? entries.map(entry => entry.control.close())
       : [...this.#callbacks.values()].map(close => close()));
+    const owned = await Promise.allSettled(isMainThread
+      ? [...this.#owners.values()].map(entry => entry.owner.dispose())
+      : [...this.#runtimes.values()].map(runtime => runtime.dispose()));
+    settled.push(...owned);
+    this.#runtimes.clear();
     this.#closed = true;
     this.#stopRegistry?.();
     this.#failPending("Remote family control channel was disposed; local fallback is disabled");

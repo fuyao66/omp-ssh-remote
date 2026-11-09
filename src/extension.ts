@@ -14,7 +14,7 @@ import {
   parseConnectOptions,
   type RemoteConnectRequest,
 } from "./connect-options.ts";
-import { RemoteRuntimeClient, remoteErrorMessage } from "./client.ts";
+import { RemoteRuntimeClient, remoteErrorMessage, type RemoteRuntimeClientApi } from "./client.ts";
 import { describeRemoteWorkerCacheAudit, prepareRemoteWorker, type PreparedRemoteWorker, type RemoteWorkerCacheAudit } from "./deploy.ts";
 import { REMOTE_TOOL_NAMES, type RemoteToolName, type ReadyMessage } from "./protocol.ts";
 import { createOmpRuntimeHandshake, captureOmpToolSnapshot } from "./omp/runtime-contract.ts";
@@ -271,7 +271,7 @@ type RemoteConnectOptions = Omit<RemoteConnectRequest, "cwd"> & {
 };
 type RemoteExtensionState = {
   binding: string;
-  client?: RemoteRuntimeClient;
+  client?: RemoteRuntimeClientApi;
   lspDiagnostics?: RemoteLspDiagnostics;
   transaction?: ConnectionTransaction;
   remoteCwd?: string;
@@ -711,7 +711,7 @@ async function executionTarget(
   return target;
 }
 
-function hostEvalInvoker(state: RemoteExtensionState, client: RemoteRuntimeClient, ctx: ExtensionContext): HostToolInvoker {
+function hostEvalInvoker(state: RemoteExtensionState, client: RemoteRuntimeClientApi, ctx: ExtensionContext): HostToolInvoker {
   const binding = state.binding;
   const owner = hostSessionFor(state, ctx);
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1029,7 +1029,7 @@ async function registerActiveWrappers(
 function detachRemoteState(
   state: RemoteExtensionState,
   restoreLocal: boolean,
-): RemoteRuntimeClient | undefined {
+): RemoteRuntimeClientApi | undefined {
   cancelConnectionTransaction(state, "Remote runtime was disconnected");
   const current = state.client;
   state.client = undefined;
@@ -1058,10 +1058,13 @@ async function closeRemoteState(
   const current = detachRemoteState(state, true);
   const attachment = state.threadAttachment;
   state.threadAttachment = undefined;
-  const cleanup = await Promise.allSettled([
-    ...(attachment ? [threadFamilies.detach(attachment.token, attachment.identity)] : []),
-    ...(current ? [current.close(timeoutMs)] : []),
-  ]);
+  // Keep the channel alive until its client's requested shutdown has settled.
+  const pending: Promise<void>[] = current ? [current.close(timeoutMs)] : [];
+  const cleanup = await Promise.allSettled(pending);
+  if (attachment) {
+    const detached = await Promise.allSettled([threadFamilies.detach(attachment.token, attachment.identity)]);
+    cleanup.push(...detached);
+  }
   const failures = cleanup.filter((result): result is PromiseRejectedResult => result.status === "rejected");
   if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Remote member cleanup failed");
 }
@@ -1074,9 +1077,10 @@ export async function closeRemoteFamily(
   threadFamilies.reap();
   const clients = [...family.members]
     .map((member) => detachRemoteState(member, member.owner))
-    .filter((client): client is RemoteRuntimeClient => client !== undefined);
+    .filter((client): client is RemoteRuntimeClientApi => client !== undefined);
   const settled = await Promise.allSettled(
-    [...clients.map((client) => client.close(timeoutMs)), ...[...family.threadMembers ?? []].map(member => member.close())],
+    [...clients.map((client) => client.close(timeoutMs)), ...[...family.threadMembers ?? []].map(member => member.close(timeoutMs)),
+      threadFamilies.closeFamilyResources(family, timeoutMs)],
   );
   const failures = settled.filter(
     (result): result is PromiseRejectedResult => result.status === "rejected",
@@ -1098,7 +1102,7 @@ export async function closeRemoteFamily(
  */
 function bindLaunchCompletionDelivery(
   pi: ExtensionAPI,
-  client: RemoteRuntimeClient,
+  client: RemoteRuntimeClientApi,
 ): void {
   client.onEvent((event) => {
     if (event.event !== "launch-completion") return;
@@ -1124,7 +1128,7 @@ function launchOwnerId(ctx: ExtensionContext | undefined): string | undefined {
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }
 
-type OpenedTransport = { client: RemoteRuntimeClient; ready: ReadyMessage; binding: string; diagnostics?: RemoteLspDiagnostics };
+type OpenedTransport = { client: RemoteRuntimeClientApi; ready: ReadyMessage; binding: string; diagnostics?: RemoteLspDiagnostics };
 
 /** Spawn the SSH worker, run the admission handshake, and bind event delivery.
  * Never mutates session state: only the caller's still-current transaction
@@ -1140,9 +1144,9 @@ async function openRemoteTransport(
   const handshake = await captureOmpHandshake(pi, state, ctx);
   signal?.throwIfAborted();
   const binding = crypto.randomUUID();
-  const client = new RemoteRuntimeClient({
-    command: buildSshWorkerCommand(connection),
-  });
+  const client: RemoteRuntimeClientApi = state.threadAttachment
+    ? await threadFamilies.runtime(state.threadAttachment.token).createClient({ ...connection, cwd })
+    : new RemoteRuntimeClient({ command: buildSshWorkerCommand(connection) });
   try {
     const owner = hostSessionFor(state, ctx);
     const taskDepth = ctx?.agent?.depth ?? 0;
@@ -1173,6 +1177,7 @@ async function openRemoteTransport(
         }
       });
     }
+    client.activateEvents?.();
     return { client, ready, binding, diagnostics };
   } catch (error) {
     client.kill();
@@ -1247,7 +1252,25 @@ async function reconnectRemoteRuntime(
   try {
     await state.persistIntent?.(true);
     assertFamilyTransaction(state, family, transaction);
-    prepared = await prepareRemoteWorker({ ...family.connection, signal: transaction.signal, onProgress: (stage) => ctx?.ui?.setWorkingMessage(stage) });
+    const attachment = state.threadAttachment;
+    if (attachment && threadFamilies.runtimeClosed(attachment.token)) {
+      // Renewal is explicit, generation-bound, and waits for the old owner's cleanup.
+      await threadFamilies.detach(attachment.token, attachment.identity);
+      assertFamilyTransaction(state, family, transaction);
+      const decision = await threadFamilies.reserve(attachment.identity,
+        () => closeThreadMemberTransport(state), family.generation!);
+      if (decision.kind !== "active") throw new Error("Remote family ownership is unavailable during reconnect; local fallback is disabled");
+      try { assertFamilyTransaction(state, family, transaction); }
+      catch (error) {
+        await threadFamilies.detach(decision.token, attachment.identity);
+        throw error;
+      }
+      state.threadAttachment = { token: decision.token, identity: attachment.identity };
+    }
+    const onProgress = (stage: string) => ctx?.ui?.setWorkingMessage(stage);
+    prepared = state.threadAttachment
+      ? await threadFamilies.runtime(state.threadAttachment.token).prepare(transaction.signal, onProgress)
+      : await prepareRemoteWorker({ ...family.connection, signal: transaction.signal, onProgress });
     assertFamilyTransaction(state, family, transaction);
     const connection = { ...family.connection, cwd: family.remoteCwd, workerPath: prepared.workerPath,
       pythonLspPack: prepared.pythonLspPack, typescriptLspPack: prepared.typescriptLspPack, cppLspPack: prepared.cppLspPack };
@@ -1344,6 +1367,11 @@ async function attachFamilyMember(
   }
 }
 
+async function closeThreadMemberTransport(state: RemoteExtensionState): Promise<void> {
+  const client = detachRemoteState(state, false);
+  if (client) await client.close(SESSION_SHUTDOWN_REMOTE_CLOSE_TIMEOUT_MS);
+}
+
 async function attachThreadFamily(pi: ExtensionAPI, state: RemoteExtensionState, ctx: ExtensionContext, transaction: ConnectionTransaction): Promise<boolean> {
   state.selected = true;
   state.connectionError = "Remote family ownership has not been admitted; local fallback is disabled";
@@ -1354,10 +1382,7 @@ async function attachThreadFamily(pi: ExtensionAPI, state: RemoteExtensionState,
     agentId: ref.id, registryGeneration: ref.generation, instanceKey: session.instanceKey, sessionFile: state.sessionFile,
   };
   try {
-    const decision = await threadFamilies.reserve(identity, async () => {
-      const client = detachRemoteState(state, false);
-      if (client) await client.close(SESSION_SHUTDOWN_REMOTE_CLOSE_TIMEOUT_MS);
-    });
+    const decision = await threadFamilies.reserve(identity, () => closeThreadMemberTransport(state));
     if (decision.kind === "active") state.threadAttachment = { token: decision.token, identity };
     assertConnectionTransaction(state, transaction);
     if (decision.kind === "unavailable") {

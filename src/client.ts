@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import {
   PROTOCOL_VERSION,
+  MAX_FRAME_BYTES,
   decodeFrames,
   encodeMessage,
   parseMessage,
@@ -23,13 +24,45 @@ export type SpawnSpec = {
   command: string[];
   cwd?: string;
   env?: Record<string, string>;
+  /** @internal Only owner IPC callbacks return transport delivery acknowledgements. */
+  delivery?: "acknowledged";
 };
+
+export interface RemoteInitializeOptions {
+  sessionId?: string;
+  settings?: RemoteExecutionSettings;
+  outReplies?: boolean;
+  taskDepth?: number;
+  signal?: AbortSignal;
+  resourceBinding?: string;
+}
+
+export interface RemoteExecuteOptions {
+  toolNames?: readonly string[];
+  steeringSignal?: AbortSignal;
+  bashScope?: "job" | "session";
+  onCapture?: (capture: JobCapturePayload) => void;
+  onInvoke?: HostToolInvoker;
+}
+
+export interface RemoteRuntimeClientApi {
+  initialize(cwd: string, handshake: RemoteRuntimeHandshake, timeoutMs?: number, options?: RemoteInitializeOptions): Promise<ReadyMessage>;
+  execute(tool: string, toolCallId: string, args: Record<string, unknown>, signal?: AbortSignal, onUpdate?: (update: unknown) => void, options?: RemoteExecuteOptions): Promise<unknown>;
+  stopService(name: string, instanceId: string): Promise<unknown>;
+  close(timeoutMs?: number): Promise<void>;
+  kill(signal?: NodeJS.Signals): void;
+  waitForExit(): Promise<number | null>;
+  onEvent(listener: (event: EventMessage) => void | Promise<void>): () => void;
+  onClose(listener: (error: Error) => void): () => void;
+  readonly isClosed: boolean;
+  activateEvents?(): void;
+}
 
 type PendingCall = {
   resolve(value: unknown): void;
   reject(error: Error): void;
-  onUpdate?: (update: unknown) => void;
-  onCapture?: (capture: JobCapturePayload) => void;
+  onUpdate?: (update: unknown) => unknown;
+  onCapture?: (capture: JobCapturePayload) => unknown;
   tool?: string;
   signal?: AbortSignal;
   onInvoke?: HostToolInvoker;
@@ -66,8 +99,9 @@ function exitError(code: number | null, signal: NodeJS.Signals | null, outputEnd
     : `Remote runtime exited on signal ${signal}`);
 }
 
-export class RemoteRuntimeClient {
+export class RemoteRuntimeClient implements RemoteRuntimeClientApi {
   readonly #process: ChildProcess;
+  readonly #acknowledgedDelivery: boolean;
   readonly #pending = new Map<string, PendingCall>();
   readonly #ready: Promise<ReadyMessage>;
   #resolveReady?: (message: ReadyMessage) => void;
@@ -79,6 +113,9 @@ export class RemoteRuntimeClient {
   #closePromise?: Promise<void>;
   #nextId = 1;
   readonly #exitPromise: Promise<number | null>;
+  readonly #stdoutRead: Promise<void>;
+  #finishStdout?: () => void;
+  #exitDrain?: Promise<void>;
   readonly #eventListeners = new Set<(event: EventMessage) => void | Promise<void>>();
   readonly #closeListeners = new Set<(error: Error) => void>();
   readonly #invocations = new Map<string, { parentId: string; controller: AbortController }>();
@@ -102,6 +139,7 @@ export class RemoteRuntimeClient {
   }
 
   constructor(spec: SpawnSpec) {
+    this.#acknowledgedDelivery = spec.delivery === "acknowledged";
     const [file, ...args] = spec.command;
     this.#process = spawn(file, args, {
       cwd: spec.cwd,
@@ -120,11 +158,7 @@ export class RemoteRuntimeClient {
     this.#process.once("exit", (code, signal) => {
       this.#exited = true;
       exit.resolve(code);
-      // Descendants that inherited stdio (an SSH mux master, a detached child) can
-      // delay 'close' indefinitely. A worker writes nothing after exit, and what it
-      // wrote earlier but the host has not read is bounded by the pipe's capacity,
-      // which one read pass drains: after one turn, fail what is still pending.
-      setImmediate(() => this.#close(exitError(code, signal, this.#outputEnded)));
+      this.#settleAfterOutputDrain(code, signal);
     });
     // Failed spawns have no process and do not emit an exit event.
     this.#process.once("error", (error) => {
@@ -135,10 +169,11 @@ export class RemoteRuntimeClient {
       this.#terminate(error);
     });
     this.#process.once("close", (code, signal) => {
-      this.#close(exitError(code, signal, this.#outputEnded));
+      this.#settleAfterOutputDrain(code, signal);
     });
     this.#process.stdin?.on("error", (error) => this.#terminate(error));
-    void this.#readStdout().catch((error) => this.#terminate(error));
+    this.#stdoutRead = this.#readStdout();
+    void this.#stdoutRead.catch((error) => this.#terminate(error));
     void this.#readStderr().catch((error) => this.#terminate(error));
   }
 
@@ -151,7 +186,7 @@ export class RemoteRuntimeClient {
     cwd: string,
     handshake: RemoteRuntimeHandshake,
     timeoutMs = 15_000,
-    options: { sessionId?: string; settings?: RemoteExecutionSettings; outReplies?: boolean; taskDepth?: number; signal?: AbortSignal; resourceBinding?: string } = {},
+    options: RemoteInitializeOptions = {},
   ): Promise<ReadyMessage> {
     const abort = () => {
       const error = options.signal?.reason instanceof Error
@@ -197,7 +232,13 @@ export class RemoteRuntimeClient {
       if (options.resourceBinding !== undefined && ready.resourceBinding !== options.resourceBinding) {
         throw new Error("Remote runtime resource binding mismatch");
       }
-      handshake.validateReady(ready);
+      await handshake.validateReady(ready);
+      if (options.signal?.aborted) {
+        throw options.signal.reason instanceof Error
+          ? options.signal.reason
+          : new Error("Remote runtime initialization aborted");
+      }
+      if (this.#closed) throw new Error("Remote runtime closed");
       return ready;
     } catch (error) {
       // close() intentionally rejects ready while graceful shutdown is pending.
@@ -216,7 +257,7 @@ export class RemoteRuntimeClient {
     args: Record<string, unknown>,
     signal?: AbortSignal,
     onUpdate?: (update: unknown) => void,
-    options: { toolNames?: readonly string[]; steeringSignal?: AbortSignal; bashScope?: "job" | "session"; onCapture?: (capture: JobCapturePayload) => void; onInvoke?: HostToolInvoker } = {},
+    options: RemoteExecuteOptions = {},
   ): Promise<unknown> {
     if (this.#closed) throw new Error("Remote runtime is disconnected");
     if (signal?.aborted) {
@@ -305,8 +346,8 @@ export class RemoteRuntimeClient {
     }
   }
 
-  kill(): void {
-    this.#terminate(new Error("Remote runtime killed"));
+  kill(signal: NodeJS.Signals = "SIGTERM"): void {
+    this.#terminate(new Error("Remote runtime killed"), signal);
   }
 
   #send(message: Request): void {
@@ -315,18 +356,109 @@ export class RemoteRuntimeClient {
   }
 
   async #readStdout(): Promise<void> {
-    if (!this.#process.stdout) return;
-    for await (const line of decodeFrames(this.#process.stdout)) {
-      if (line.trim()) this.#handle(parseMessage(line));
+    const stdout = this.#process.stdout;
+    if (!stdout) return;
+    // Read the pipe independently of delivery ACKs. Otherwise a withheld capture
+    // callback can stop the worker flushing its final result before process exit.
+    let chunks: Uint8Array[] = [];
+    let queuedBytes = 0;
+    let snapshotBytes = 0;
+    let ended = false;
+    let failure: Error | undefined;
+    let changed = Promise.withResolvers<void>();
+    const finish = () => {
+      ended = true;
+      changed.resolve();
+    };
+    this.#finishStdout = () => {
+      // Freeze a finite readable snapshot after exit. Later descendant writes
+      // cannot extend this boundary, even if they keep the descriptor active.
+      stdout.pause();
+      snapshotBytes = stdout.readableLength;
+      finish();
+    };
+    const onData = (chunk: Buffer) => {
+      if (ended) return;
+      chunks.push(chunk);
+      queuedBytes += chunk.byteLength;
+      if (queuedBytes >= MAX_FRAME_BYTES) stdout.pause();
+      changed.resolve();
+    };
+    const onEnd = () => {
+      this.#outputEnded = true;
+      finish();
+    };
+    const onError = (error: Error) => {
+      failure = error;
+      finish();
+    };
+    stdout.on("data", onData);
+    stdout.once("end", onEnd);
+    stdout.once("error", onError);
+    async function* input(source: NonNullable<ChildProcess["stdout"]>): AsyncGenerator<Uint8Array> {
+      while (chunks.length > 0 || snapshotBytes > 0 || !ended) {
+        if (chunks.length > 0) {
+          const chunk = chunks.shift()!;
+          yield chunk;
+          queuedBytes -= chunk.byteLength;
+          if (!ended && queuedBytes <= MAX_FRAME_BYTES / 2) source.resume();
+        } else if (snapshotBytes > 0) {
+          // Data events from this explicit read are ignored after finish().
+          // Never read beyond the byte count frozen at the exit boundary.
+          const chunk = source.read(snapshotBytes) as Buffer | null;
+          if (!chunk) throw new Error("Remote runtime stdout snapshot became unavailable");
+          snapshotBytes -= chunk.byteLength;
+          yield chunk;
+        } else if (!ended) {
+          await changed.promise;
+          changed = Promise.withResolvers<void>();
+        }
+      }
+      if (failure) throw failure;
     }
-    // No result can follow EOF. A dying worker reports its own exit status; one
-    // still running without its output channel cannot serve the session, so stop
-    // it and let the exit handler fail what is pending.
-    this.#outputEnded = true;
-    if (!this.#closed && !this.#exited && !this.#killSent) {
-      this.#killSent = true;
-      this.#process.kill();
+    try {
+      for await (const line of decodeFrames(input(stdout))) {
+        if (line.trim()) await this.#handle(parseMessage(line));
+      }
+      // Real EOF makes further results impossible even if the worker ignores
+      // SIGTERM. Settle the protocol now; waitForExit still tracks actual exit.
+      // Synthetic exit snapshots retain the shared process-exit drain fence.
+      if (this.#outputEnded && !this.#closed && !this.#exited) {
+        this.#terminate(new Error("Remote runtime output stream ended"));
+      }
+    } finally {
+      stdout.off("data", onData);
+      stdout.off("end", onEnd);
+      stdout.off("error", onError);
+      this.#finishStdout = undefined;
     }
+  }
+
+  #settleAfterOutputDrain(code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.#exitDrain) return;
+    this.#exitDrain = (async () => {
+      // One read turn admits already-written pipe data without waiting for EOF.
+      // Then freeze the readable backlog: an inherited writer cannot prolong
+      // acquisition indefinitely, and parser delivery ACKs remain independent.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      this.#finishStdout?.();
+      // Both child 'exit' and 'close' share this parser fence. Await delivery
+      // ACKs and buffered final frames, never unsolicited listeners or invokes.
+      try {
+        await this.#stdoutRead;
+        this.#close(exitError(code, signal, this.#outputEnded));
+      } catch (error) {
+        this.#terminate(error);
+      } finally {
+        // The child has been reaped and protocol delivery has settled. Release
+        // our pipe endpoints without waiting for inherited descendant handles.
+        // Close first so stderr's premature-close rejection cannot win the cause.
+        this.#process.stdin?.destroy();
+        this.#process.stdout?.destroy();
+        this.#process.stderr?.destroy();
+      }
+    })();
+    void this.#exitDrain.catch(error => this.#terminate(error));
   }
 
   async #readStderr(): Promise<void> {
@@ -346,10 +478,10 @@ export class RemoteRuntimeClient {
   }
 
 
-  #handle(message: Message): void {
+  async #handle(message: Message): Promise<void> {
     if (message.type === "invoke") {
-      // Never await a callback in the frame reader: it may execute another
-      // native worker tool while the originating Eval waits for its reply.
+      // Never await Eval invocation completion in the frame reader: it may run
+      // another native worker tool while the originating Eval awaits its reply.
       void this.#invoke(message);
       return;
     }
@@ -372,12 +504,19 @@ export class RemoteRuntimeClient {
       }
       return;
     }
-    if (message.type === "capture") {
-      this.#pending.get(message.id)?.onCapture?.(message.capture);
-      return;
-    }
-    if (message.type === "update") {
-      this.#pending.get(message.id)?.onUpdate?.(message.result);
+    if (message.type === "capture" || message.type === "update") {
+      const pending = this.#pending.get(message.id);
+      const delivery: unknown = message.type === "capture"
+        ? pending?.onCapture?.(message.capture)
+        : pending?.onUpdate?.(message.result);
+      // Only the owner's IPC seam supplies delivery ACKs. Direct observers may
+      // await another request on this client and must never fence its reader.
+      if (this.#acknowledgedDelivery) await Promise.resolve(delivery);
+      else if (delivery !== null && (typeof delivery === "object" || typeof delivery === "function")) {
+        // Assimilation safely consumes PromiseLike rejections and throwing
+        // `then` getters; ordinary observer return values have no effect.
+        void Promise.resolve(delivery).catch(() => {});
+      }
       return;
     }
     if (message.type === "result") {
@@ -440,11 +579,11 @@ export class RemoteRuntimeClient {
     }
   }
 
-  #terminate(error: unknown): void {
+  #terminate(error: unknown, signal: NodeJS.Signals = "SIGTERM"): void {
     const failure = error instanceof Error ? error : new Error(String(error));
-    if (!this.#exited && !this.#killSent) {
+    if (!this.#exited && (!this.#killSent || signal === "SIGKILL")) {
       this.#killSent = true;
-      this.#process.kill();
+      this.#process.kill(signal);
     }
     this.#close(failure);
   }

@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RemoteRuntimeClient } from "../src/client.ts";
+import { RemoteRuntimeClient, type SpawnSpec } from "../src/client.ts";
 import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
 import { PROTOCOL_VERSION, TOOL_RUNTIME_VERSION, type InitializeRequest } from "../src/protocol.ts";
 
@@ -20,11 +20,12 @@ async function deadline<T>(promise: Promise<T>, label: string, timeoutMs = 5_000
   }
 }
 
-async function withClient(fixture: string | readonly string[], run: (client: RemoteRuntimeClient) => Promise<void>, mode?: string): Promise<void> {
+async function withClient(fixture: string | readonly string[], run: (client: RemoteRuntimeClient) => Promise<void>, mode?: string, delivery?: SpawnSpec["delivery"]): Promise<void> {
   const client = new RemoteRuntimeClient({
     command: typeof fixture === "string"
       ? [process.execPath, join(import.meta.dir, "fixtures", fixture), ...(mode ? [mode] : [])]
       : [...fixture],
+    ...(delivery ? { delivery } : {}),
   });
   try {
     await run(client);
@@ -34,8 +35,8 @@ async function withClient(fixture: string | readonly string[], run: (client: Rem
   }
 }
 
-function lifecycle(mode: string, run: (client: RemoteRuntimeClient) => Promise<void>): Promise<void> {
-  return withClient("lifecycle-worker.ts", run, mode);
+function lifecycle(mode: string, run: (client: RemoteRuntimeClient) => Promise<void>, delivery?: SpawnSpec["delivery"]): Promise<void> {
+  return withClient("lifecycle-worker.ts", run, mode, delivery);
 }
 
 describe("remote runtime disconnects", () => {
@@ -213,6 +214,257 @@ describe("remote runtime disconnects", () => {
     });
   });
 
+  test("awaits asynchronous ready validation before initialization resolves", async () => {
+    await lifecycle("normal", async client => {
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let initialized = false;
+      const initializing = client.initialize("/remote/workspace", {
+        ...OMP_RUNTIME_HANDSHAKE,
+        async validateReady(ready) {
+          await OMP_RUNTIME_HANDSHAKE.validateReady(ready);
+          entered.resolve();
+          await release.promise;
+        },
+      });
+      void initializing.then(() => { initialized = true; }, () => {});
+      try {
+        await deadline(entered.promise, "asynchronous ready validation entry");
+        expect(initialized).toBe(false);
+        release.resolve();
+        await deadline(initializing, "asynchronous ready validation delivery");
+        expect(initialized).toBe(true);
+      } finally {
+        release.resolve();
+      }
+    });
+  });
+
+  test("asynchronous ready validation failure terminates initialization", async () => {
+    await lifecycle("normal", async client => {
+      await expect(client.initialize("/remote/workspace", {
+        ...OMP_RUNTIME_HANDSHAKE,
+        async validateReady() { throw new Error("asynchronous admission rejected"); },
+      })).rejects.toThrow("asynchronous admission rejected");
+      expect(client.isClosed).toBe(true);
+      await deadline(client.waitForExit(), "asynchronous admission failure exit");
+    });
+  });
+
+  for (const transition of ["abort", "close"] as const) {
+    test(`${transition} during asynchronous ready validation cannot admit a closed client`, async () => {
+      await lifecycle("normal", async client => {
+        const entered = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        const controller = new AbortController();
+        const initializing = client.initialize("/remote/workspace", {
+          ...OMP_RUNTIME_HANDSHAKE,
+          async validateReady(ready) {
+            await OMP_RUNTIME_HANDSHAKE.validateReady(ready);
+            entered.resolve();
+            await release.promise;
+          },
+        }, undefined, { signal: controller.signal });
+        void initializing.catch(() => {});
+        try {
+          await deadline(entered.promise, `${transition} held-validator entry`);
+          let closing: Promise<void> | undefined;
+          const reason = new Error("cancelled during ready validation");
+          if (transition === "abort") controller.abort(reason);
+          else {
+            closing = client.close();
+            void closing.catch(() => {});
+          }
+          expect(client.isClosed).toBe(true);
+          release.resolve();
+          await expect(deadline(initializing, `${transition} held-validator rejection`)).rejects.toThrow(
+            transition === "abort" ? reason.message : "Remote runtime closed",
+          );
+          if (closing) {
+            await deadline(closing, "graceful close during ready validation");
+            expect(await client.waitForExit()).toBe(0);
+          } else {
+            await deadline(client.waitForExit(), "abort during ready validation process exit");
+          }
+        } finally {
+          release.resolve();
+        }
+      });
+    });
+  }
+
+  test("SIGKILL escalates a prior kill when the worker ignores SIGTERM", async () => {
+    await lifecycle("ignore-sigterm", async client => {
+      const worker = Promise.withResolvers<number>();
+      client.onEvent(event => {
+        if (typeof event.payload.workerPid === "number") worker.resolve(event.payload.workerPid);
+      });
+      await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+      const pid = await deadline(worker.promise, "SIGTERM-resistant worker readiness");
+      try {
+        client.kill();
+        expect(client.isClosed).toBe(true);
+        client.kill("SIGKILL");
+        await deadline(client.waitForExit(), "SIGKILL escalation exit");
+      } finally {
+        // Native cleanup must remain effective even if escalation regresses.
+        try { process.kill(pid, "SIGKILL"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      }
+    });
+  });
+
+  for (const channel of ["update", "capture"] as const) {
+    test(`awaits asynchronous ${channel} delivery before settling its final result`, async () => {
+      await lifecycle(`delivery-${channel}`, async client => {
+        await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+        const entered = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        let delivered = false;
+        let settled = false;
+        const deliver = async () => {
+          entered.resolve();
+          await release.promise;
+          delivered = true;
+        };
+        const pending = client.execute("read", `await-${channel}`, { path: "file.txt" }, undefined,
+          channel === "update" ? deliver : undefined,
+          channel === "capture" ? { onCapture: deliver } : {});
+        void pending.then(() => { settled = true; }, () => { settled = true; });
+        try {
+          await deadline(entered.promise, `${channel} delivery entry`);
+          await new Promise<void>(resolve => setImmediate(resolve));
+          expect(settled).toBe(false);
+          release.resolve();
+          expect(await deadline(pending, `${channel} delivery completion`)).toEqual({ delivered: true });
+          expect(delivered).toBe(true);
+        } finally {
+          release.resolve();
+        }
+      }, "acknowledged");
+    });
+
+    test(`an asynchronous ${channel} delivery failure rejects execution and stops the worker`, async () => {
+      await lifecycle(`delivery-${channel}`, async client => {
+        await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+        const rejectDelivery = async () => { throw new Error(`${channel} delivery failed`); };
+        const pending = client.execute("read", `reject-${channel}`, { path: "file.txt" }, undefined,
+          channel === "update" ? rejectDelivery : undefined,
+          channel === "capture" ? { onCapture: rejectDelivery } : {});
+        await expect(pending).rejects.toThrow(`${channel} delivery failed`);
+        expect(client.isClosed).toBe(true);
+        await deadline(client.waitForExit(), `${channel} delivery failure exit`);
+      }, "acknowledged");
+    });
+  }
+
+  test("a direct asynchronous update observer may await another request on the same client", async () => {
+    await lifecycle("delivery-update", async client => {
+      await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+      const observed = Promise.withResolvers<unknown>();
+      const pending = client.execute("read", "direct-observer-parent", { path: "parent.txt" }, undefined, async () => {
+        try {
+          const result = await client.execute("read", "direct-observer-nested", { path: "nested.txt" });
+          observed.resolve(result);
+        } catch (error) {
+          observed.reject(error);
+        }
+      });
+      void pending.catch(() => {});
+      void observed.promise.catch(() => {});
+      expect(await deadline(pending, "direct observer parent result")).toEqual({ delivered: true });
+      expect(await deadline(observed.promise, "same-client observer nested result")).toEqual({ delivered: true });
+      expect(client.isClosed).toBe(false);
+    });
+  });
+
+  for (const channel of ["update", "capture"] as const) {
+    test(`a direct asynchronous ${channel} observer rejection does not reject execution`, async () => {
+      await lifecycle(`delivery-${channel}`, async client => {
+        await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+        const observer = async () => { throw new Error(`${channel} observer failed`); };
+        const pending = client.execute("read", `direct-${channel}-rejection`, { path: "file.txt" }, undefined,
+          channel === "update" ? observer : undefined,
+          channel === "capture" ? { onCapture: observer } : {});
+        expect(await deadline(pending, `direct ${channel} result after observer rejection`)).toEqual({ delivered: true });
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(client.isClosed).toBe(false);
+      });
+    });
+  }
+
+  for (const delivery of [undefined, "acknowledged"] as const) {
+    for (const channel of ["update", "capture"] as const) {
+      const mode = delivery ?? "direct";
+      test(`${mode} ${channel} observers may return array.push's numeric result`, async () => {
+        await lifecycle(`delivery-${channel}`, async client => {
+          await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+          const observations: unknown[] = [];
+          const observer = (value: unknown) => observations.push(value);
+          const pending = client.execute("read", `${mode}-${channel}-numeric`, { path: "file.txt" }, undefined,
+            channel === "update" ? observer : undefined,
+            channel === "capture" ? { onCapture: observer } : {});
+          expect(await deadline(pending, `${mode} ${channel} numeric callback result`)).toEqual({ delivered: true });
+          expect(observations).toEqual(channel === "update"
+            ? [{ phase: "delivering" }]
+            : [{ kind: "output", start: 0, end: 8, text: "captured", open: false }]);
+          expect(client.isClosed).toBe(false);
+        }, delivery);
+      });
+
+      test(`${mode} ${channel} observers assimilate rejected non-Promise thenables`, async () => {
+        await lifecycle(`delivery-${channel}`, async client => {
+          await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+          const assimilated = Promise.withResolvers<void>();
+          const failure = new Error(`${mode} ${channel} thenable rejected`);
+          const observer = () => ({
+            then(_resolve: (value: unknown) => void, reject: (reason: unknown) => void) {
+              assimilated.resolve();
+              reject(failure);
+            },
+          });
+          const pending = client.execute("read", `${mode}-${channel}-thenable`, { path: "file.txt" }, undefined,
+            channel === "update" ? observer : undefined,
+            channel === "capture" ? { onCapture: observer } : {});
+          void pending.catch(() => {});
+          await deadline(assimilated.promise, `${mode} ${channel} thenable assimilation`);
+          if (delivery === "acknowledged") {
+            await expect(pending).rejects.toThrow(failure.message);
+            expect(client.isClosed).toBe(true);
+            await deadline(client.waitForExit(), `${mode} ${channel} thenable failure exit`);
+          } else {
+            expect(await deadline(pending, `${mode} ${channel} result despite thenable rejection`)).toEqual({ delivered: true });
+            await new Promise<void>(resolve => setImmediate(resolve));
+            expect(client.isClosed).toBe(false);
+          }
+        }, delivery);
+      });
+    }
+  }
+
+  test("does not await an Eval invocation before reading its parent's final result", async () => {
+    await lifecycle("invoke-pending", async client => {
+      await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+      const entered = Promise.withResolvers<AbortSignal>();
+      const release = Promise.withResolvers<void>();
+      const pending = client.execute("eval", "pending-invocation", { code: "nested call" }, undefined, undefined, {
+        async onInvoke(_invocation, signal) {
+          entered.resolve(signal);
+          await release.promise;
+          return { late: true };
+        },
+      });
+      void pending.catch(() => {});
+      try {
+        const signal = await deadline(entered.promise, "Eval invocation entry");
+        expect(await deadline(pending, "Eval result with invocation outstanding")).toEqual({ delivered: true });
+        expect(signal.aborted).toBe(true);
+      } finally {
+        release.resolve();
+      }
+    });
+  });
+
   for (const mode of ["wrong-binding", "missing-binding"]) {
     test(`rejects and terminates a worker with ${mode} before admitting its tools`, async () => {
       await lifecycle(mode, async (client) => {
@@ -301,8 +553,9 @@ describe("native worker fatal lifecycle", () => {
 
 describe("transport settlement before inherited pipe closure", () => {
   async function withTransportWorker(
-    mode: "stdout-eof" | "exit-pending" | "exit-result",
-    run: (client: RemoteRuntimeClient, descendant: Promise<number>) => Promise<void>,
+    mode: "stdout-eof" | "stdout-eof-ignore-sigterm" | "exit-pending" | "exit-result" | "exit-capture-result" | "exit-capture-result-no-descendant" | "exit-chatty-descendant",
+    run: (client: RemoteRuntimeClient, descendant: Promise<number>, worker: string) => Promise<void>,
+    delivery?: SpawnSpec["delivery"],
   ): Promise<void> {
     const { writeFile } = await import("node:fs/promises");
     const root = await mkdtemp(join(tmpdir(), "omp-transport-settlement-"));
@@ -318,7 +571,21 @@ const server = createServer();
 server.listen(process.argv[1] + ".sock", async () => {
   await writeFile(process.argv[1], String(process.pid));
   process.send?.({ ready: true });
-  process.disconnect?.();
+  if (process.argv[2] === "chatty") {
+    process.once("message", () => {
+      process.disconnect?.();
+      process.stdout.on("error", () => {});
+      // Ignorable frames keep a finite byte snapshot valid even at a partial line.
+      const frame = " ".repeat(4096) + "\n";
+      const pump = () => {
+        while (process.stdout.write(frame.repeat(16))) {}
+        process.stdout.once("drain", pump);
+      };
+      pump();
+    });
+  } else {
+    process.disconnect?.();
+  }
 });`;
     await writeFile(worker, String.raw`import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -326,9 +593,10 @@ import { closeSync, writeSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { encodeMessage, PROTOCOL_VERSION, REMOTE_TOOL_NAMES, TOOL_RUNTIME_VERSION } from ` + JSON.stringify(join(import.meta.dir, "../src/protocol.ts")) + String.raw`;
 const mode = ` + JSON.stringify(mode) + String.raw`;
+if (mode === "stdout-eof-ignore-sigterm") process.on("SIGTERM", () => {});
 // Bun keeps fd 1 open after stdout.end(), so the EOF mode speaks the protocol on
 // fd 3, the pipe's only reference, which it can genuinely close while staying alive.
-const send = mode === "stdout-eof"
+const send = mode.startsWith("stdout-eof")
   ? async message => { writeSync(3, encodeMessage(message)); }
   : message => new Promise((resolve, reject) => {
     process.stdout.write(encodeMessage(message), error => error ? reject(error) : resolve());
@@ -342,22 +610,33 @@ for await (const line of createInterface({ input: process.stdin })) {
       tools: REMOTE_TOOL_NAMES.map(name => ({ name, description: name, parameters: { type: "object" } })) });
   }
   if (request.type !== "execute") continue;
-  if (mode === "stdout-eof") {
+  if (mode.startsWith("stdout-eof")) {
+    if (mode === "stdout-eof-ignore-sigterm") {
+      await send({ type: "event", event: "launch-completion", payload: { workerPid: process.pid } });
+    }
     closeSync(3);
     continue;
   }
-  const child = spawn(process.execPath, ["-e", ` + JSON.stringify(holder) + ", " + JSON.stringify(descendantFile) + String.raw`], {
-    stdio: ["ignore", process.stdout, process.stderr, "ipc"],
-  });
-  await once(child, "message");
-  await send({ type: "event", event: "launch-completion", payload: { descendantPid: child.pid } });
-  if (mode === "exit-result") {
+  if (mode !== "exit-capture-result-no-descendant") {
+    const child = spawn(process.execPath, ["-e", ` + JSON.stringify(holder) + ", " + JSON.stringify(descendantFile) + String.raw`, mode === "exit-chatty-descendant" ? "chatty" : "silent"], {
+      stdio: ["ignore", process.stdout, process.stderr, "ipc"],
+    });
+    await once(child, "message");
+    await send({ type: "event", event: "launch-completion", payload: { descendantPid: child.pid } });
+    if (mode === "exit-chatty-descendant") child.send("start");
+  }
+  if (mode.startsWith("exit-capture-result")) {
+    await send({ type: "event", event: "launch-completion", payload: { completionId: "unrelated-listener" } });
+    await send({ type: "capture", id: request.id,
+      capture: { kind: "output", start: 0, end: 8, text: "captured", open: false } });
+    await send({ type: "result", id: request.id, result: "x".repeat(4 * 1024 * 1024) });
+  } else if (mode === "exit-result") {
     await send({ type: "result", id: request.id, result: { completedBeforeExit: true } });
   }
   process.exit(27);
 }`);
     try {
-      const command = mode === "stdout-eof"
+      const command = mode.startsWith("stdout-eof")
         ? ["/bin/sh", "-c", 'exec "$0" "$1" 3>&1 1>/dev/null', process.execPath, worker]
         : [process.execPath, worker];
       await withClient(command, async client => {
@@ -369,8 +648,8 @@ for await (const line of createInterface({ input: process.stdin })) {
           }
         });
         await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
-        await run(client, descendant.promise);
-      });
+        await run(client, descendant.promise, worker);
+      }, undefined, delivery);
     } finally {
       try {
         // The marker also covers a failure before the ready event reaches the host.
@@ -401,6 +680,31 @@ for await (const line of createInterface({ input: process.stdin })) {
     });
   }, 15_000);
 
+  test("stdout EOF rejects pending execution before a SIGTERM-resistant worker exits", async () => {
+    await withTransportWorker("stdout-eof-ignore-sigterm", async client => {
+      const worker = Promise.withResolvers<number>();
+      client.onEvent(event => {
+        if (typeof event.payload.workerPid === "number") worker.resolve(event.payload.workerPid);
+      });
+      let exited = false;
+      void client.waitForExit().then(() => { exited = true; });
+      const pending = client.execute("read", "stdout-eof-ignore-sigterm", { path: "pending.txt" });
+      void pending.catch(() => {});
+      try {
+        const pid = await deadline(worker.promise, "output-less resistant worker identity");
+        await expect(deadline(pending, "EOF rejection before forced process exit")).rejects.toThrow("output stream ended");
+        expect(client.isClosed).toBe(true);
+        expect(exited).toBe(false);
+        expect(() => process.kill(pid, 0)).not.toThrow();
+      } finally {
+        // This is the first SIGKILL: pending must already have rejected above
+        // while the real worker remained alive and its exit promise unresolved.
+        client.kill("SIGKILL");
+        await deadline(client.waitForExit(), "output-less resistant worker cleanup");
+      }
+    });
+  }, 15_000);
+
   test("worker exit rejects pending execution before its descendant releases inherited pipes", async () => {
     await withTransportWorker("exit-pending", async (client, descendant) => {
       const pending = client.execute("read", "exit-pending", { path: "pending.txt" });
@@ -410,6 +714,63 @@ for await (const line of createInterface({ input: process.stdin })) {
       await expect(deadline(pending, "pending execution rejection after worker exit")).rejects.toThrow("exited with code 27");
       expect(client.isClosed).toBe(true);
       expect(() => process.kill(pid, 0)).not.toThrow();
+    });
+  }, 15_000);
+
+  test("an inherited descendant writing continuously cannot extend the exit drain boundary", async () => {
+    await withTransportWorker("exit-chatty-descendant", async (client, descendant) => {
+      const pending = client.execute("read", "chatty-descendant", { path: "pending.txt" });
+      void pending.catch(() => {});
+      const pid = await deadline(descendant, "continuously writing descendant readiness");
+      expect(await deadline(client.waitForExit(), "worker exit with continuously inherited output")).toBe(27);
+      await expect(deadline(pending, "finite inherited-output snapshot")).rejects.toThrow("exited with code 27");
+      expect(client.isClosed).toBe(true);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    });
+  }, 15_000);
+
+  test("exit-drain disposal lets the client host exit while an inherited writer remains alive", async () => {
+    await withTransportWorker("exit-chatty-descendant", async (_client, _descendant, worker) => {
+      const { writeFile } = await import("node:fs/promises");
+      const probe = join(worker, "..", "client-probe.ts");
+      const report = join(worker, "..", "client-probe.json");
+      await writeFile(probe, `
+import { writeFile } from "node:fs/promises";
+import { RemoteRuntimeClient } from ${JSON.stringify(join(import.meta.dir, "../src/client.ts"))};
+import { OMP_RUNTIME_HANDSHAKE } from ${JSON.stringify(join(import.meta.dir, "../src/omp/runtime-contract.ts"))};
+const client = new RemoteRuntimeClient({ command: [process.execPath, ${JSON.stringify(worker)}] });
+let descendantPid;
+client.onEvent(event => {
+  if (typeof event.payload.descendantPid === "number") descendantPid = event.payload.descendantPid;
+});
+await client.initialize("/remote/workspace", OMP_RUNTIME_HANDSHAKE);
+let failure;
+try {
+  await client.execute("read", "disposal-probe", { path: "pending.txt" });
+  throw new Error("execution unexpectedly resolved");
+} catch (error) {
+  failure = String(error);
+}
+const exitCode = await client.waitForExit();
+await writeFile(${JSON.stringify(report)}, JSON.stringify({ descendantPid, exitCode, failure }));
+// No process.exit(), kill(), or close(): natural host exit proves pipe disposal.
+`);
+      const host = spawn(process.execPath, [probe], { stdio: ["ignore", "ignore", "pipe"] });
+      let stderr = "";
+      host.stderr?.on("data", chunk => { stderr += String(chunk); });
+      const exited = once(host, "exit");
+      try {
+        const [code, signal] = await deadline(exited, "natural client-host exit after drain disposal");
+        expect({ code, signal, stderr }).toEqual({ code: 0, signal: null, stderr: "" });
+        const result = JSON.parse(await readFile(report, "utf8"));
+        expect(result.exitCode).toBe(27);
+        expect(result.failure).toContain("exited with code 27");
+        expect(typeof result.descendantPid).toBe("number");
+        expect(() => process.kill(result.descendantPid, 0)).not.toThrow();
+      } finally {
+        if (host.exitCode === null && host.signalCode === null) host.kill("SIGKILL");
+        await deadline(exited, "client-host probe cleanup");
+      }
     });
   }, 15_000);
 
@@ -423,4 +784,59 @@ for await (const line of createInterface({ input: process.stdin })) {
       expect(() => process.kill(pid, 0)).not.toThrow();
     });
   }, 15_000);
+
+  for (const inheritedPipes of [false, true]) {
+    test(`a withheld capture ACK preserves the exact 4 MiB final result after exit ${inheritedPipes ? "with" : "without"} inherited pipes`, async () => {
+      const mode = inheritedPipes ? "exit-capture-result" : "exit-capture-result-no-descendant";
+      await withTransportWorker(mode, async (client, descendant) => {
+        const entered = Promise.withResolvers<void>();
+        const releaseCapture = Promise.withResolvers<void>();
+        const releaseEvent = Promise.withResolvers<void>();
+        let captureDelivered = false;
+        let settled = false;
+        let closeCalls = 0;
+        client.onClose(() => { closeCalls++; });
+        client.onEvent(event => {
+          if (event.payload.completionId === "unrelated-listener") return releaseEvent.promise;
+        });
+        const pending = client.execute("read", "capture-before-final-result", { path: "large.txt" }, undefined, undefined, {
+          async onCapture(capture) {
+            expect(capture).toEqual({ kind: "output", start: 0, end: 8, text: "captured", open: false });
+            entered.resolve();
+            await releaseCapture.promise;
+            captureDelivered = true;
+          },
+        });
+        void pending.then(() => { settled = true; }, () => { settled = true; });
+        try {
+          await deadline(entered.promise, "withheld capture callback entry");
+          // The worker must flush all 4 MiB and actually exit while delivery is
+          // withheld. Neither an exit callback nor a subsequent close may reject.
+          expect(await deadline(client.waitForExit(), "worker exit before capture ACK")).toBe(27);
+          await new Promise<void>(resolve => setImmediate(resolve));
+          await new Promise<void>(resolve => setImmediate(resolve));
+          expect(settled).toBe(false);
+          expect(closeCalls).toBe(0);
+          expect(captureDelivered).toBe(false);
+          releaseCapture.resolve();
+          const result = await deadline(pending, "buffered 4 MiB result after capture ACK");
+          expect(captureDelivered).toBe(true);
+          expect(typeof result).toBe("string");
+          expect((result as string).length).toBe(4 * 1024 * 1024);
+          expect(result).toBe("x".repeat(4 * 1024 * 1024));
+          const closed = Promise.withResolvers<void>();
+          client.onClose(() => { closed.resolve(); });
+          await deadline(closed.promise, "parser-drained transport closure");
+          expect(closeCalls).toBe(1);
+          if (inheritedPipes) {
+            const pid = await deadline(descendant, "capture result descendant readiness");
+            expect(() => process.kill(pid, 0)).not.toThrow();
+          }
+        } finally {
+          releaseCapture.resolve();
+          releaseEvent.resolve();
+        }
+      }, "acknowledged");
+    }, 15_000);
+  }
 });

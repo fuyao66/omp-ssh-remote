@@ -1,11 +1,13 @@
 // Native TaskTool acceptance; build with build-smoke.ts, launch with run-task-acceptance.ts.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { isMainThread, threadId } from "node:worker_threads";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { runSubagentFollowUpTurn } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { isLocalAgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
+import { z } from "@oh-my-pi/omptype/zod";
 import { bootstrapSmokeHost } from "./smoke-host.ts";
 
 export default async function taskSmoke(pi: ExtensionAPI) {
@@ -23,6 +25,89 @@ export default async function taskSmoke(pi: ExtensionAPI) {
     models: [{ id: "probe", name: "Deterministic task probe", reasoning: false, input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 256 }],
   });
+  const nativeSessions = new Map<string, any>();
+  pi.registerTool({
+    name: "task_acceptance_capture",
+    label: "Task acceptance capture",
+    description: "Measure retained output and pipe windows in this isolated native worker fixture.",
+    parameters: z.object({}),
+    loadMode: "essential",
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      assert(ctx?.agent.kind === "sub" && !isMainThread && threadId > 0, "Capture measurement must execute inside the actual native worker");
+      const native = nativeSessions.get(ctx.agent.id);
+      assert(native && isLocalAgentSession(native));
+      const manager = native.asyncJobManager;
+      assert(manager, "The native worker session must inherit its root async-job manager");
+      const originalBridge = native.clientBridge;
+      native.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
+      let jobId: string | undefined;
+      const deadline = Promise.withResolvers<never>();
+      const timer = setTimeout(() => deadline.reject(new Error("Native worker capture did not settle in 40s")), 40_000);
+      try {
+        const sentinel = `TASK_CAPTURE_END_${run}`;
+        const command = `python3 -c 'import sys; sys.stdout.write("X" * (3 * 1024 * 1024) + "\\n${sentinel}\\n")' | cat`;
+        const bash = native.getToolByName("bash");
+        assert(bash, "The native worker session must expose its remote Bash wrapper");
+        const result = await bash.execute(crypto.randomUUID(),
+          { command, async: true, timeout: 0 }, signal, undefined,
+          { ...ctx, hasUI: false, settings: native.settings, sessionManager: native.sessionManager,
+            toolNames: pi.getActiveTools(), hasQueuedMessages: () => ctx.hasPendingMessages() });
+        assert(!result.isError, JSON.stringify(result));
+        const registeredId = result.details?.async?.jobId;
+        assert(typeof registeredId === "string", "The actual remote Bash wrapper must register a native background job");
+        jobId = registeredId;
+        const pending = manager.getJob(registeredId); assert(pending);
+        manager.watchJobs([registeredId]);
+        await Promise.race([pending.promise, deadline.promise]);
+        // Worker getJob() returns a wire snapshot, not a live mutable job.
+        // Re-fetch after settlement; local capture inputs stay on this proxy.
+        const job = manager.getJob(registeredId); assert(job);
+        assert.equal(job.status, "completed", job.errorText ?? "Capture job failed");
+        const sources = job.widgetInputs?.sources(); assert(sources);
+        const output = sources.find((source: any) => source.id === "out")?.read(0);
+        const pipe = sources.find((source: any) => source.id === "pipe:1")?.read(0);
+        assert(output && pipe, "Native retained output and pipe sources are both required");
+        const suffix = `\n${sentinel}\n`;
+        const emittedBytes = 3 * 1024 * 1024 + Buffer.byteLength(suffix, "utf8");
+        const emittedUnits = 3 * 1024 * 1024 + suffix.length;
+        const outputUnits = 256 * 1024, pipeBytes = 1024 * 1024;
+        // Expected retained content comes only from the fixture's known ASCII
+        // producer, never from a slice of the observed output or pipe source.
+        const expectedOutput = "X".repeat(outputUnits - suffix.length) + suffix;
+        const expectedPipe = "X".repeat(pipeBytes - Buffer.byteLength(suffix, "utf8")) + suffix;
+        const hash = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
+        const outputHash = hash(output.text), pipeHash = hash(pipe.text);
+        const expectedOutputHash = hash(expectedOutput), expectedPipeHash = hash(expectedPipe);
+        assert.equal(output.text.length, outputUnits, "Output window is measured in UTF-16 units");
+        assert.equal(output.start, emittedUnits - outputUnits);
+        assert.equal(output.end, emittedUnits);
+        assert.equal(output.end - output.start, outputUnits);
+        assert.equal(outputHash, expectedOutputHash, "Every retained output unit must match the independently constructed ASCII window");
+        assert.equal(Buffer.byteLength(pipe.text, "utf8"), pipeBytes, "ASCII pipe window is measured in bytes");
+        assert.equal(pipe.start, emittedBytes - pipeBytes);
+        assert.equal(pipe.end, emittedBytes);
+        assert.equal(pipe.end - pipe.start, pipeBytes);
+        assert.equal(pipeHash, expectedPipeHash, "Every retained pipe byte must match the independently constructed ASCII window");
+        assert(!output.open && !pipe.open);
+        assert(output.text.endsWith(`${sentinel}\n`) && pipe.text.endsWith(`${sentinel}\n`));
+        const evidence = { id: ctx.agent.id, instanceKey: native.instanceKey, isMainThread, threadId, jobId,
+          output: { start: output.start, end: output.end, retainedUnits: output.text.length, sha256: outputHash,
+            expected: { start: emittedUnits - outputUnits, end: emittedUnits, retainedUnits: outputUnits, sha256: expectedOutputHash } },
+          pipe: { start: pipe.start, end: pipe.end, retainedBytes: Buffer.byteLength(pipe.text, "utf8"), sha256: pipeHash,
+            expected: { start: emittedBytes - pipeBytes, end: emittedBytes, retainedBytes: pipeBytes, sha256: expectedPipeHash } },
+          emittedBytes, emittedUnits, sentinelRetained: true };
+        return { content: [{ type: "text", text: JSON.stringify(evidence) }], details: evidence };
+      } finally {
+        clearTimeout(timer);
+        if (jobId) {
+          if (manager.getJob(jobId)?.status === "running") manager.cancel(jobId);
+          manager.consumeJobResults([jobId]);
+          manager.unwatchJobs([jobId]);
+        }
+        native.setClientBridge(originalBridge);
+      }
+    },
+  });
   // Installed in every native child, after remote's session_start handler. The
   // observation comes from the executing JS realm, not from placement settings.
   pi.on("session_start", async (_, ctx) => {
@@ -30,6 +115,7 @@ export default async function taskSmoke(pi: ExtensionAPI) {
     const session = AgentRegistry.global().get(ctx.agent.id)?.session;
     assert(session && isLocalAgentSession(session), "Child observer must run on the child's home thread");
     const native = session as any;
+    nativeSessions.set(ctx.agent.id, native);
     const status = await native.getToolByName("remote_workspace_status").execute(crypto.randomUUID(), {}, AbortSignal.timeout(40_000));
     // ReadTool opens procfs in the companion itself; Bash runs under the native
     // daemon broker and therefore cannot identify its companion with `$PPID`.
@@ -115,13 +201,19 @@ export default async function taskSmoke(pi: ExtensionAPI) {
       const initial = AgentRegistry.global().get(id)!;
       assert.equal(initial.status, "idle");
       assert.equal(initial.session!.instanceKey, worker.instanceKey, "Observer and authoritative registry disagree on session home");
+      const agent = { name: "task", description: "Native task acceptance", systemPrompt: "Follow the deterministic acceptance assignment.", source: "project" as const };
+      const follow = (phase: string, signal?: AbortSignal) => runSubagentFollowUpTurn({ id, agent,
+        message: `ACCEPTANCE_TURN=${id}:${phase}`, structured: false, signal, completionProbe: false, softRequestBudget: 0, maxRuntimeMs: 90_000 });
+      await post("checkpoint", { phase: "before-normal-worker-reconnect", id });
+      const reconnected = await follow("reconnect");
+      assert.equal(reconnected.exitCode, 0, JSON.stringify(reconnected));
+      assert(reconnected.output.includes("NORMAL_WORKER_RECONNECT_VERIFIED"));
+      const normal = await post("checkpoint", { phase: "normal-worker-reconnect", id });
+      assert(normal.reconnectVerified && normal.nestedEvalVerified && normal.captureEvidence?.sentinelRetained);
       await lifecycle.park(id);
       assert.equal(AgentRegistry.global().get(id)!.status, "parked");
       assert.equal(AgentRegistry.global().get(id)!.session, null);
       await post("checkpoint", { phase: "parked", id });
-      const agent = { name: "task", description: "Native task acceptance", systemPrompt: "Follow the deterministic acceptance assignment.", source: "project" as const };
-      const follow = (phase: string, signal?: AbortSignal) => runSubagentFollowUpTurn({ id, agent,
-        message: `ACCEPTANCE_TURN=${id}:${phase}`, structured: false, signal, completionProbe: false, softRequestBudget: 0, maxRuntimeMs: 90_000 });
       const revived = await follow("revived");
       assert.equal(revived.exitCode, 0, JSON.stringify(revived));
       assert.notEqual(AgentRegistry.global().get(id)!.session!.instanceKey, worker.instanceKey);
@@ -147,9 +239,16 @@ export default async function taskSmoke(pi: ExtensionAPI) {
       const lost = await crashing.catch((error: unknown) => ({ exitCode: 1, error: String(error) }));
       assert.notEqual(lost.exitCode, 0, "Terminated worker unexpectedly completed its turn");
       const cleanup = await post("checkpoint", { phase: "worker-terminated", id });
-      assert(cleanup.remoteCleanup && cleanup.sshStdinClosed, "Abrupt worker exit left an open transport, companion or service");
-      assert(cleanup.localReaped || cleanup.unreapedSsh.every((row: any) => row.state === "Z" && !row.stdinOpen), "Unclassified local process survived");
-      assert.equal((await invoke("remote_workspace_status", {})).details.mode, "remote", "Parent lost its binding with the child worker");
+      assert(cleanup.remoteCleanup && cleanup.sshExitObserved && cleanup.sshStdinClosed && cleanup.localReaped && cleanup.parentAlive,
+        "Abrupt worker exit must remove the exact SSH PID/start and remote companion/service while the OMP parent stays alive; a closed-fd zombie is failure");
+      const parentStatus = (await invoke("remote_workspace_status", {})).details;
+      assert.equal(parentStatus.mode, "remote", "Parent lost its binding with the child worker");
+      const parentProbe = await invoke("bash", { command: `printf 'PARENT_STILL_USABLE_${run}\\n'; pwd; printf 'SESSION=%s\\n' "$PI_SESSION_ID"` });
+      const parentOutput = parentProbe.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
+      assert(parentOutput.includes(`PARENT_STILL_USABLE_${run}`) && parentOutput.includes(owner.sessionManager.getSessionId()) &&
+        typeof parentStatus.remoteCwd === "string" && parentOutput.includes(parentStatus.remoteCwd),
+        "Parent status alone is insufficient: its actual remote Bash connection must remain usable");
+      await post("checkpoint", { phase: "parent-connection-usable", id });
       // Keep the independent owner-exit contract on an untouched main-homed child.
       id = ids.find(candidate => candidate !== id && AgentRegistry.global().get(candidate)?.session?.instanceKey.startsWith("main:"))!;
       assert(id, "No live main-homed child remains for owner-exit acceptance");
@@ -160,7 +259,7 @@ export default async function taskSmoke(pi: ExtensionAPI) {
       assert(revoked.output.includes("REVOKED_WORKSPACE_REJECTED"), "Child did not observe unavailable status and a rejected workspace write");
       const after = await post("checkpoint", { phase: "revoked-turn", id });
       assert(after.revokedToolDenied && after.localMarkerAbsent && after.noNewRemoteWorkers, "Owner exit did not preserve workspace revocation");
-      console.log(cleanup.localReaped ? "TASK_SMOKE_PASS" : "TASK_SMOKE_PARTIAL", JSON.stringify({ tasks: 9, workerThread: worker.nativeThread, parkRevive: true, interruptResume: true, abruptWorkerExit: true, remoteCleanup: cleanup.remoteCleanup, sshStdinClosed: cleanup.sshStdinClosed, localReaped: cleanup.localReaped, ownerExitFailClosed: true }));
+      console.log("TASK_SMOKE_PASS", JSON.stringify({ tasks: 9, workerThread: worker.nativeThread, normalWorkerReconnect: true, nestedEvalCallback: true, boundedCapture: normal.captureEvidence, parkRevive: true, interruptResume: true, abruptWorkerExit: true, remoteCleanup: cleanup.remoteCleanup, sshExitObserved: cleanup.sshExitObserved, sshStdinClosed: cleanup.sshStdinClosed, localReaped: cleanup.localReaped, parentConnectionUsable: true, ownerExitFailClosed: true }));
     } catch (error) {
       console.error("TASK_SMOKE_ERROR", error); process.exitCode = 1;
     } finally {

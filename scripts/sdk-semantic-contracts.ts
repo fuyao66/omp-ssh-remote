@@ -21,6 +21,16 @@ export type SemanticSdkContract = {
 /** Review every assumption after an SDK bump; only genuine native execution belongs in coveredBy. */
 export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
+    id: "standalone-thread-rpc",
+    plugin: ["src/thread-rpc.ts", "src/thread-runtime.ts"],
+    native: ["thread/rpc.ts"],
+    assumption: "RpcLink can be instantiated over an explicit send/listen endpoint without the CLI worker pool. Async callbacks remain reentrant, AbortSignals and errors retain native encoding, and close rejects pending calls and aborts imported signals. The socket carrier supplies framing, byte bounds and peer-loss ownership; no synchronous RPC channel or shared-buffer transfer is used.",
+    coveredBy: [
+      { path: "test/thread-rpc.test.ts" },
+      { path: "test/thread-runtime.test.ts" },
+    ],
+  },
+  {
     id: "worker-tool-session",
     plugin: ["src/runtime.ts"],
     native: ["tools/index.ts", "sdk.ts", "tools/eval.ts"],

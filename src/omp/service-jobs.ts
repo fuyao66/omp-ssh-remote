@@ -1,11 +1,11 @@
-import type { RemoteRuntimeClient } from "../client.ts";
+import type { RemoteRuntimeClientApi } from "../client.ts";
 import type { AsyncJobManagerApi } from "@oh-my-pi/pi-coding-agent/async";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 
 /** Reserve local ownership before sending any remote launch request. */
-const exits = new WeakMap<RemoteRuntimeClient, Map<string, (value: unknown) => void>>();
+const exits = new WeakMap<RemoteRuntimeClientApi, Map<string, (value: unknown) => void>>();
 
-export function completeService(client: RemoteRuntimeClient, name: string, result: unknown): boolean {
+export function completeService(client: RemoteRuntimeClientApi, name: string, result: unknown): boolean {
   const resolve = exits.get(client)?.get(name);
   if (!resolve) return false;
   resolve(result);
@@ -14,7 +14,7 @@ export function completeService(client: RemoteRuntimeClient, name: string, resul
 
 /** Native explicit stops intentionally do not emit daemon-completed. */
 export function completeStoppedService(
-  client: RemoteRuntimeClient,
+  client: RemoteRuntimeClientApi,
   result: AgentToolResult,
 ): boolean {
   const proc = (result.details as { proc?: { action?: string; daemon?: { name?: string } } })?.proc;
@@ -23,7 +23,7 @@ export function completeStoppedService(
 }
 
 export async function startRemoteService(
-  client: RemoteRuntimeClient,
+  client: RemoteRuntimeClientApi,
   name: string,
   ownerId: string,
   manager: AsyncJobManagerApi,

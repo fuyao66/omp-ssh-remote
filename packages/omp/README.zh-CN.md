@@ -309,4 +309,6 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 - 启用 autoresearch 工具时拒绝连接；原生未暴露私有的实验运行状态，请先关闭 autoresearch 并等待已有实验停止；
 - browser、desktop、模型凭据、memory 和本机 session 控制面不进入远端。
 
-在 Bun 1.4.4／Linux 上，原生 worker-thread 突然退出后，已退出的本机 SSH 子进程可能以僵尸状态（`Z`）保留至父 OMP 进程退出。实际验收确认 SSH stdin 已关闭，远端 companion 及其非持久服务均已退出，并非远端活跃进程泄漏。不含 SSH、也不加载插件的隔离实验分别使用 `node:child_process.spawn` 和 `Bun.spawn` 复现了该行为；更换 spawn 接口不能解决。正常停放／恢复验收通过。未新增监督进程或回收器，也未修改 `task.workerThreads`。
+原生 worker-thread 子代理仍各用独立 SSH 连接，但其 SSH/SCP 进程句柄和准备租约由 OMP 主线程持有。每个子代理通过私有、经过认证的本地 socket 使用 OMP 原生 RPC；socket 断开也是该资源作用域的结束信号。主线程取消准备、释放租约并关闭传输，等待进程实际退出；优雅关闭失败时可升级为 SIGKILL。仅关闭管道，或进程仍以 `Z` 状态存在，均不算清理完成。
+
+本地 IPC 通道失效后，只有显式重连才能在同一有效 family 代次下重新建立通道；不能恢复已撤销的授权，也不会退回本机执行。改变的是进程句柄和退出监听器的线程归属，而非操作系统的父子进程关系。未新增监督进程、心跳或全局回收器，也未改变原生停放／恢复的生命周期及 `task.workerThreads` 设置。

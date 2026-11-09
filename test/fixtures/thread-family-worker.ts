@@ -1,11 +1,14 @@
+import { threadId } from "node:worker_threads";
 import { assertFamilyLeaseActive } from "../../src/family-broker.ts";
 import { ThreadFamilyBridge, type ThreadFamilyDecision, type ThreadMemberIdentity } from "../../src/thread-family.ts";
 
 export type WorkerCommand =
   | { op: "init"; channelName: string }
-  | { op: "reserve"; identity: ThreadMemberIdentity }
+  | { op: "reserve"; identity: ThreadMemberIdentity; generation?: string }
   | { op: "commit"; token: string; generation: string; identity: ThreadMemberIdentity }
   | { op: "detach"; token: string; identity: ThreadMemberIdentity }
+  | { op: "runtime-closed" | "watch-runtime-close" | "probe-runtime"; token: string }
+  | { op: "worker-identity" }
   | { op: "lease" | "stats" | "hold-close" | "release-close" | "dispose" }
   | { op: "fast-timeout"; identity: ThreadMemberIdentity };
 
@@ -33,12 +36,31 @@ async function execute(command: WorkerCommand): Promise<unknown> {
       bridge = new ThreadFamilyBridge(command.channelName);
       return;
     case "reserve":
-      decision = await bridge.reserve(command.identity, close);
+      decision = await bridge.reserve(command.identity, close, command.generation);
       return decision;
     case "commit":
       return await bridge.commit(command.token, command.generation, command.identity);
     case "detach":
       return await bridge.detach(command.token, command.identity);
+    case "runtime-closed":
+      return bridge.runtimeClosed(command.token);
+    case "watch-runtime-close": {
+      const runtime = bridge.runtime(command.token);
+      const lost = runtime.lost.bind(runtime);
+      runtime.lost = error => {
+        lost(error);
+        port.postMessage({ event: "runtime-closed" });
+      };
+      return;
+    }
+    case "probe-runtime":
+      if (decision?.kind !== "active") throw new Error("No active fixture lease");
+      // Reach the real owner's work handler without admitting an SSH process.
+      return await bridge.runtime(command.token).createClient({
+        ...decision.family.connection, workerPath: `${decision.family.connection.workerPath}.not-admitted`,
+      });
+    case "worker-identity":
+      return { pid: process.pid, threadId };
     case "lease":
       if (decision?.kind !== "active") throw new Error("No active fixture lease");
       assertFamilyLeaseActive({ ownerSessionFile: decision.family.ownerSessionFile, members: new Set(),

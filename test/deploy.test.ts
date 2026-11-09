@@ -226,3 +226,184 @@ try {
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
 });
+
+async function deploymentSettlementFixture(mode: string, body: string): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), "worker-settlement-"));
+  const path = (name: string) => join(directory, name);
+  try {
+    await mkdir(path("home"));
+    await writeFile(path("worker"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    const gates = ["upload-ready", "upload-gate", "cleanup-ready", "cleanup-gate", "lease-ended", "lease-exit", "descendant-ready", "descendant-gate", "descendant-done"];
+    expect(spawnSync("mkfifo", gates.map(path)).status).toBe(0);
+    await writeFile(path("descendant.ts"), `
+import { readFile, writeFile } from 'node:fs/promises';
+await writeFile(${JSON.stringify(path("descendant-ready"))}, 'ready');
+await readFile(${JSON.stringify(path("descendant-gate"))});
+await writeFile(${JSON.stringify(path("descendant-done"))}, 'done');
+process.exit(0);
+`);
+    await writeFile(path("ssh"), `#!${process.execPath}
+import { spawn, spawnSync } from 'node:child_process';
+import { readFile, unlink, writeFile } from 'node:fs/promises';
+const script = process.argv.at(-1);
+const mode = ${JSON.stringify(mode)};
+const holdDescriptors = async () => {
+  const child = spawn(process.execPath, [${JSON.stringify(path("descendant.ts"))}], { stdio: 'inherit' });
+  await writeFile(${JSON.stringify(path("descendant-pid"))}, String(child.pid));
+};
+if (script.includes('uname -s')) {
+  if (mode === 'lease-spawn') await unlink(${JSON.stringify(path("ssh"))});
+  if (mode === 'output-limit') {
+    await new Promise(resolve => process.stdout.write(Buffer.alloc(1024 * 1024 + 1, 120), resolve));
+  } else console.log('Linux\\nx86_64\\n' + ${JSON.stringify(path("home"))});
+} else if (mode === 'descriptors' && script.includes('"$HOME"')) {
+  console.log(${JSON.stringify(path("home"))});
+  await holdDescriptors();
+} else if (script.includes("printf 'READY")) {
+  console.log('READY');
+  await new Promise(resolve => { process.stdin.resume(); process.stdin.on('end', resolve); });
+  if (mode === 'dispose') {
+    await writeFile(${JSON.stringify(path("lease-ended"))}, 'ended');
+    await readFile(${JSON.stringify(path("lease-exit"))});
+    await holdDescriptors();
+  }
+} else if (mode === 'cleanup' && script.startsWith('rm -f -- ')) {
+  await writeFile(${JSON.stringify(path("cleanup-ready"))}, 'ready');
+  await readFile(${JSON.stringify(path("cleanup-gate"))});
+  const result = spawnSync('sh', ['-c', script], { stdio: 'inherit' });
+  if (result.status !== 0) process.exit(result.status ?? 1);
+  await writeFile(${JSON.stringify(path("cleanup-done"))}, 'done');
+} else if (script.startsWith('test ! -L')) {
+  console.log(mode === 'cleanup' ? 'missing' : 'present');
+} else {
+  const result = spawnSync('sh', ['-c', script], { stdio: 'inherit' });
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
+process.exit(0);
+`, { mode: 0o700 });
+    await writeFile(path("scp"), `#!${process.execPath}
+import { readFile, writeFile } from 'node:fs/promises';
+await writeFile(${JSON.stringify(path("upload-ready"))}, 'ready');
+await readFile(${JSON.stringify(path("upload-gate"))});
+process.exit(0);
+`, { mode: 0o700 });
+    await writeFile(path("runner.ts"), `
+import { startRemoteWorkerPreparation, prepareRemoteWorker, resolveRemoteHome } from ${JSON.stringify(new URL("../src/deploy.ts", import.meta.url).href)};
+import { readFile, writeFile } from 'node:fs/promises';
+import { strict as assert } from 'node:assert';
+const directory = ${JSON.stringify(directory)};
+const path = name => directory + '/' + name;
+const options = { target: 'fixture.example', localWorkerPath: path('worker') };
+const turn = () => new Promise(resolve => setImmediate(resolve));
+${body}
+`);
+    const result = spawnSync(process.execPath, ["run", path("runner.ts")], {
+      encoding: "utf8", timeout: 10000,
+      env: { ...process.env, PATH: `${directory}:${process.env.PATH}` },
+    });
+    expect({ status: result.status, stderr: result.stderr, error: result.error?.message }).toEqual({ status: 0, stderr: "", error: undefined });
+  } finally {
+    // This fixture owns at most one descriptor-holding descendant.
+    try { process.kill(Number(await readFile(path("descendant-pid"), "utf8")), "SIGKILL"); } catch {}
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+describe("deployment producer settlement", () => {
+  test("ready cancels promptly while settled retains upload cleanup and queued producers", async () => {
+    await deploymentSettlementFixture("cleanup", `
+const controller = new AbortController();
+const reason = new Error('cancel held upload');
+const operation = startRemoteWorkerPreparation({ ...options, signal: controller.signal });
+let settled = false;
+void operation.settled.then(() => { settled = true; });
+const rejected = operation.ready.then(() => { throw new Error('cancelled upload delivered'); }, error => error);
+assert.equal(await readFile(path('upload-ready'), 'utf8'), 'ready');
+controller.abort(reason);
+assert.equal((await rejected).cause, reason);
+assert.equal(await readFile(path('cleanup-ready'), 'utf8'), 'ready');
+assert.equal(settled, false, 'settlement discarded post-abort cleanup');
+let queuedSettled = false;
+let waited = false;
+const queued = startRemoteWorkerPreparation({
+  ...options, signal: controller.signal,
+  onProgress(stage) { if (stage === 'Waiting for existing deployment to finish') waited = true; },
+});
+void queued.settled.then(() => { queuedSettled = true; });
+const queuedError = await queued.ready.then(() => { throw new Error('cancelled queue delivered'); }, error => error);
+assert.equal(queuedError.cause, reason);
+await turn();
+assert.equal(waited, true);
+assert.equal(queuedSettled, false, 'queued producer escaped its predecessor');
+assert.equal(settled, false);
+await writeFile(path('cleanup-gate'), 'release');
+await Promise.all([operation.settled, queued.settled]);
+assert.equal(await readFile(path('cleanup-done'), 'utf8'), 'done');
+assert.equal(settled, true);
+assert.equal(queuedSettled, true);
+`);
+  });
+
+  test("command exit drains output without waiting for descendant-held descriptors", async () => {
+    await deploymentSettlementFixture("descriptors", `
+const home = resolveRemoteHome(options);
+assert.equal(await readFile(path('descendant-ready'), 'utf8'), 'ready');
+assert.equal(await home, path('home'));
+await writeFile(path('descendant-gate'), 'release');
+assert.equal(await readFile(path('descendant-done'), 'utf8'), 'done');
+`);
+  });
+
+  test("delivered leases outlive producer settlement and share actual disposal completion", async () => {
+    await deploymentSettlementFixture("dispose", `
+const operation = startRemoteWorkerPreparation(options);
+const prepared = await operation.ready;
+await operation.settled;
+assert.equal(prepared.signal.aborted, false);
+const first = prepared.dispose();
+const second = prepared.dispose();
+assert.equal(first, second, 'dispose must return the memoized completion promise');
+let disposed = false;
+void second.then(() => { disposed = true; });
+assert.equal(await readFile(path('lease-ended'), 'utf8'), 'ended');
+await turn();
+assert.equal(disposed, false, 'disposal completed before child exit');
+await writeFile(path('lease-exit'), 'release');
+assert.equal(await readFile(path('descendant-ready'), 'utf8'), 'ready');
+await Promise.all([first, second]);
+assert.equal(prepared.dispose(), first);
+assert.equal(prepared.signal.aborted, false, 'normal disposal aborted delivered worker');
+await writeFile(path('descendant-gate'), 'release');
+assert.equal(await readFile(path('descendant-done'), 'utf8'), 'done');
+`);
+  });
+
+  test("failed spawn rejects readiness and still settles its producer", async () => {
+    await deploymentSettlementFixture("spawn", `
+process.env.PATH = path('missing-command-directory');
+const operation = startRemoteWorkerPreparation(options);
+const error = await operation.ready.then(() => { throw new Error('missing SSH succeeded'); }, error => error);
+assert.equal(error.code, 'ENOENT');
+await operation.settled;
+`);
+  });
+
+  test("failed lease spawn settles without waiting for an impossible exit", async () => {
+    await deploymentSettlementFixture("lease-spawn", `
+process.env.PATH = directory;
+const operation = startRemoteWorkerPreparation(options);
+const error = await operation.ready.then(() => { throw new Error('missing lease SSH succeeded'); }, error => error);
+assert.equal(error.code, 'ENOENT');
+await operation.settled;
+`);
+  });
+
+  test("bounded exit draining preserves the shared 1 MiB command output limit", async () => {
+    await deploymentSettlementFixture("output-limit", `
+const operation = startRemoteWorkerPreparation(options);
+const error = await operation.ready.then(() => { throw new Error('oversized command output succeeded'); }, error => error);
+assert.match(error.message, /output exceeded 1048576 bytes/);
+await operation.settled;
+`);
+  });
+});
