@@ -402,9 +402,99 @@ function liveDescendants(state: RemoteExtensionState, ownerSessionFile: string, 
   });
 }
 
-function descendantAdmissionError(refs: ReturnType<typeof liveDescendants>, reason = "live descendant agents"): Error {
-  const names = refs.map(ref => `${ref.displayName} (${ref.id}, ${ref.status})${ref.session?.ircWakesPending ? " — has pending messages; retry shortly" : ""}`).join(", ");
-  return new Error(`This session has ${reason}: ${names}. Wait for them to finish, or open /hub and press x to stop them.`);
+type Descendant = ReturnType<typeof liveDescendants>[number];
+const IRC_WAKE_BLOCK_REASON = "IRC wake held/queued/awaiting compaction";
+const IRC_WAKE_SETTLEMENT_MS = 1_000;
+
+/** Keep admission, settlement eligibility, and native parking on the same fail-closed rules. */
+function descendantBlockerReason(ref: Descendant): string | undefined {
+  const reasons: string[] = [];
+  if (ref.status !== "idle") reasons.push(ref.status === "running" ? "running work" : "not idle");
+  if (!ref.sessionFile) reasons.push("transcript is not persisted");
+  if (ref.session && !isLocalAgentSession(ref.session)) {
+    reasons.push(ref.status === "idle"
+      ? "worker-thread session requires native parking; immediate retry will not help"
+      : "worker-thread session requires native parking");
+  }
+  if (ref.status === "idle" && ref.session?.ircWakesPending) reasons.push(IRC_WAKE_BLOCK_REASON);
+  return reasons.length ? reasons.join("; ") : undefined;
+}
+
+function descendantAdmissionError(refs: Descendant[], reason = "live descendant agents"): Error {
+  const names = refs.map(ref => {
+    const blocker = descendantBlockerReason(ref);
+    return `${ref.displayName} (${ref.id}, ${ref.status})${blocker ? ` — ${blocker}` : ""}`;
+  }).join(", ");
+  return new Error(`This session has ${reason}: ${names}. Let running work finish and blocked wakes settle; idle worker-thread sessions need native parking before connecting. To explicitly stop an agent instead, open /hub and press x.`);
+}
+
+/** Observe one bounded native wake-settlement window, never consume or authorize pending work. */
+async function settleDescendantIrcWakes(
+  state: RemoteExtensionState,
+  ownerSessionFile: string,
+  transaction: ConnectionTransaction,
+  onProgress: (stage: string) => void,
+  ctx?: ExtensionContext,
+): Promise<void> {
+  const blockers = liveDescendants(state, ownerSessionFile, ctx).filter(ref => descendantBlockerReason(ref));
+  if (!blockers.length) return;
+  if (blockers.some(ref => descendantBlockerReason(ref) !== IRC_WAKE_BLOCK_REASON)) {
+    throw descendantAdmissionError(blockers);
+  }
+  const registry = AgentRegistry.global();
+  const subscriptions = new Map<NonNullable<Descendant["session"]>, () => void>();
+  let unsubscribeRegistry: (() => void) | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let finished = false;
+      const finish = (error?: unknown) => {
+        if (finished) return;
+        finished = true;
+        if (error !== undefined) reject(error);
+        else resolve();
+      };
+      const inspect = () => {
+        if (finished) return;
+        try {
+          assertConnectionTransaction(state, transaction);
+          const pending = liveDescendants(state, ownerSessionFile, ctx)
+            .filter(ref => descendantBlockerReason(ref));
+          if (pending.some(ref => descendantBlockerReason(ref) !== IRC_WAKE_BLOCK_REASON)) {
+            finish(descendantAdmissionError(pending));
+            return;
+          }
+          if (!pending.length) { finish(); return; }
+          const sessions = new Set(pending.map(ref => ref.session!));
+          for (const [session, unsubscribe] of subscriptions) {
+            if (!sessions.has(session)) { unsubscribe(); subscriptions.delete(session); }
+          }
+          for (const session of sessions) {
+            if (isLocalAgentSession(session) && !subscriptions.has(session)) {
+              subscriptions.set(session, session.subscribeIrcWakeHolds(inspect));
+            }
+          }
+        } catch (error) { finish(error); }
+      };
+      onAbort = () => finish(transaction.signal.reason ?? new Error("Remote connection was cancelled"));
+      transaction.signal.addEventListener("abort", onAbort, { once: true });
+      unsubscribeRegistry = registry.onChange(inspect);
+      timer = setTimeout(() => finish(descendantAdmissionError(
+        liveDescendants(state, ownerSessionFile, ctx), "descendants whose IRC wake settlement exceeded 1000 ms",
+      )), IRC_WAKE_SETTLEMENT_MS);
+      inspect();
+      if (!finished) {
+        onProgress("Waiting up to 1000 ms for idle descendants' native IRC wakes to settle (held/queued/awaiting compaction); pending work will not be discarded.");
+        inspect();
+      }
+    });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    unsubscribeRegistry?.();
+    for (const unsubscribe of subscriptions.values()) unsubscribe();
+    if (onAbort) transaction.signal.removeEventListener("abort", onAbort);
+  }
 }
 
 /** Use the native TTL transition so revival rebuilds extensions against the new family. */
@@ -415,13 +505,12 @@ async function parkIdleDescendants(
   ctx?: ExtensionContext,
 ): Promise<void> {
   const refs = liveDescendants(state, ownerSessionFile, ctx);
-  // Match native TTL admission: idle refs can still owe turns to queued IRC.
-  const blockers = refs.filter(ref => ref.status !== "idle" || !ref.sessionFile || ref.session?.ircWakesPending);
+  const blockers = refs.filter(ref => descendantBlockerReason(ref));
   if (blockers.length) throw descendantAdmissionError(blockers);
   const registry = AgentRegistry.global(), lifecycle = AgentLifecycleManager.global();
   for (const ref of refs) {
     assertConnectionTransaction(state, transaction);
-    if (registry.get(ref.id) !== ref || ref.status !== "idle" || ref.session?.ircWakesPending) {
+    if (registry.get(ref.id) !== ref || descendantBlockerReason(ref)) {
       throw descendantAdmissionError([ref]);
     }
     const refSession = ref.session!;
@@ -434,6 +523,12 @@ async function parkIdleDescendants(
         if (ref.session) void lifecycle.ensureLive(ref.id).catch(() => {});
       }
     });
+    const unsubscribeWake = isLocalAgentSession(refSession) ? refSession.subscribeIrcWakeHolds(() => {
+      if (registry.get(ref.id) === ref && ref.session === refSession && descendantBlockerReason(ref)) {
+        woke = true;
+        if (ref.session) void lifecycle.ensureLive(ref.id).catch(() => {});
+      }
+    }) : undefined;
     try {
       await lifecycle.park(ref.id);
       // Native park logs disposal errors instead of rejecting. AgentSession.dispose
@@ -446,6 +541,7 @@ async function parkIdleDescendants(
       throw descendantAdmissionError([ref], `a descendant that could not be parked (${error instanceof Error ? error.message : String(error)})`);
     } finally {
       unsubscribe();
+      unsubscribeWake?.();
     }
     assertConnectionTransaction(state, transaction);
     if (woke) throw descendantAdmissionError([ref]);
@@ -1439,31 +1535,37 @@ async function connectOwner(
   if (remoteFamilyBroker.hasOwner(normalizedSessionFile)) {
     throw new Error("This session already owns a remote runtime family");
   }
-  const assertAdmission = () => {
+  const assertOtherAdmission = () => {
     const cursorReason = cursorBlockReason(state, ctx);
     if (cursorReason) throw new Error(cursorReason);
-    const workerDescendants = liveDescendants(state, normalizedSessionFile, ctx)
-      .filter(ref => ref.session && !isLocalAgentSession(ref.session));
-    if (workerDescendants.length) throw descendantAdmissionError(workerDescendants, "live worker-thread descendants; stop them before connecting");
-    const running = liveDescendants(state, normalizedSessionFile, ctx)
-      .filter(ref => ref.status !== "idle" || !ref.sessionFile || ref.session?.ircWakesPending);
-    if (running.length) throw descendantAdmissionError(running);
     if (pi.getActiveTools().some(name => AUTORESEARCH_TOOLS.has(name))) {
       throw new Error("Autoresearch is active locally; run /autoresearch off and wait for experiments to stop before connecting.");
     }
   };
-  assertAdmission();
+  const assertAdmission = () => {
+    assertOtherAdmission();
+    const blockers = liveDescendants(state, normalizedSessionFile, ctx)
+      .filter(ref => descendantBlockerReason(ref));
+    if (blockers.length) throw descendantAdmissionError(blockers);
+  };
   const transaction = beginConnectionTransaction(state, input.signal);
   let prepared: PreparedRemoteWorker | undefined;
   let opened: OpenedTransport | undefined;
   try {
+    assertConnectionTransaction(state, transaction);
+    assertOtherAdmission();
+    await settleDescendantIrcWakes(state, normalizedSessionFile, transaction, input.onProgress, ctx);
+    assertConnectionTransaction(state, transaction);
+    assertAdmission();
     await parkIdleDescendants(state, normalizedSessionFile, transaction, ctx);
     assertConnectionTransaction(state, transaction);
     const hosts = await loadConfiguredSshHosts(input.localCwd);
     assertConnectionTransaction(state, transaction);
+    assertAdmission();
     const request = input.parseRequest(hosts);
     prepared = await prepareRemoteWorker({ ...request, signal: transaction.signal, onProgress: input.onProgress });
     assertConnectionTransaction(state, transaction);
+    assertAdmission();
     const remoteCwd = request.cwd ?? prepared.home;
     const connection = {
       ...request,

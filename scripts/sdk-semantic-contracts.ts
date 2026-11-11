@@ -468,8 +468,8 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "live-descendant-registry",
     plugin: ["src/extension.ts"],
-    native: ["registry/agent-registry.ts", "registry/agent-lifecycle.ts", "registry/persisted-agents.ts", "task/executor.ts"],
-    assumption: "AgentRef ancestry includes parked intermediates; persisted session paths scope descendants to the selected transcript root, and native lifecycle parking cancels pending attachment and disposes attached sessions before connect publishes.",
+    native: ["registry/agent-registry.ts", "registry/agent-lifecycle.ts", "registry/persisted-agents.ts", "task/executor.ts", "session/agent-session.ts", "session/agent-session-handle.ts", "thread/session-publisher.ts", "thread/remote-agent-session.ts"],
+    assumption: "Persisted session paths scope descendants through parked intermediates. Same-thread idle children may park through native lifecycle; subscribeIrcWakeHolds and registry events expose completion of a held, queued, or compaction-delayed wake obligation, but elapsed time never authorizes parking. Worker-homed mirrors lack an atomic home-thread idle/no-wake check and disposal join, so live handles stay blocked even when mirrored idle. Reassess this restriction when upgrading the SDK.",
     coveredBy: [{ path: "test/lifecycle-transactions.test.ts" }],
   },
   {

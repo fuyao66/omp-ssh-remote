@@ -93,7 +93,9 @@ type Harness = {
   activeTools: string[];
   context: ExtensionContext;
   aborts: string[];
-  execute(name: string, args?: Record<string, unknown>): Promise<{ details?: unknown }>;
+  execute(name: string, args?: Record<string, unknown>, options?: {
+    signal?: AbortSignal; onProgress?: (stage: string) => void;
+  }): Promise<{ details?: unknown }>;
   state(family: Family): State;
   status(): Promise<{ mode: string }>;
 };
@@ -135,6 +137,36 @@ async function nativeChild(child: Harness) {
     parentId: child.context.agent.parentId, session, sessionFile: child.sessionFile, status: "running",
   });
   return { session, ref, shutdowns: () => shutdowns, shutdown: shutdown.promise };
+}
+
+async function idleNativeChild(owner: Harness, id: string) {
+  const child = await harness(owner.sessionFile.replace(/\.jsonl$/, `/subagent/${id}.jsonl`), {
+    kind: "sub", id, name: id, depth: 1, parentId: owner.context.agent.id,
+  });
+  const native = await nativeChild(child);
+  AgentRegistry.global().setStatus(id, "idle");
+  AgentLifecycleManager.global().adopt(id, { idleTtlMs: 0 });
+  return native;
+}
+
+/** Count real native subscriptions without replacing event delivery or cleanup. */
+function observeSettlementListeners(session: AgentSession) {
+  const holds = new Set<() => void>(), changes = new Set<Parameters<AgentRegistry["onChange"]>[0]>();
+  const registry = AgentRegistry.global(), subscribe = session.subscribeIrcWakeHolds, onChange = registry.onChange;
+  const holdSpy = spyOn(session, "subscribeIrcWakeHolds").mockImplementation(function (listener) {
+    holds.add(listener);
+    const unsubscribe = subscribe.call(session, listener);
+    return () => { holds.delete(listener); unsubscribe(); };
+  });
+  const registrySpy = spyOn(registry, "onChange").mockImplementation(function (listener) {
+    changes.add(listener);
+    const unsubscribe = onChange.call(registry, listener);
+    return () => { changes.delete(listener); unsubscribe(); };
+  });
+  return {
+    holds, changes,
+    restore() { holdSpy.mockRestore(); registrySpy.mockRestore(); },
+  };
 }
 
 async function ensureNativeToolManifests() {
@@ -255,7 +287,11 @@ async function harness(sessionFile = join(directory, "owner.jsonl"), agent: Exte
       }
     },
     command: async (name: string, args = "") => await commands.get(name)!.handler(args, ctx),
-    execute: async (name: string, args = {}) => await tools.get(name)!.execute(name, args, undefined, undefined, ctx),
+    execute: async (name: string, args = {}, options) => await tools.get(name)!.execute(
+      name, args, options?.signal, options?.onProgress ? update => {
+        for (const item of update.content) if (item.type === "text") options.onProgress!(item.text);
+      } : undefined, ctx,
+    ),
     state: (family: Family): State => [...family.members].find(member => member.sessionFile === sessionFile)!,
     status: async () => (await tools.get("remote_workspace_status")!.execute("status", {}, undefined, undefined, ctx)).details as { mode: string },
   };
@@ -376,12 +412,14 @@ test("connect ignores live idle children from a previous transcript root", async
   const owner = await harness(undefined, { kind: "main", id: "Main", name: "owner", depth: 0 });
   const registry = AgentRegistry.global(), id = "previous-root-child";
   const ref = registry.register({ id, displayName: "previous helper", kind: "sub", parentId: "Main",
-    session: {} as never, sessionFile: join(directory, "previous", "subagent", "child.jsonl"), status: "idle" });
+    session: { instanceKey: "other-thread:previous", ircWakesPending: true } as never,
+    sessionFile: join(directory, "previous", "subagent", "child.jsonl"), status: "idle" });
   try {
     await owner.execute("remote_connect", { target: "fixture.invalid" });
     expect((await owner.status()).mode).toBe("remote");
     expect(ref.session).not.toBeNull();
     expect(ref.status).toBe("idle");
+    expect(ref.session?.ircWakesPending).toBe(true);
   } finally { registry.unregister(id); }
 });
 
@@ -456,12 +494,170 @@ test("connect parking releases idle child extension state from a revoked family"
   expect((await owner.status()).mode).toBe("remote");
 });
 
+test("running native wake hold without queued messages refuses immediately and describes running work", async () => {
+  const owner = await harness(), native = await idleNativeChild(owner, "held-running");
+  native.session.holdIrcWakes();
+  AgentRegistry.global().setStatus(native.ref.id, "running");
+  const progress: string[] = [], listeners = observeSettlementListeners(native.session);
+  const discoveries = discoveryBoundary.mock.calls.length, deployments = deploymentBoundary.mock.calls.length;
+  try {
+    expect(native.session.ircWakesPending).toBe(true);
+    expect(native.session.hasQueuedIrcFrom("fixture-peer")).toBe(false);
+    const error = await settle(owner.execute("remote_connect", { target: "fixture.invalid" }, {
+      onProgress: stage => progress.push(stage),
+    }));
+    expect(error?.message).toContain("held-running (held-running, running)");
+    expect(error?.message).toContain("running work");
+    expect(error?.message).not.toContain("IRC wake held/queued/awaiting compaction");
+    expect(error?.message).toContain("open /hub and press x");
+    expect(error?.message).not.toMatch(/has pending messages|retry shortly/);
+    expect(progress).toEqual([]);
+    expect(listeners.holds.size).toBe(0);
+    expect(listeners.changes.size).toBe(0);
+    expect(discoveryBoundary.mock.calls.length).toBe(discoveries);
+    expect(deploymentBoundary.mock.calls.length).toBe(deployments);
+    expect(native.ref.session).toBe(native.session);
+    expect(native.ref.status).toBe("running");
+    expect(native.shutdowns()).toBe(0);
+    expect((await owner.status()).mode).toBe("local");
+  } finally { listeners.restore(); }
+});
+
+test.each(["progress", "native event"] as const)(
+  "idle wake hold released by %s parks natively and connects within the same transaction", async releaseAt => {
+    const owner = await harness(), native = await idleNativeChild(owner, "settling-idle");
+    const release = native.session.holdIrcWakes(), entered = Promise.withResolvers<void>();
+    const listeners = observeSettlementListeners(native.session), progress: string[] = [];
+    const discoveries = discoveryBoundary.mock.calls.length, deployments = deploymentBoundary.mock.calls.length;
+    try {
+      const connecting = owner.execute("remote_connect", { target: "fixture.invalid" }, {
+        onProgress(stage) {
+          progress.push(stage);
+          expect(listeners.holds.size).toBe(1);
+          expect(listeners.changes.size).toBe(1);
+          expect(discoveryBoundary.mock.calls.length).toBe(discoveries);
+          expect(deploymentBoundary.mock.calls.length).toBe(deployments);
+          if (releaseAt === "progress") release();
+          entered.resolve();
+        },
+      });
+      await entered.promise;
+      if (releaseAt === "native event") release();
+      await connecting;
+      expect(progress).toHaveLength(1);
+      expect(progress[0]).toMatch(/up to 1000 ms.*native IRC wakes.*held\/queued\/awaiting compaction/);
+      expect(listeners.holds.size).toBe(0);
+      expect(listeners.changes.size).toBe(0);
+      expect(native.ref.status).toBe("parked");
+      expect(native.ref.session).toBeNull();
+      expect(native.shutdowns()).toBe(1);
+      expect(native.session.isDisposed).toBe(true);
+      expect((await owner.status()).mode).toBe("remote");
+    } finally { listeners.restore(); }
+  },
+);
+
+test.each(["caller abort", "remote_exit", "slash exit"] as const)(
+  "%s cancels idle wake settlement before SSH and removes native listeners", async cancellation => {
+    const owner = await harness(), native = await idleNativeChild(owner, "cancel-settlement");
+    const release = native.session.holdIrcWakes(), entered = Promise.withResolvers<void>();
+    const controller = new AbortController(), listeners = observeSettlementListeners(native.session);
+    const discoveries = discoveryBoundary.mock.calls.length, deployments = deploymentBoundary.mock.calls.length;
+    const transports = transport.mock.calls.length;
+    try {
+      const connecting = settle(owner.execute("remote_connect", { target: "fixture.invalid" }, {
+        signal: controller.signal, onProgress() { entered.resolve(); },
+      }));
+      await entered.promise;
+      expect(listeners.holds.size).toBe(1);
+      expect(listeners.changes.size).toBe(1);
+      if (cancellation === "caller abort") controller.abort(new Error("Fixture caller cancelled settlement"));
+      else if (cancellation === "remote_exit") await owner.execute("remote_exit");
+      else await owner.command("remote-exit");
+      expect((await connecting)?.message).toMatch(/cancel|abort|exit/i);
+      expect(listeners.holds.size).toBe(0);
+      expect(listeners.changes.size).toBe(0);
+      release();
+      expect(discoveryBoundary.mock.calls.length).toBe(discoveries);
+      expect(deploymentBoundary.mock.calls.length).toBe(deployments);
+      expect(transport.mock.calls.length).toBe(transports);
+      expect(native.ref.session).toBe(native.session);
+      expect(native.ref.status).toBe("idle");
+      expect(native.shutdowns()).toBe(0);
+      expect(broker.hasOwner(owner.sessionFile)).toBe(false);
+      expect((await owner.status()).mode).toBe("local");
+      // Cancellation releases the transaction slot as well as its subscriptions.
+      await owner.execute("remote_connect", { target: "fixture.invalid" });
+      expect(native.ref.status).toBe("parked");
+      expect((await owner.status()).mode).toBe("remote");
+    } finally { listeners.restore(); }
+  },
+);
+
+test("a new running child interrupts wake settlement and refuses without deploying", async () => {
+  const owner = await harness(), native = await idleNativeChild(owner, "waiting-idle");
+  native.session.holdIrcWakes();
+  const entered = Promise.withResolvers<void>(), listeners = observeSettlementListeners(native.session);
+  const registry = AgentRegistry.global(), id = "new-running-during-settlement";
+  const discoveries = discoveryBoundary.mock.calls.length, deployments = deploymentBoundary.mock.calls.length;
+  try {
+    const connecting = settle(owner.execute("remote_connect", { target: "fixture.invalid" }, {
+      onProgress() { entered.resolve(); },
+    }));
+    await entered.promise;
+    registry.register({ id, displayName: "new running helper", kind: "sub",
+      parentId: owner.context.agent.id, session: null, status: "running" });
+    const error = await connecting;
+    expect(error?.message).toContain(`new running helper (${id}, running)`);
+    expect(error?.message).toContain("running work");
+    expect(discoveryBoundary.mock.calls.length).toBe(discoveries);
+    expect(deploymentBoundary.mock.calls.length).toBe(deployments);
+    expect(listeners.holds.size).toBe(0);
+    expect(listeners.changes.size).toBe(0);
+    expect(native.ref.session).toBe(native.session);
+    expect(native.ref.status).toBe("idle");
+    expect(native.session.ircWakesPending).toBe(true);
+    expect(native.shutdowns()).toBe(0);
+    expect((await owner.status()).mode).toBe("local");
+  } finally { registry.unregister(id); listeners.restore(); }
+});
+
+test.each([false, true])("idle worker handle with IRC pending=%s requires native parking without waiting or mutation", async pending => {
+  const owner = await harness(), registry = AgentRegistry.global(), lifecycle = AgentLifecycleManager.global();
+  const id = "worker-idle", progress: string[] = [];
+  const session = { instanceKey: "foreign-thread:idle", ircWakesPending: pending } as AgentSessionHandle;
+  const ref = registry.register({ id, displayName: "worker idle", kind: "sub", parentId: owner.context.agent.id,
+    session, sessionFile: owner.sessionFile.replace(/\.jsonl$/, "/subagent/worker-idle.jsonl"), status: "idle" });
+  const parking = spyOn(lifecycle, "park"), discoveries = discoveryBoundary.mock.calls.length;
+  const deployments = deploymentBoundary.mock.calls.length;
+  try {
+    const error = await settle(owner.execute("remote_connect", { target: "fixture.invalid" }, {
+      onProgress: stage => progress.push(stage),
+    }));
+    expect(error?.message).toContain("worker idle (worker-idle, idle)");
+    expect(error?.message).toContain("worker-thread session requires native parking");
+    expect(error?.message).toContain("immediate retry will not help");
+    expect(error?.message).toContain("open /hub and press x");
+    expect(error?.message?.includes("IRC wake held/queued/awaiting compaction")).toBe(pending);
+    expect(progress).toEqual([]);
+    expect(parking).not.toHaveBeenCalled();
+    expect(discoveryBoundary.mock.calls.length).toBe(discoveries);
+    expect(deploymentBoundary.mock.calls.length).toBe(deployments);
+    expect(ref.session).toBe(session);
+    expect(ref.status).toBe("idle");
+    expect(session.ircWakesPending).toBe(pending);
+    expect((await owner.status()).mode).toBe("local");
+  } finally { parking.mockRestore(); registry.unregister(id); }
+});
+
 test.each(["admission", "publication"] as const)(
   "connect refuses an idle child with a deferred native IRC wake at %s", async boundary => {
-    const owner = await harness();
+    const owner = await harness(), progress: string[] = [];
     if (boundary === "publication") commit = gate();
     const connecting = boundary === "publication"
-      ? settle(owner.execute("remote_connect", { target: "fixture.invalid" })) : undefined;
+      ? settle(owner.execute("remote_connect", { target: "fixture.invalid" }, {
+        onProgress: stage => progress.push(stage),
+      })) : undefined;
     if (connecting) await commit!.entered;
     const child = await harness(owner.sessionFile.replace(/\.jsonl$/, "/subagent/pending-irc.jsonl"), {
       kind: "sub", id: "pending-irc", name: "pending IRC helper", depth: 1, parentId: owner.context.agent.id,
@@ -479,25 +675,47 @@ test.each(["admission", "publication"] as const)(
     expect(native.ref.status).toBe("idle");
     expect(native.session.ircWakesPending).toBe(true);
     expect(native.session.hasQueuedIrcFrom("fixture-peer")).toBe(true);
-    commit?.release();
-    const error = await (connecting ?? settle(owner.execute("remote_connect", { target: "fixture.invalid" })));
-    expect(error?.message).toContain("pending IRC helper");
-    expect(error?.message).toContain("has pending messages; retry shortly");
-    expect(native.ref.session).toBe(native.session);
-    expect(native.ref.status).toBe("idle");
-    expect(native.shutdowns()).toBe(0);
-    expect(native.session.hasQueuedIrcFrom("fixture-peer")).toBe(true);
-    expect((await owner.status()).mode).toBe("local");
+    const listeners = observeSettlementListeners(native.session), timers = spyOn(globalThis, "setTimeout");
+    const discoveries = discoveryBoundary.mock.calls.length, deployments = deploymentBoundary.mock.calls.length;
+    const transports = transport.mock.calls.length;
+    try {
+      commit?.release();
+      // Admission deliberately lets its one real native deadline expire; no fake authorization.
+      const error = await (connecting ?? settle(owner.execute("remote_connect", { target: "fixture.invalid" }, {
+        onProgress: stage => progress.push(stage),
+      })));
+      expect(error?.message).toContain("pending IRC helper");
+      expect(error?.message).toContain("IRC wake held/queued/awaiting compaction");
+      expect(error?.message).not.toMatch(/has pending messages|retry shortly/);
+      expect(progress).toHaveLength(boundary === "admission" ? 1 : 0);
+      expect(timers.mock.calls.some(([, delay]) => delay === 1000)).toBe(boundary === "admission");
+      expect(listeners.holds.size).toBe(0);
+      expect(listeners.changes.size).toBe(0);
+      expect(discoveryBoundary.mock.calls.length).toBe(discoveries);
+      expect(deploymentBoundary.mock.calls.length).toBe(deployments);
+      expect(transport.mock.calls.length).toBe(transports);
+      expect(native.ref.session).toBe(native.session);
+      expect(native.ref.status).toBe("idle");
+      expect(native.shutdowns()).toBe(0);
+      expect(native.session.hasQueuedIrcFrom("fixture-peer")).toBe(true);
+      expect((await owner.status()).mode).toBe("local");
+    } finally { timers.mockRestore(); listeners.restore(); }
   },
 );
 
 test("connect refuses an unadopted idle child rather than silently leaving it live", async () => {
   const owner = await harness(), registry = AgentRegistry.global(), id = "unadopted-helper";
-  registry.register({ id, displayName: "unadopted helper", kind: "sub", parentId: owner.context.agent.id,
-    session: {} as never, sessionFile: owner.sessionFile.replace(/\.jsonl$/, "/subagent/unadopted.jsonl"), status: "idle" });
+  const child = await harness(owner.sessionFile.replace(/\.jsonl$/, "/subagent/unadopted.jsonl"), {
+    kind: "sub", id, name: "unadopted helper", depth: 1, parentId: owner.context.agent.id,
+  });
+  const native = await nativeChild(child);
+  registry.setStatus(id, "idle");
   try {
     await expect(owner.execute("remote_connect", { target: "fixture.invalid" })).rejects.toThrow(/unadopted helper.*idle/);
     expect((await owner.status()).mode).toBe("local");
+    expect(native.ref.session).toBe(native.session);
+    expect(native.ref.status).toBe("idle");
+    expect(native.shutdowns()).toBe(0);
   } finally { registry.unregister(id); }
 });
 
@@ -522,6 +740,48 @@ test("connect cancels native parking if the idle child starts running before det
     expect(native.shutdowns()).toBe(0);
     expect((await owner.status()).mode).toBe("local");
   } finally { racing.mockRestore(); }
+});
+
+test("connect cancels native parking when a new idle wake hold appears before detach", async () => {
+  const owner = await harness(), native = await idleNativeChild(owner, "hold-during-park");
+  const lifecycle = AgentLifecycleManager.global(), park = lifecycle.park;
+  const listeners = observeSettlementListeners(native.session);
+  const racing = spyOn(lifecycle, "park").mockImplementation(function (id) {
+    const pending = park.call(lifecycle, id);
+    native.session.holdIrcWakes();
+    return pending;
+  });
+  const deployments = deploymentBoundary.mock.calls.length;
+  try {
+    const error = await settle(owner.execute("remote_connect", { target: "fixture.invalid" }));
+    expect(error?.message).toContain("hold-during-park (hold-during-park, idle)");
+    expect(error?.message).toContain("IRC wake held/queued/awaiting compaction");
+    expect(native.ref.session).toBe(native.session);
+    expect(native.ref.status).toBe("idle");
+    expect(native.session.ircWakesPending).toBe(true);
+    expect(native.session.hasQueuedIrcFrom("fixture-peer")).toBe(false);
+    expect(native.shutdowns()).toBe(0);
+    expect(listeners.holds.size).toBe(0);
+    expect(listeners.changes.size).toBe(0);
+    expect(deploymentBoundary.mock.calls.length).toBe(deployments);
+    expect((await owner.status()).mode).toBe("local");
+  } finally { racing.mockRestore(); listeners.restore(); }
+});
+
+test("wake notifications from the detached session do not cancel completed parking", async () => {
+  const owner = await harness(), native = await idleNativeChild(owner, "detached-wake");
+  native.session.addDisposer(() => {
+    expect(native.ref.session).toBeNull();
+    expect(native.ref.status).toBe("parked");
+    const release = native.session.holdIrcWakes();
+    release();
+    expect(native.session.ircWakesPending).toBe(false);
+  });
+  await owner.execute("remote_connect", { target: "fixture.invalid" });
+  expect(native.ref.status).toBe("parked");
+  expect(native.shutdowns()).toBe(1);
+  expect(native.session.isDisposed).toBe(true);
+  expect((await owner.status()).mode).toBe("remote");
 });
 
 test("connect refuses native parking when session disposal fails", async () => {

@@ -297,7 +297,11 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 - 不支持远端到本机 artifact bridge；
 - 白名单之外的 settings 在 companion 中保持编译默认值，不提供任意 settings 透传；
 - 每个 session 或子代理各占一个 companion 进程；并发子代理各消耗一条 SSH 通道和一个 worker 进程；
-- 连接时会停放当前 session 的同线程空闲子代理；再次发消息时会重建其 session 并绑定远端。已有的存活 worker-thread 子代理须先停止再连接，因为插件无法原子完成跨线程唤醒／停放准入。连接后新建的 worker-thread 子代理正常继承远端。worker-thread session 不能独立创建远端 family：请先在主 session 连接。同线程停放保留原生空闲 TTL 的待处理 IRC 竞态；尚无 transcript 且父链指向 owner 的子代理保守地视为运行中。
+- 已有子代理时的连接规则：
+  - 同线程空闲子代理通过原生生命周期停放；再次发消息会重建 session 并绑定远端。若只剩原生 IRC 唤醒义务，连接会监听状态变化，最多等待一秒，再重新检查准入。唤醒义务可能是任务收尾持有的锁、排队 IRC 或等待压缩的工作，并不证明存在排队消息。
+  - 不会等待或停止运行中的任务。存活的 worker-thread session 须先由原生生命周期停放（通常在空闲 TTL 后），或由用户明确停止。插件无法依据镜像状态原子检查子线程活动并停放；立即重试无助于解除这个限制。
+  - 请先连接再启动本地子代理。连接后新建的 worker-thread 子代理正常继承远端；已有 family 内的重连不要求停放后代。worker-thread session 不能独立创建远端 family。
+  - 同线程停放保留原生空闲 TTL 的待处理 IRC 竞态。尚无 transcript 且父链指向 owner 的子代理保守地视为运行中。
 - 单个输出 frame 不能超过 16 MiB；
 - 宿主 Git 状态／overlay 和状态栏 Git 信息描述本机仓库，而非绑定的远端工作区；
 - 计划自动保存（`plan.autosave`）写入本机 `.omp/plans/`；
