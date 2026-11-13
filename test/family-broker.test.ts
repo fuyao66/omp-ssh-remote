@@ -70,7 +70,7 @@ function makeFamily(ownerSessionFile: string): Family {
       target: "test@example.invalid", displayTarget: "test-remote", cwd: "/remote/workspace", workerPath: "/remote/worker.mjs",
     },
     members: new Set(),
-    lspEnabled: true, closing: false,
+    closing: false,
   };
 }
 

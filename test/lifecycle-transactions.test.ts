@@ -244,7 +244,7 @@ async function nativeExecutorChild(owner: Harness, family: Family, id: string) {
 }
 const settle = (promise: Promise<unknown>): Promise<Error | null> => promise.then(() => null, (error: Error) => error);
 async function harness(sessionFile = join(directory, "owner.jsonl"), agent: ExtensionContext["agent"] = { kind: "main", id: `owner-${crypto.randomUUID()}`, name: "owner", depth: 0 },
-  host: { lspTool?: boolean; settings?: Settings } = {}): Promise<Harness> {
+  host: { enableLsp?: boolean; settings?: Settings } = {}): Promise<Harness> {
   const hooks = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
   const tools = new Map<string, ToolDefinition>(), commands = new Map<string, { handler: Function }>();
   const nativeReads: string[] = [];
@@ -261,7 +261,8 @@ async function harness(sessionFile = join(directory, "owner.jsonl"), agent: Exte
   } as unknown as ExtensionContext;
   const session = {
     instanceKey: `main:${crypto.randomUUID()}`, sessionManager: manager, settings: host.settings ?? Settings.isolated(),
-    getToolByName: (name: string) => host.lspTool && name === "lsp" ? { name: "lsp" } : undefined,
+    // Native tools carry their ToolSession; enableLsp is fixed when the session is built.
+    getToolByName: (name: string) => host.enableLsp === undefined ? undefined : { name, session: { enableLsp: host.enableLsp } },
     getAdvisorStats: () => ({ configured: false, advisors: [] }),
     async runToolRegistryMutation(mutate: () => Promise<void>) { await mutate(); },
   } as unknown as AgentSessionHandle;
@@ -401,26 +402,26 @@ test("forced reconnect rotates binding, drops remote proposals, and routes to th
   expect(owner.nativeReads).toEqual([]);
 });
 
-test("remote runtimes follow the owning session's native effective LSP switch", async () => {
+test("remote runtimes follow each session's own native enableLsp, not inferred tool lists or task settings", async () => {
   const forwarded = () => (tracking.mock.calls.at(-1)![3] as { settings: Record<string, unknown> }).settings["lsp.enabled"];
-  // An owner without the lsp tool (--no-lsp or lsp.enabled:false) must not start
-  // remote language servers through write/edit formatting or diagnostics.
-  const plain = await harness(join(directory, "plain.jsonl"));
-  await plain.execute("remote_connect", { target: "fixture.invalid", cwd: "/remote" });
+  // --no-lsp: native write/edit skip formatting and diagnostics, so the companion must too.
+  const disabled = await harness(join(directory, "no-lsp.jsonl"), undefined, { enableLsp: false });
+  await disabled.execute("remote_connect", { target: "fixture.invalid", cwd: "/remote" });
   expect(forwarded()).toBe(false);
-  expect(active.get(plain.sessionFile)!.lspEnabled).toBe(false);
-  await plain.execute("remote_exit", { force: true });
+  await disabled.execute("remote_exit", { force: true });
 
-  const owner = await harness(join(directory, "lsp.jsonl"), undefined, { lspTool: true });
+  // An owner whose tool list omits `lsp` (--tools read,write) still has enableLsp: settings pass through.
+  const owner = await harness(join(directory, "lsp.jsonl"), undefined, { enableLsp: true });
   await owner.execute("remote_connect", { target: "fixture.invalid", cwd: "/remote" });
   expect(forwarded()).toBeUndefined();
   const family = active.get(owner.sessionFile)!;
-  expect(family.lspEnabled).toBe(true);
-  // Native subagents: parent switch AND task.enableLsp (default off), whatever
-  // their own restricted tool list says.
-  await harness(`${family.root}/subagent/default.jsonl`, undefined, { lspTool: true });
+  // Children use the switch captured at their own spawn, whatever task.enableLsp says now.
+  await harness(`${family.root}/subagent/spawned-off.jsonl`, undefined, { enableLsp: false, settings: Settings.isolated({ "task.enableLsp": true }) });
   expect(forwarded()).toBe(false);
-  await harness(`${family.root}/subagent/enabled.jsonl`, undefined, { settings: Settings.isolated({ "task.enableLsp": true }) });
+  await harness(`${family.root}/subagent/spawned-on.jsonl`, undefined, { enableLsp: true, settings: Settings.isolated({ "task.enableLsp": false }) });
+  expect(forwarded()).toBeUndefined();
+  // Reconnects re-capture the same session switch rather than a family snapshot.
+  await owner.execute("remote_reconnect", { force: true });
   expect(forwarded()).toBeUndefined();
 });
 

@@ -15,7 +15,10 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import remoteRuntimeExtension from "../src/extension.ts";
+import remoteRuntimeExtension, { nativeSessionLspEnabled } from "../src/extension.ts";
+import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
+import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { createNativeWorkerRuntime } from "../src/runtime.ts";
 import { normalizePathArgument, pathShouldStayLocal } from "../src/path-domain.ts";
 import { remoteWrapperApproval } from "../src/omp/approval-targets.ts";
@@ -211,5 +214,21 @@ describe("native workspace parity", () => {
       expect(result).not.toContain("has no doc topics");
       expect(result).toContain(nativeRead.docTopics().sources!.split("\n")[0]!.slice(0, 40).replace(/"/g, '\\"'));
     } finally { await harness.close(); await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  test("the session LSP switch is read from the ToolSession native write/edit gate on", () => {
+    // tools/write.ts and edit/index.ts gate formatting/diagnostics on `this.session.enableLsp`;
+    // if the SDK renames or hides that field, this must fail instead of silently forwarding true.
+    // AgentSession.getToolByName returns natives wrapped as sdk.ts builds them.
+    for (const enableLsp of [false, true, undefined]) {
+      const session = { cwd: "/tmp", settings: Settings.isolated(), enableLsp } as unknown as ToolSession;
+      for (const tool of [new WriteTool(session), new EditTool(session), new ReadTool(session)]) {
+        expect(nativeSessionLspEnabled(tool)).toBe(enableLsp !== false);
+        const registered = new ExtensionToolWrapper(wrapToolWithMetaNotice(tool as AgentTool), {} as never);
+        expect(nativeSessionLspEnabled(registered)).toBe(enableLsp !== false);
+      }
+    }
+    expect(nativeSessionLspEnabled(undefined)).toBeUndefined();
+    expect(nativeSessionLspEnabled({ name: "foreign" })).toBeUndefined();
   });
 });

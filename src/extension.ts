@@ -1,5 +1,4 @@
 import { resolve as resolvePath } from "node:path";
-import { cfgTaskEnableLsp } from "@oh-my-pi/pi-coding-agent/task/settings";
 import type { AgentTool, AgentToolResult, ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { z } from "@oh-my-pi/omptype/zod";
 import type {
@@ -82,22 +81,20 @@ export function captureLocalExecutionSettings(): RemoteExecutionSettings {
 }
 
 /**
- * The native effective LSP switch of the session that owns a remote runtime.
- * Native ToolSession.enableLsp is not public: an owner session creates the `lsp`
- * tool exactly when it is on (`--no-lsp` and `lsp.enabled` both clear it), and a
- * subagent's switch is its parent's AND `task.enableLsp` (default off). The same
- * switch gates format-on-write and write/edit diagnostics, so a session without
- * LSP must not start remote language servers through write/edit either.
+ * Native write/edit gate formatting and diagnostics on `ToolSession.enableLsp &&
+ * lsp.enabled` (`tools/write.ts`, `edit/index.ts`). `lsp.*` settings are forwarded;
+ * enableLsp is fixed when the session is built (`--no-lsp`, a subagent's spawn-time
+ * `task.enableLsp`) and SDK 18.20 exposes it only on the native tools' `session`
+ * field. Tests construct the native tools so a renamed field fails loudly.
  */
-function effectiveLspEnabled(state: RemoteExtensionState, owner: ReturnType<typeof hostSessionFor>): boolean {
-  if (!owner) return true;
-  if (state.family && !state.owner) return state.family.lspEnabled && cfgTaskEnableLsp.get(owner.settings);
-  return owner.getToolByName("lsp") !== undefined;
+export function nativeSessionLspEnabled(tool: unknown): boolean | undefined {
+  const session = (tool as { session?: { enableLsp?: boolean } } | undefined)?.session;
+  return session && typeof session === "object" ? session.enableLsp !== false : undefined;
 }
 
 function captureOwnerExecutionSettings(state: RemoteExtensionState, owner: ReturnType<typeof hostSessionFor>): RemoteExecutionSettings {
   const settings = owner ? captureExecutionSettings(owner.settings) : captureLocalExecutionSettings();
-  return effectiveLspEnabled(state, owner) ? settings : { ...settings, "lsp.enabled": false };
+  return state.sessionLspEnabled === false ? { ...settings, "lsp.enabled": false } : settings;
 }
 
 /** Probe the bound native write gate: it owns the actual host ToolSession's
@@ -299,6 +296,8 @@ type RemoteExtensionState = {
   sessionFile?: string;
   hostContext?: Pick<ExtensionContext, "agent" | "sessionManager">;
   wrappedTools: Set<RemoteToolName>;
+  /** Native ToolSession.enableLsp of this session, read from a wrapped native tool. */
+  sessionLspEnabled?: boolean;
   proposalSources: ExecutionTarget[];
   selected: boolean;
   owner: boolean;
@@ -986,6 +985,7 @@ function registerWrapper(
   fallbackConcurrency?: AgentTool["concurrency"],
 ): void {
   const original = hostSessionFor(state)?.getToolByName(name);
+  state.sessionLspEnabled ??= nativeSessionLspEnabled(original);
   const approval = remoteWrapperApproval(
     name,
     typeof original?.approval === "function" ? original.approval.bind(original) : original?.approval ?? approvalFor(name),
@@ -1633,7 +1633,6 @@ async function connectOwner(
       remoteCwd: resolvedRemoteCwd,
       connection: { ...connection, cwd: resolvedRemoteCwd },
       cacheAudit: prepared.cacheAudit,
-      lspEnabled: effectiveLspEnabled(state, hostSessionFor(state, ctx)),
       members: new Set([state]),
       closing: false,
     };

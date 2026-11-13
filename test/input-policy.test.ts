@@ -33,7 +33,7 @@ async function harness(selected: boolean, bareSlashCommands = false, cwd = "/loc
   const family: Family = {
     ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: "/remote/workspace",
     connection: { target: "fixture.invalid", displayTarget: "fixture", cwd: "/remote/workspace", workerPath: "/remote/worker" },
-    members: new Set(), lspEnabled: true, closing: true,
+    members: new Set(), closing: true,
   };
   const families = (globalThis as unknown as Record<symbol, Map<string, Family>>)[Symbol.for("omp-ssh-remote/session-families")]!;
   const manager = await SessionManager.open(sessionFile, dirname(sessionFile), undefined, { initialCwd: cwd, suppressBreadcrumb: true });

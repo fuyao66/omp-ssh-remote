@@ -52,11 +52,12 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   },
   {
     id: "effective-lsp-switch",
-    plugin: ["src/extension.ts", "src/thread-family.ts", "src/runtime.ts"],
-    native: ["sdk.ts", "main.ts", "tools/index.ts", "tools/write.ts", "edit/index.ts", "task/index.ts", "task/settings.ts"],
-    assumption: "ToolSession.enableLsp is not public. An owner session creates the lsp tool exactly when enableLsp && lsp.enabled; a subagent's enableLsp is its parent's AND task.enableLsp (default false) regardless of its restricted tool list; write/edit format-on-write and diagnostics are gated by the same switch.",
+    plugin: ["src/extension.ts", "src/runtime.ts"],
+    native: ["sdk.ts", "main.ts", "tools/write.ts", "edit/index.ts", "tools/read.ts", "task/index.ts", "task/executor.ts"],
+    assumption: "Native write/edit gate formatting and diagnostics on ToolSession.enableLsp && lsp.enabled. enableLsp is fixed at session construction (--no-lsp; a subagent's spawn-time parent AND task.enableLsp) and is independent of the lsp tool's presence; SDK 18.20 exposes it only as the native tools' private `session` field, which the plugin reads per session.",
     coveredBy: [
-      { path: "test/lifecycle-transactions.test.ts", name: "remote runtimes follow the owning session's native effective LSP switch" },
+      { path: "test/native-parity.test.ts", name: "the session LSP switch is read from the ToolSession native write/edit gate on" },
+      { path: "test/lifecycle-transactions.test.ts", name: "remote runtimes follow each session's own native enableLsp, not inferred tool lists or task settings" },
       { path: "test/runtime-dispose.test.ts", name: "the forwarded effective LSP switch reaches the worker session" },
     ],
   },

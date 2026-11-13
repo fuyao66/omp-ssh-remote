@@ -62,7 +62,7 @@ async function harness(options: { remote?: boolean; authority?: boolean } = {}) 
   const ref = registry.register(input);
   const identity: ThreadMemberIdentity = { agentId: ref.id, registryGeneration: ref.generation, instanceKey, sessionFile };
   const family: ThreadFamilySource = {
-    ownerSessionFile: owner, members: new Set(), lspEnabled: true, closing: false,
+    ownerSessionFile: owner, members: new Set(), closing: false,
     localCwd: "/local/workspace", remoteCwd: "/remote/workspace",
     connection: { target: "worker.example.invalid", displayTarget: "fixture", cwd: "/remote/workspace", workerPath: "/remote/worker.mjs" },
   };
