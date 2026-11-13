@@ -228,7 +228,7 @@ describe("extension workspace architecture", () => {
     const family: Family = {
       ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: cwd,
       connection: { target: "fixture.invalid", displayTarget: "fixture", cwd, workerPath: "/fixture/worker" },
-      members: new Set(), closing: false,
+      members: new Set(), lspEnabled: true, closing: false,
     };
     const harness = await extensionHarness(`${root}/subagent/child.jsonl`, undefined, ["read"]);
     const broker = (globalThis as unknown as Record<symbol, Map<string, Family>>)[Symbol.for("omp-ssh-remote/session-families")]!;
@@ -263,7 +263,7 @@ describe("extension workspace architecture", () => {
     const family: Family = {
       ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: import.meta.dir,
       connection: { target: "test@example.invalid", displayTarget: "test-remote", cwd: import.meta.dir, workerPath: "/remote/worker.mjs" },
-      members: new Set(), closing: false,
+      members: new Set(), lspEnabled: true, closing: false,
     };
     const reader = new ReadTool({
       cwd: "/local/workspace", settings: Settings.isolated({ "launch.enabled": false }), hasUI: false,
@@ -317,7 +317,7 @@ describe("extension workspace architecture", () => {
     const family: Family = {
       ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: import.meta.dir,
       connection: { target: "test@example.invalid", displayTarget: "test-remote", cwd: import.meta.dir, workerPath: "/remote/worker.mjs" },
-      members: new Set(), closing: false,
+      members: new Set(), lspEnabled: true, closing: false,
     };
     const localPaths: unknown[] = [];
     const remotePaths: unknown[] = [];
@@ -384,7 +384,7 @@ describe("extension workspace architecture", () => {
     const family: Family = {
       ownerSessionFile: ownerFile, root, localCwd: "/local/workspace", remoteCwd: import.meta.dir,
       connection: { target: "test@example.invalid", displayTarget: "test-remote", cwd: import.meta.dir, workerPath: "/remote/worker.mjs" },
-      members: new Set(), closing: false,
+      members: new Set(), lspEnabled: true, closing: false,
     };
     const localPaths: unknown[] = [];
     const harness = await extensionHarness(childFile, undefined, ["write"], async input => {
@@ -434,7 +434,7 @@ describe("extension workspace architecture", () => {
         workerPath: "/remote/worker.mjs",
       },
       members: new Set(),
-      closing: false,
+      lspEnabled: true, closing: false,
     };
     const member = (sessionFile: string, owner: boolean): Member => ({
       binding: crypto.randomUUID(),

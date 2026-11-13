@@ -64,10 +64,12 @@ async function cleanupWorker(reason: Error): Promise<void> {
       Promise.allSettled([disposeAllKernelSessions(), disposeAllVmContexts(), shutdownAllLspClients()]),
       Bun.sleep(5_000),
     ]);
-    await closeDaemonClients().catch(() => undefined);
-    // Artifacts only matter while this worker can still serve remote-artifact://
-    // reads; once the transport is gone they are unreachable, so free them.
+    // Native session teardown runs tool dispose callbacks (which unsubscribe
+    // service completions with preservePending) before daemon clients close,
+    // and drains cancelled shells' TERM→KILL wave. Artifacts are freed with it:
+    // once the transport is gone, remote-artifact:// reads are unreachable.
     await runtime?.dispose().catch(() => undefined);
+    await closeDaemonClients().catch(() => undefined);
   })();
   return cleanupPromise;
 }

@@ -181,17 +181,9 @@ describe("remote session boundaries", () => {
       remoteControlPlaneBlockReason("task", { task: "read", isolated: false }),
     ).toBeUndefined();
   });
-  test("task files require explicit host ownership for absolute paths, including batch items", () => {
-    for (const taskFile of ["/remote/task.txt", "C:\\host\\task.txt", "\\\\host\\share\\task.txt"]) {
-      expect(remoteControlPlaneBlockReason("task", { taskFile })).toContain("Use local://");
-      expect(remoteControlPlaneBlockReason("task", { tasks: [{ task: "first" }, { taskFile }] })).toContain("Use local://");
-    }
-    for (const taskFile of ["local://task.txt", "relative-task.txt"]) {
-      expect(remoteControlPlaneBlockReason("task", { taskFile })).toBeUndefined();
-      expect(remoteControlPlaneBlockReason("task", { tasks: [{ taskFile }] })).toBeUndefined();
-    }
+  test("task batches and non-task tools pass the control-plane guard", () => {
     expect(remoteControlPlaneBlockReason("task", { tasks: [null, { task: "inline" }] })).toBeUndefined();
-    expect(remoteControlPlaneBlockReason("extension_tool", { taskFile: "/local/task.txt" })).toBeUndefined();
+    expect(remoteControlPlaneBlockReason("extension_tool", {})).toBeUndefined();
     expect(remoteControlPlaneBlockReason("mcp_server_tool", {})).toBeUndefined();
   });
   test("keeps native conversation checkpoints local while blocking workspace scans", () => {

@@ -16,6 +16,8 @@ export interface ThreadFamilyDescriptor {
   remoteCwd: string;
   connection: FamilyConnection;
   cacheAudit?: RemoteWorkerCacheAudit;
+  /** The owner session's effective LSP switch; subagents combine it with task.enableLsp. */
+  lspEnabled: boolean;
   generation: string;
   revocation: SharedArrayBuffer;
 }
@@ -35,6 +37,7 @@ export interface ThreadFamilySource extends FamilyBrokerFamily {
   remoteCwd: string;
   connection: FamilyConnection;
   cacheAudit?: RemoteWorkerCacheAudit;
+  lspEnabled: boolean;
   threadMembers?: Set<ThreadMemberControl>;
 }
 export type ThreadFamilyDecision = { kind: "local" } | { kind: "unavailable"; reason: string } |
@@ -178,7 +181,7 @@ export class ThreadFamilyBridge {
       this.#owners.set(token, { peer, identity, family, control, owner });
       const descriptor: ThreadFamilyDescriptor = {
         ownerSessionFile: family.ownerSessionFile, localCwd: family.localCwd, remoteCwd: family.remoteCwd,
-        connection: family.connection, cacheAudit: family.cacheAudit, ...familyLease(family),
+        connection: family.connection, cacheAudit: family.cacheAudit, lspEnabled: family.lspEnabled, ...familyLease(family),
       };
       return { kind: "active", token, family: descriptor, runtime: owner.address } satisfies ThreadFamilyDecision;
     }

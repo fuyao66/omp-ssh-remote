@@ -42,6 +42,25 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     ],
   },
   {
+    id: "worker-session-teardown",
+    plugin: ["src/runtime.ts", "src/worker-companion.ts"],
+    native: ["session/agent-session.ts", "sdk.ts", "launch/services.ts", "exec/bash-executor.ts"],
+    assumption: "Native session disposal runs ToolSession dispose callbacks (service completion unsubscription with preservePending), awaits drainAbortedShells for the session id and its :async: keys, and releaseShellSessions drops the session's persistent shells; persistent shells are keyed by getSessionId.",
+    coveredBy: [
+      { path: "test/runtime-dispose.test.ts", name: "dispose runs tool dispose callbacks once and releases the owner's persistent shell" },
+    ],
+  },
+  {
+    id: "effective-lsp-switch",
+    plugin: ["src/extension.ts", "src/thread-family.ts", "src/runtime.ts"],
+    native: ["sdk.ts", "main.ts", "tools/index.ts", "tools/write.ts", "edit/index.ts", "task/index.ts", "task/settings.ts"],
+    assumption: "ToolSession.enableLsp is not public. An owner session creates the lsp tool exactly when enableLsp && lsp.enabled; a subagent's enableLsp is its parent's AND task.enableLsp (default false) regardless of its restricted tool list; write/edit format-on-write and diagnostics are gated by the same switch.",
+    coveredBy: [
+      { path: "test/lifecycle-transactions.test.ts", name: "remote runtimes follow the owning session's native effective LSP switch" },
+      { path: "test/runtime-dispose.test.ts", name: "the forwarded effective LSP switch reaches the worker session" },
+    ],
+  },
+  {
     id: "worker-eval-tool-lookup",
     plugin: ["src/runtime.ts", "src/worker-companion.ts"],
     native: ["eval/js/tool-bridge.ts"],
@@ -377,6 +396,20 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     assumption: "Native registered wrappers preserve live schema and grammar getters plus loading and approval metadata without acquiring native speculative-execution policy.",
     coveredBy: [],
     gap: "Metadata harnesses do not execute the real SDK registry replacement and presentation pipeline.",
+  },
+  {
+    id: "wrapper-doc-topics",
+    plugin: ["src/extension.ts"],
+    native: ["extensibility/tool-proxy.ts", "extensibility/extensions/wrapper.ts", "internal-urls/xd-protocol.ts", "tools/read.ts", "tools/eval.ts"],
+    assumption: "applyToolProxy copies every definition key, including the undeclared docTopics, onto RegisteredToolAdapter and ExtensionToolWrapper; xd://<tool>/<topic> resolves through session.getToolByName, so a wrapper without docTopics hides native read/eval documentation even in local mode.",
+    coveredBy: [{ path: "test/native-parity.test.ts", name: "wrapped read keeps native xd:// doc topics reachable" }],
+  },
+  {
+    id: "remote-read-batch-ordering",
+    plugin: ["src/extension.ts"],
+    native: ["../../pi-agent-core/src/agent-loop.ts", "../../pi-agent-core/src/types.ts", "tools/read.ts", "extensibility/extensions/runner.ts"],
+    assumption: "Native read awaits toolCall.earlierEffectsSettled (earlier shared non-read-tier calls in its batch). ExtensionContext from runner.createContext omits toolCall, so remote-routed reads declare exclusive concurrency instead; a throwing resolver also schedules exclusive. Drop this once the SDK exposes toolCall to registered tools.",
+    coveredBy: [{ path: "test/lifecycle-transactions.test.ts", name: "remote reads schedule after earlier same-batch effects; local reads stay shared" }],
   },
   {
     id: "remote-image-question-error",

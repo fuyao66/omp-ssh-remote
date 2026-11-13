@@ -197,4 +197,19 @@ describe("native workspace parity", () => {
       expect(selected).not.toContain("theirs");
     } finally { await store.dispose(); await runtime.dispose(); await rm(cwd, { recursive: true, force: true }); }
   });
+
+  test("wrapped read keeps native xd:// doc topics reachable", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-parity-doc-topics-"));
+    const session = { cwd, settings: Settings.isolated({ "lsp.enabled": false }), getSessionFile: () => null } as unknown as ToolSession;
+    const nativeRead = new ReadTool(session);
+    const harness = await wrappers(cwd, [nativeRead]);
+    try {
+      const wrapped = wrapRegisteredTool({ definition: harness.definitions.get("read")!, extensionPath: "parity" } as never, {} as never);
+      session.getToolByName = (name: string) => (name === "read" ? wrapped : undefined);
+      expect(Object.keys(wrapped.docTopics?.() ?? {})).toEqual(Object.keys(nativeRead.docTopics()));
+      const result = JSON.stringify(await nativeRead.execute("topic", { path: "xd://read/sources" }));
+      expect(result).not.toContain("has no doc topics");
+      expect(result).toContain(nativeRead.docTopics().sources!.split("\n")[0]!.slice(0, 40).replace(/"/g, '\\"'));
+    } finally { await harness.close(); await rm(cwd, { recursive: true, force: true }); }
+  });
 });

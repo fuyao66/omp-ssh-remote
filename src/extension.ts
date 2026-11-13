@@ -1,4 +1,5 @@
-import { isAbsolute, win32, resolve as resolvePath } from "node:path";
+import { resolve as resolvePath } from "node:path";
+import { cfgTaskEnableLsp } from "@oh-my-pi/pi-coding-agent/task/settings";
 import type { AgentTool, AgentToolResult, ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { z } from "@oh-my-pi/omptype/zod";
 import type {
@@ -78,6 +79,25 @@ export function captureLocalExecutionSettings(): RemoteExecutionSettings {
   } catch {
     return {};
   }
+}
+
+/**
+ * The native effective LSP switch of the session that owns a remote runtime.
+ * Native ToolSession.enableLsp is not public: an owner session creates the `lsp`
+ * tool exactly when it is on (`--no-lsp` and `lsp.enabled` both clear it), and a
+ * subagent's switch is its parent's AND `task.enableLsp` (default off). The same
+ * switch gates format-on-write and write/edit diagnostics, so a session without
+ * LSP must not start remote language servers through write/edit either.
+ */
+function effectiveLspEnabled(state: RemoteExtensionState, owner: ReturnType<typeof hostSessionFor>): boolean {
+  if (!owner) return true;
+  if (state.family && !state.owner) return state.family.lspEnabled && cfgTaskEnableLsp.get(owner.settings);
+  return owner.getToolByName("lsp") !== undefined;
+}
+
+function captureOwnerExecutionSettings(state: RemoteExtensionState, owner: ReturnType<typeof hostSessionFor>): RemoteExecutionSettings {
+  const settings = owner ? captureExecutionSettings(owner.settings) : captureLocalExecutionSettings();
+  return effectiveLspEnabled(state, owner) ? settings : { ...settings, "lsp.enabled": false };
 }
 
 /** Probe the bound native write gate: it owns the actual host ToolSession's
@@ -600,13 +620,6 @@ export function remoteControlPlaneBlockReason(
   if (toolName === "task" && taskRequestsIsolation(params)) {
     return "Remote runtime does not support OMP local isolated worktrees. Use isolated:false or disconnect first.";
   }
-  if (toolName === "task") {
-    const tasks = [params, ...(Array.isArray(params.tasks) ? params.tasks.map(asRecord) : [])];
-    if (tasks.some(task => typeof task.taskFile === "string" &&
-        (isAbsolute(task.taskFile) || win32.isAbsolute(task.taskFile)))) {
-      return "taskFile absolute paths are ambiguous while remote is selected. Use local:// for a host task file; remote task files are not read by the local task tool.";
-    }
-  }
   if (toolName === "bash" && params.async === true && !resolveLocalAsyncJobManager(sessionFile)) {
     return "Remote async bash requires the local OMP background job manager, which is unavailable in this session.";
   }
@@ -752,6 +765,26 @@ async function localXdevAvailable(
   );
 }
 
+function ownershipState(state: RemoteExtensionState, ctx?: ExtensionContext) {
+  return {
+    selected: state.selected, binding: state.binding, editMode: effectiveHostEditMode(state, ctx),
+    isLocalProcessId: (id: string) => resolveLocalAsyncJobManager(state.sessionFile)?.getAllJobs().some(job => job.id === id) === true ||
+      AgentRegistry.global().list().some(agent => agent.id === id),
+  };
+}
+
+/**
+ * Native read awaits toolCall.earlierEffectsSettled before reading, but SDK 18.20's
+ * ExtensionContext does not expose toolCall, so a remote read cannot wait for an
+ * earlier shared remote bash in its batch. Exclusive scheduling restores that order
+ * (at the cost of serializing remote reads). Throws count as exclusive natively.
+ */
+function readsRemoteWorkspace(params: Record<string, unknown>, state: RemoteExtensionState): boolean {
+  if (!state.selected) return false;
+  const owner = resourceOwnershipTarget("read", params, ownershipState(state));
+  return (owner ?? (pathShouldStayLocal("read", params, effectiveHostEditMode(state)) ? "local" : "remote")) === "remote";
+}
+
 async function executionTarget(
   name: RemoteToolName,
   params: Record<string, unknown>,
@@ -759,11 +792,7 @@ async function executionTarget(
   ctx: ExtensionContext,
   signal?: AbortSignal,
 ): Promise<ExecutionTarget> {
-  const ownership = {
-    selected: state.selected, binding: state.binding, editMode: effectiveHostEditMode(state, ctx),
-    isLocalProcessId: (id: string) => resolveLocalAsyncJobManager(state.sessionFile)?.getAllJobs().some(job => job.id === id) === true ||
-      AgentRegistry.global().list().some(agent => agent.id === id),
-  };
+  const ownership = ownershipState(state, ctx);
   const owner = resourceOwnershipTarget(name, params, ownership);
   let target: ExecutionTarget;
   if (owner) target = owner;
@@ -964,16 +993,19 @@ function registerWrapper(
     () => ({ ...state, editMode: effectiveHostEditMode(state) }),
     original?.formatApprovalDetails?.bind(original),
   );
-  // ToolDefinition does not declare formatApprovalDetails, yet OMP's registered-tool
-  // adapter forwards every definition key to its approval prompt; a test pins this.
-  const definition: ToolDefinition & Pick<AgentTool, "formatApprovalDetails"> = {
+  // ToolDefinition declares neither formatApprovalDetails nor docTopics, yet OMP's
+  // registered-tool adapter forwards every definition key; tests pin both.
+  const definition: ToolDefinition & Pick<AgentTool, "formatApprovalDetails" | "docTopics"> = {
     name,
     label: original?.label ?? TOOL_LABELS[name],
     get description() { return original?.description ?? native.description; },
     get parameters() { return original?.parameters ?? native.parameters; },
     get concurrency() {
       const concurrency = original?.concurrency ?? fallbackConcurrency;
-      return typeof concurrency === "function" ? concurrency.bind(original) : concurrency;
+      const bound = typeof concurrency === "function" ? concurrency.bind(original) : concurrency;
+      if (name !== "read") return bound;
+      return (args: Record<string, unknown>) => readsRemoteWorkspace(args, state) ? "exclusive"
+        : typeof bound === "function" ? bound(args) : bound ?? "shared";
     },
     ...remoteWrapperRenderer(name),
     loadMode: original?.loadMode ?? "essential",
@@ -982,6 +1014,8 @@ function registerWrapper(
     strict: original?.strict,
     get customWireName() { return original?.customWireName; },
     get customFormat() { return original?.customFormat; },
+    // xd://<tool>/<topic> resolves through getToolByName; without this the wrapper hides native docs.
+    docTopics: original?.docTopics ? () => original.docTopics!() : undefined,
     approval: approval.approval,
     approvalCacheTargets: approval.approvalCacheTargets,
     formatApprovalDetails: approval.formatApprovalDetails,
@@ -1248,7 +1282,7 @@ async function openRemoteTransport(
     const taskDepth = ctx?.agent?.depth ?? 0;
     const ready = await client.initialize(cwd, handshake, undefined, {
       sessionId: launchOwnerId(ctx),
-      settings: owner ? captureExecutionSettings(owner.settings) : captureLocalExecutionSettings(),
+      settings: captureOwnerExecutionSettings(state, owner),
       outReplies: captureOutReplyCapability(owner?.getToolByName("write")?.approval, taskDepth),
       taskDepth,
       signal,
@@ -1599,6 +1633,7 @@ async function connectOwner(
       remoteCwd: resolvedRemoteCwd,
       connection: { ...connection, cwd: resolvedRemoteCwd },
       cacheAudit: prepared.cacheAudit,
+      lspEnabled: effectiveLspEnabled(state, hostSessionFor(state, ctx)),
       members: new Set([state]),
       closing: false,
     };

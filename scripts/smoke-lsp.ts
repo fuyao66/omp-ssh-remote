@@ -63,7 +63,11 @@ export default async function lspSmoke(pi: ExtensionAPI) {
       return result;
     };
     const lsp = (action: string, params: object = {}) => ok("lsp", { action, ...params });
-    const shell = async (command: string): Promise<string> => text(await ok("bash", { command }));
+    // Native bash appends "Wall time: …" to slow commands; file-content checks compare only the output.
+    const shell = async (command: string): Promise<string> => {
+      const result = await ok("bash", { command });
+      return result.details?.wallTimeNoticeEmitted ? text(result).replace(/\n\nWall time: [^\n]*$/, "") : text(result);
+    };
     const disk = async (path: string): Promise<string> => shell(`cat -- ${quote(path)}`);
     const write = (path: string, content: string) => ok("write", { path, content });
     const failure = async (params: object, expected: RegExp): Promise<string> => {

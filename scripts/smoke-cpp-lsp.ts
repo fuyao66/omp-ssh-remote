@@ -53,7 +53,11 @@ export default async function cppLspSmoke(pi: ExtensionAPI) {
       return result;
     };
     const lsp = async (action: string, params: object = {}) => text(await invoke("lsp", { action, ...params }));
-    const shell = async (command: string) => text(await invoke("bash", { command }));
+    // Native bash appends "Wall time: …" to slow commands; file-content checks compare only the output.
+    const shell = async (command: string) => {
+      const result = await invoke("bash", { command });
+      return result.details?.wallTimeNoticeEmitted ? text(result).replace(/\n\nWall time: [^\n]*$/, "") : text(result);
+    };
     const disk = (path: string) => shell(`cat -- ${quote(path)}`);
     const put = (path: string, content: string) => invoke("write", { path, content });
     const reconnectArgs = (cwd: string): string => {

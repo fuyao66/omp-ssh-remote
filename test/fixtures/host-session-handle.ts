@@ -33,7 +33,7 @@ export function hostSessionHandle(
     getAdvisorStatusOverview: () => ({ configured: false, advisors: [] }),
     getSessionAgents: () => [],
     hasQueuedIrcFrom: () => false,
-    drainPendingIrcInboxMessages: () => [],
+    hasIrcInterrupts: () => false,
     emitIrcRelayObservation: unsupported,
     deliverIrcMessage: async () => unsupported(),
     waitForIrcReplies: async () => {},

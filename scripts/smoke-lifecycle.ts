@@ -1,5 +1,6 @@
 // Bundle and run inside native OMP; no model requests are made.
 import assert from "node:assert/strict";
+import { agentLoopContinue } from "@oh-my-pi/pi-agent-core";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { resolveLocalHostSession } from "../src/omp/host-session.ts";
 import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
@@ -151,6 +152,23 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       const header = read.match(/\[[^\]\n]+#[A-F0-9]+\]/)?.[0]; assert(header);
       await invoke("edit", { input: `${header}\nPUT 1.=1:\n+second` });
       assert(text(await invoke("read", { path: file })).includes("second"));
+      // Native read awaits earlierEffectsSettled; registered tools never see it, so remote reads
+      // must be scheduled after an earlier shared bash in the same batch by the real agent loop.
+      const ordered = `${file}.order`;
+      await invoke("write", { path: ordered, content: "old\n" });
+      const batch = agentLoopContinue({ systemPrompt: [], tools: ["bash", "read"].map(name => session.getToolByName(name)!), messages: [{ role: "assistant", content: [
+        { type: "toolCall", id: "order-bash", name: "bash", arguments: { command: `sleep 0.5; printf 'new\\n' > '${ordered}'` } },
+        { type: "toolCall", id: "order-read", name: "read", arguments: { path: ordered } },
+      ], stopReason: "toolUse", timestamp: Date.now() } as never] }, {
+        model: { id: "fixture", api: "openai-responses", provider: "openai", contextWindow: 10000 } as never,
+        convertToLlm: messages => messages as never, beforeModelCall: () => ({ stop: true }),
+      });
+      let batchRead: { text: string; isError?: boolean } | undefined;
+      for await (const event of batch) if (event.type === "tool_execution_end" && event.toolName === "read") batchRead = { text: text(event.result), isError: event.isError };
+      assert(batchRead && !batchRead.isError && batchRead.text.includes("new") && !batchRead.text.includes("old"), `same-batch read saw ${JSON.stringify(batchRead)}`);
+      console.log("BATCH_READ_AFTER_BASH_PASS");
+      assert(text(await invoke("read", { path: "xd://read/sources" })).length > 0);
+      console.log("XD_DOC_TOPICS_PASS");
       for (const language of ["js", "py"]) assert(text(await invoke("eval", { language, code: "print(6 * 7)", title: "upgrade compute" })).includes("42"));
       assert(text(await invoke("lsp", { action: "status" })).length > 0);
       const output = text(await invoke("bash", { command: "seq 1 20000" }));

@@ -18,6 +18,7 @@ import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { createXdevState, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
+import { drainAbortedShells, releaseShellSessions } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import {
@@ -65,7 +66,6 @@ export interface RemoteNativeTool {
 const WORKER_OVERRIDES = {
   "async.enabled": false,
   "bash.autoBackground.enabled": false,
-  "lsp.enabled": true,
   "lsp.lazy": true,
   "lsp.shared": false,
   "memory.backend": "off",
@@ -89,7 +89,7 @@ export type NativeWorkerRuntime = {
   executeEval: (invoke: NonNullable<NativeWorkerRuntimeOptions["invokeTool"]>, ...args: Parameters<RemoteNativeTool["execute"]>) => Promise<unknown>;
   createJobBash: (onCapture: JobCaptureSender, foreground?: boolean) => RemoteNativeTool;
   stopService: (name: string, id: string) => Promise<ServiceStopReceipt>;
-  /** Release runtime-owned host resources (the output artifact namespace). Idempotent. */
+  /** Native session teardown for this owner: tool dispose callbacks, cancelled-shell drain, shells, artifacts. Idempotent. */
   dispose: () => Promise<void>;
 };
 
@@ -327,7 +327,19 @@ export async function createNativeWorkerRuntime(
   for (const name of xdevMountedNames)
     xdevTools.set(name, tools[name as RemoteToolName] as Tool);
   let disposed: Promise<void> | undefined;
-  const dispose = () => (disposed ??= (revisions.dispose(), artifacts.dispose()));
+  // Mirrors the execution-side part of native AgentSession.dispose: registered
+  // tool callbacks (service completion subscriptions), then the delayed TERM→KILL
+  // wave of cancelled shells, then this owner's persistent shells.
+  const dispose = () => (disposed ??= (async () => {
+    for (const callback of [...disposeCallbacks]) {
+      try { callback(); } catch { /* one failing subsystem must not skip the rest */ }
+    }
+    disposeCallbacks.clear();
+    await drainAbortedShells(sessionId);
+    releaseShellSessions(sessionId);
+    revisions.dispose();
+    await artifacts.dispose();
+  })());
   return {
     cwd: absoluteCwd, sessionId, tools, session, editMode, resourceBinding, dispose,
     executeEval: async (invoke, ...args) => {

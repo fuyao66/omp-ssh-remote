@@ -12,7 +12,7 @@ import { AgentRegistry, type AgentRef } from "@oh-my-pi/pi-coding-agent/registry
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { Database } from "bun:sqlite";
-import { Agent, ProxyMessageEventStream } from "@oh-my-pi/pi-agent-core";
+import { Agent, ProxyMessageEventStream, resolveToolConcurrency, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
@@ -98,6 +98,7 @@ type Harness = {
   }): Promise<{ details?: unknown }>;
   state(family: Family): State;
   status(): Promise<{ mode: string }>;
+  tool(name: string): ToolDefinition;
 };
 const harnesses: Harness[] = [];
 const nativeSessions: { session: AgentSession; auth: AuthStorage; id: string }[] = [];
@@ -242,7 +243,8 @@ async function nativeExecutorChild(owner: Harness, family: Family, id: string) {
   return { sessions, requests: () => requests };
 }
 const settle = (promise: Promise<unknown>): Promise<Error | null> => promise.then(() => null, (error: Error) => error);
-async function harness(sessionFile = join(directory, "owner.jsonl"), agent: ExtensionContext["agent"] = { kind: "main", id: `owner-${crypto.randomUUID()}`, name: "owner", depth: 0 }): Promise<Harness> {
+async function harness(sessionFile = join(directory, "owner.jsonl"), agent: ExtensionContext["agent"] = { kind: "main", id: `owner-${crypto.randomUUID()}`, name: "owner", depth: 0 },
+  host: { lspTool?: boolean; settings?: Settings } = {}): Promise<Harness> {
   const hooks = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
   const tools = new Map<string, ToolDefinition>(), commands = new Map<string, { handler: Function }>();
   const nativeReads: string[] = [];
@@ -258,8 +260,9 @@ async function harness(sessionFile = join(directory, "owner.jsonl"), agent: Exte
     },
   } as unknown as ExtensionContext;
   const session = {
-    instanceKey: `main:${crypto.randomUUID()}`, sessionManager: manager, settings: Settings.isolated(),
-    getToolByName: () => undefined, getAdvisorStats: () => ({ configured: false, advisors: [] }),
+    instanceKey: `main:${crypto.randomUUID()}`, sessionManager: manager, settings: host.settings ?? Settings.isolated(),
+    getToolByName: (name: string) => host.lspTool && name === "lsp" ? { name: "lsp" } : undefined,
+    getAdvisorStats: () => ({ configured: false, advisors: [] }),
     async runToolRegistryMutation(mutate: () => Promise<void>) { await mutate(); },
   } as unknown as AgentSessionHandle;
   const registry = AgentRegistry.global();
@@ -294,6 +297,7 @@ async function harness(sessionFile = join(directory, "owner.jsonl"), agent: Exte
     ),
     state: (family: Family): State => [...family.members].find(member => member.sessionFile === sessionFile)!,
     status: async () => (await tools.get("remote_workspace_status")!.execute("status", {}, undefined, undefined, ctx)).details as { mode: string },
+    tool: (name: string) => tools.get(name)!,
   };
   harnesses.push(h); await h.emit("session_start"); return h;
 }
@@ -395,6 +399,42 @@ test("forced reconnect rotates binding, drops remote proposals, and routes to th
   expect(next.details).toMatchObject({ path: "/remote/after" });
   expect((next.details as { pid: number }).pid).not.toBe((previous.details as { pid: number }).pid);
   expect(owner.nativeReads).toEqual([]);
+});
+
+test("remote runtimes follow the owning session's native effective LSP switch", async () => {
+  const forwarded = () => (tracking.mock.calls.at(-1)![3] as { settings: Record<string, unknown> }).settings["lsp.enabled"];
+  // An owner without the lsp tool (--no-lsp or lsp.enabled:false) must not start
+  // remote language servers through write/edit formatting or diagnostics.
+  const plain = await harness(join(directory, "plain.jsonl"));
+  await plain.execute("remote_connect", { target: "fixture.invalid", cwd: "/remote" });
+  expect(forwarded()).toBe(false);
+  expect(active.get(plain.sessionFile)!.lspEnabled).toBe(false);
+  await plain.execute("remote_exit", { force: true });
+
+  const owner = await harness(join(directory, "lsp.jsonl"), undefined, { lspTool: true });
+  await owner.execute("remote_connect", { target: "fixture.invalid", cwd: "/remote" });
+  expect(forwarded()).toBeUndefined();
+  const family = active.get(owner.sessionFile)!;
+  expect(family.lspEnabled).toBe(true);
+  // Native subagents: parent switch AND task.enableLsp (default off), whatever
+  // their own restricted tool list says.
+  await harness(`${family.root}/subagent/default.jsonl`, undefined, { lspTool: true });
+  expect(forwarded()).toBe(false);
+  await harness(`${family.root}/subagent/enabled.jsonl`, undefined, { settings: Settings.isolated({ "task.enableLsp": true }) });
+  expect(forwarded()).toBeUndefined();
+});
+
+test("remote reads schedule after earlier same-batch effects; local reads stay shared", async () => {
+  // Native read awaits toolCall.earlierEffectsSettled, which ExtensionContext does not expose.
+  const owner = await harness(join(directory, "ordering.jsonl"));
+  const read = owner.tool("read") as unknown as AgentTool<any>;
+  expect(resolveToolConcurrency(read, { path: "src/a.ts" })).toBe("shared");
+  await owner.execute("remote_connect", { target: "fixture.invalid", cwd: "/remote" });
+  expect(resolveToolConcurrency(read, { path: "src/a.ts" })).toBe("exclusive");
+  expect(resolveToolConcurrency(read, { path: "local://notes.md" })).toBe("shared");
+  expect(resolveToolConcurrency(owner.tool("bash") as unknown as AgentTool<any>, { command: "true" })).toBe("shared");
+  await owner.execute("remote_exit", { force: true });
+  expect(resolveToolConcurrency(read, { path: "src/a.ts" })).toBe("shared");
 });
 
 test("transport death rejects wrapped filesystem tools without native local fallback", async () => {
