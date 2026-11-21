@@ -52,7 +52,7 @@ Eval 本身就执行任意 JavaScript／Python，不是只读沙箱，也不是 
 
 连接期间明确拒绝用户直接 shell（`!`/`!!`）和 Python 快捷入口，避免静默执行本机命令；请使用远端 `bash`/`eval`，或退出连接后使用本机快捷入口。未适配的 `find`、`security_scan`、`ida`（包括 xdev 入口）仍明确拒绝。原生 `checkpoint`、`rewind` 留在本机并允许使用：只修改对话历史，不回滚远端项目文件或内核状态。远端 eval 支持计算、原生 `sh` 和远端工作区工具回调，不桥接本机 agent/workpool、judge/completion、archive、browser、todo；固定工作区说明解释此边界，本机编排请用顶层工具。
 
-选中远端 runtime 时，原生 input hook 会拒绝 `/git`、`/security`、`/wt`（含 `/worktree`）、`/move`、`/add-dir`、`/remove-dir`、`/review`、`/annotate`、带原生 `--until` 或 `--while` shell 条件（含 `=` 写法）的 `/loop`，以及原生 `@path` 文件引用，因为这些入口会使用本机工作区或 shell。内置命令的冒号语法，以及启用 `input.bareSlashCommands` 后的裸命令词也在防护范围内。请改用远端 `bash`／`read`，文件路径去掉 `@`；不带 shell 条件的 `/loop` 仍可使用。此防护覆盖会发出原生 input 事件的 TUI 和 RPC 提交，不覆盖启动参数、print 模式或子代理 prompt，并非完整的本机执行隔离边界。
+选中远端 runtime 时，原生 input hook 会拒绝 `/git`、`/commit`、`/security`、`/wt`（含 `/worktree`）、`/move`、`/add-dir`、`/remove-dir`、`/review`、`/annotate`、`/green`、`/tan`、`/cleanse`、带原生 `--until` 或 `--while` shell 条件（含 `=` 写法）的 `/loop`，以及原生 `@path` 文件引用，因为这些入口会使用本机工作区或 shell。内置命令的冒号语法，以及启用 `input.bareSlashCommands` 后的裸命令词也在防护范围内。请改用远端 `bash`／`read`，文件路径去掉 `@`；不带 shell 条件的 `/loop` 仍可使用。此防护覆盖会发出原生 input 事件的 TUI 和 RPC 提交，不覆盖启动参数、print 模式或子代理 prompt，并非完整的本机执行隔离边界。只管理宿主侧状态的命令保持可用：`/export`、`/dump`、user 或 project 作用域的 `/ssh`／`/mcp` 配置、`/omfg` 规则保存、`/advisor configure`、计划文件，以及本地 skill 或 `AGENTS.md` 指令。`/restart` 只恢复远端意图、不恢复活动连接，因此工作区工具会失败关闭，直到再次 `/remote-connect`。
 
 GitHub 仅保留明确的 API 查询操作；非搜索查询必须显式给出 `repo`，不从本机目录推断仓库。`pr_create`、`pr_checkout`、`pr_push` 和未知操作在远端模式下拒绝。
 
@@ -105,7 +105,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 链接后重启 OMP。更新时重新构建 extension 和双架构 worker。停用、暂停或 reload 插件前，必须先执行 `/remote-exit`。OMP 18.12.6 的动态暂停不发送 shutdown，也没有暂停前回调；连接中直接暂停会恢复本机工具但可能保留旧 worker，插件无法在自己的 hook 一起被暂停后保证拦截或清理。
 
-当前 companion 基于 OMP 19.0.1 构建，runtime contract 为 0.16.0。daemon 完成事件改为携带原生 unit 快照；旧 companion 会重新部署，不会直接复用。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。
+当前 companion 基于 OMP 19.0.1 构建，runtime contract 为 0.16.0。daemon 完成事件改为携带原生 unit 快照；旧 companion 会重新部署，不会直接复用。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。宿主 OMP 版本与构建时验证的 SDK 版本不一致时，connect 和 reconnect 在任何 SSH 操作之前直接拒绝；用 `bun run upgrade <版本>` 完成适配。
 
 上传显式使用 `scp -O`（SCP 协议），与远端目标路径的 shell 转义保持一致；OpenSSH 9+ 默认的 SFTP 会把这些引号当作文件名字符。本机 SCP 客户端须支持 `-O`。
 

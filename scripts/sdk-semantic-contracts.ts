@@ -16,9 +16,26 @@ export type SemanticSdkContract = {
   readonly plugin: readonly [string, ...string[]];
   readonly native: readonly [string, ...string[]];
   readonly assumption: string;
-} & SemanticSdkCoverage;
+} & SemanticSdkCoverage & {
+  /**
+   * The part of the assumption that tests cannot execute. Set only when it exists:
+   * any change to this contract's native files then blocks automatic upgrades for review.
+   */
+  readonly review?: string;
+};
 
 /** Review every assumption after an SDK bump; only genuine native execution belongs in coveredBy. */
+/**
+ * Native files that run in the remote worker and read a forwarded setting handle.
+ * test/native-settings-and-actions.test.ts derives the actual readers from SDK
+ * source and fails until every reader appears here or in its host-side list.
+ */
+export const SETTING_CONSUMERS = [
+  "edit/index.ts", "eval/shell-bridge.ts", "exec/bash-executor.ts", "lsp/deferred-diagnostics.ts", "lsp/tool.ts",
+  "tools/auto-generated-guard.ts", "tools/bash.ts", "tools/debug.ts", "tools/eval.ts", "tools/grep.ts", "tools/index.ts",
+  "tools/output-meta.ts", "tools/read-archive.ts", "tools/read-format.ts", "tools/read-summary.ts", "tools/read.ts", "tools/write.ts",
+] as const;
+
 export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "native-task-worker-threads",
@@ -88,16 +105,14 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/extension.ts", "src/nested-dispatch.ts"],
     native: ["session/agent-session.ts", "session/agent-session-handle.ts", "session/session-tools.ts", "extensibility/extensions/wrapper.ts"],
     assumption: "After isLocalAgentSession narrows the owning registry session to a concrete AgentSession, getToolForEvalBridge returns enabled permission-wrapped tools and a fresh nested context re-enters native hooks and rewritten-input approvals without inheriting outer approval markers; peer handles do not expose this executable tool lookup.",
-    coveredBy: [],
-    gap: "Host bridge tests inject callbacks; none drives real AgentSession enabled-tool, hook-rewrite and approval dispatch together.",
+    coveredBy: [{ path: "test/real-session-tools.test.ts", name: "host-eval-context:" }],
   },
   {
     id: "wrapper-installation-and-delegation",
     plugin: ["src/extension.ts"],
     native: ["sdk.ts", "session/agent-session.ts", "session/agent-session-handle.ts", "extensibility/extensions/runner.ts", "extensibility/extensions/wrapper.ts"],
     assumption: "Native registration captures pre-override tools for same-name ctx.invokeTool delegation. On the concrete owning AgentSession, narrowed with isLocalAgentSession, an empty runToolRegistryMutation waits for scheduled wrapper installation; peer handles do not expose that mutation queue.",
-    coveredBy: [],
-    gap: "Extension harnesses emulate registration and invocation rather than exercising native scheduling, same-name delegation and the mutation barrier.",
+    coveredBy: [{ path: "test/real-session-tools.test.ts", name: "wrapper-installation-and-delegation:" }],
   },
   {
     id: "wrapper-approval-details",
@@ -118,8 +133,8 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/worker.ts", "src/worker-js-eval.ts"],
     native: ["eval/js/process-entry.ts", "exec/shell-process-worker.ts", "daemon/server.ts", "../../pi-utils/src/worker-host.ts", "../../pi-utils/src/postmortem.ts"],
     assumption: "The entry installs process signal handlers before loading process-mode implementations and buffers the native Eval thread’s startup inbox before import. The companion, daemon, shell process, Eval process and Eval fallback thread do not initialize one another’s entry graph.",
-    coveredBy: [],
-    gap: "Bootstrap ordering is source-checked; source-mode worker tests do not execute the compiled binary or establish native signal-handler ordering.",
+    // Run by `bun run upgrade:gate` after both worker builds, not by `bun test`.
+    coveredBy: [{ path: "scripts/smoke-compiled-worker.ts", name: "PASS Eval ${fallback ? \"fallback thread\" : \"process\"}" }],
   },
   {
     id: "service-readiness-steering",
@@ -133,8 +148,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/extension.ts", "src/omp/readiness-steering.ts"],
     native: ["session/agent-session.ts", "session/agent-session-handle.ts"],
     assumption: "On the concrete owning AgentSession, narrowed with isLocalAgentSession, immediate steering and IRC queue events expose pending input in time to interrupt readiness whereas follow-up input does not; generic peer handles do not expose steering-queue inspection.",
-    coveredBy: [],
-    gap: "Readiness adapter tests use a synthetic session; native queue and IRC event timing is not exercised.",
+    coveredBy: [{ path: "test/real-session-lifecycle.test.ts", name: "host-readiness-queue-events:" }],
   },
   {
     id: "artifact-storage-layout",
@@ -169,8 +183,12 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/omp/artifacts.ts"],
     native: ["tools/output-meta.ts", "edit/index.ts", "../../pi-tui/src/tools/output-meta.ts", "../../pi-tui/src/tools/bash.ts"],
     assumption: "Native OutputMeta slots, Edit per-file results and selectors retain their typed shape; native spill sources, generated notices and raw-output footers now use local://<id>.log, not artifact://.",
-    coveredBy: [],
-    gap: "Native Bash minimization and rendering are covered; exhaustive Edit, sampling and footer publication tests still construct synthetic metadata instead of exercising every native producer.",
+    coveredBy: [
+      { path: "test/artifact-publication.test.ts", name: "publishes minimized raw captures without changing application metadata or duplicating Bash footers" },
+      { path: "test/artifact-publication.test.ts", name: "adapts verified Edit per-file metadata only, preserving diffs, snapshots, and nested application metadata" },
+      { path: "test/artifact-publication.test.ts", name: "published recovery references resolve to the actual remote artifact bytes" },
+    ],
+    review: "Tests run the native Bash producer and representative Edit/sampling shapes. When any listed native file changes, compare every OutputMeta slot, Edit per-file result field, sampling selector and generated footer/notice against src/omp/artifacts.ts adaptMeta and its typed-slot list.",
   },
   {
     id: "process-uri-identity",
@@ -187,8 +205,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/omp/process-routing.ts"],
     native: ["internal-urls/proc-protocol.ts", "../../pi-tui/src/tools/read.ts"],
     assumption: "Merged proc listings retain details.proc jobs, agents and daemons; service rows are native UnitSnapshots keyed by key, with pids, state and policy rather than old broker fields.",
-    coveredBy: [],
-    gap: "Merge tests supply synthetic results and never render a merged native process listing.",
+    coveredBy: [{ path: "test/native-narrow.test.ts", name: "renders native proc job and daemon rows after merging listings" }],
   },
   {
     id: "conflict-registration",
@@ -227,8 +244,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/omp/workspace-context.ts", "src/extension.ts"],
     native: ["session/agent-session.ts", "extensibility/extensions/runner.ts"],
     assumption: "before_agent_start notice acceptance and subsequent context transforms determine when a remote workspace notice actually enters model context.",
-    coveredBy: [],
-    gap: "History tests append accepted notices manually; native hook delivery, cancellation and transform ordering are not exercised.",
+    coveredBy: [{ path: "test/real-session-turns.test.ts", name: "workspace-notice-acceptance:" }],
   },
   {
     id: "host-live-registry-identity",
@@ -242,8 +258,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/omp/host-session.ts", "src/extension.ts"],
     native: ["registry/agent-registry.ts", "session/session-manager.ts", "session/agent-session.ts", "session/agent-session-handle.ts"],
     assumption: "Native navigation and attachment transitions preserve the live owning-thread manager and current file identity used to reject stale remote ownership; generic peer handles require isLocalAgentSession narrowing before concrete session access, and tree navigation has a separate session_before_tree hook.",
-    coveredBy: [],
-    gap: "Registry tests use stub managers and mutate a filename; real SessionManager navigation and AgentSession attachment transitions are not exercised.",
+    coveredBy: [{ path: "test/real-session-lifecycle.test.ts", name: "host-session-transitions:" }],
   },
   {
     id: "input-file-mentions",
@@ -262,8 +277,10 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/omp/input-policy.ts", "src/extension.ts"],
     native: ["extensibility/extensions/types.ts", "extensibility/extensions/runner.ts", "modes/controllers/input-controller.ts", "modes/rpc/rpc-mode.ts", "modes/loop-condition.ts", "modes/interactive-mode.ts"],
     assumption: "TUI and RPC emit native InputEvent before local builtin and loop dispatch and honor a handled InputEventResult without continuing execution.",
-    coveredBy: [],
-    gap: "Input tests invoke registered handlers with synthetic events; no end-to-end native TUI/RPC builtin-dispatch assertion exists.",
+    coveredBy: [
+      { path: "test/input-entry.test.ts", name: "RPC input hook stops local command dispatch" },
+      { path: "test/input-entry.test.ts", name: "TUI input hook runs before the native builtin handler" },
+    ],
   },
   {
     id: "bash-managed-capture",
@@ -277,8 +294,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/omp/captured-bash.ts"],
     native: ["tools/bash.ts", "async/job-manager.ts"],
     assumption: "Native asynchronous Bash retains image content in latestDetails for capture recovery without duplicating terminal images.",
-    coveredBy: [],
-    gap: "No image-producing native command test establishes image recovery or deduplication.",
+    coveredBy: [{ path: "test/native-narrow.test.ts", name: "recovers and deduplicates images from an async native Bash job" }],
   },
   {
     id: "remote-capture-native-consumers",
@@ -319,8 +335,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/omp/service-jobs.ts"],
     native: ["async/job-manager.ts", "internal-urls/proc-protocol.ts"],
     assumption: "Native job capacity rejects before remote launch. Successful proc stop results expose details.proc.action=stop and the UnitSnapshot key and generation in details.proc.daemon.",
-    coveredBy: [],
-    gap: "No native integration test exhausts capacity before launch or drives completeStoppedService with a real proc stop result.",
+    coveredBy: [{ path: "test/native-narrow.test.ts", name: "rejects service launch at native job capacity and settles only the matching proc stop generation" }],
   },
   {
     id: "diagnostic-lazy-stale-receipts",
@@ -337,16 +352,15 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/omp/lsp-diagnostics.ts", "src/extension.ts"],
     native: ["sdk.ts", "session/agent-session.ts", "session/agent-session-handle.ts", "session/messages.ts", "session/yield-queue.ts"],
     assumption: "The live SDK registers the late-diagnostic dispatcher on the concrete owning AgentSession and consumes reconstructed DeferredDiagnosticsEntry messages through native delivery. isLocalAgentSession narrows the owner before yieldQueue access; peer handles do not expose that queue.",
-    coveredBy: [],
-    gap: "YieldQueue tests install a test dispatcher rather than exercising production AgentSession rendering and injection.",
+    coveredBy: [{ path: "test/real-session-turns.test.ts", name: "diagnostic-production-delivery:" }],
   },
   {
     id: "lsp-mutation-action-classification",
     plugin: ["src/omp/lsp-diagnostics.ts"],
     native: ["lsp/types.ts", "lsp/tool.ts"],
     assumption: "The native mutation-capable LSP action set remains rename, rename_file, code_actions and request, conservatively including previews and arbitrary requests.",
-    coveredBy: [],
-    gap: "The action list matches current native types by source review, but no test executes all four native mutation paths.",
+    coveredBy: [{ path: "test/native-settings-and-actions.test.ts", name: "every native LSP action is classified as mutating or read-only" }],
+    review: "The test fails on any added or removed native action. When lsp/tool.ts changes, check that no READ_ONLY_LSP_ACTIONS branch has started applying workspace edits.",
   },
   {
     id: "execution-settings-handles",
@@ -358,10 +372,18 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "execution-settings-consumer-units",
     plugin: ["src/omp/execution-settings.ts", "src/runtime.ts"],
-    native: ["tools/settings.ts", "exec/settings.ts", "edit/settings.ts", "lsp/settings.ts", "modes/settings.ts", "tools/output-meta.ts"],
+    native: [
+      "tools/settings.ts", "exec/settings.ts", "edit/settings.ts", "lsp/settings.ts", "modes/settings.ts",
+      // Worker-side consumers of the forwarded handles; the classification test fails when this set drifts.
+      ...SETTING_CONSUMERS,
+    ],
     assumption: "Allowlisted native setting keys and types retain their meanings, including second-based tool/LSP timeouts, millisecond direnv timeout and MiB artifact caps.",
-    coveredBy: [],
-    gap: "Native interceptor, maxTimeout and artifact-cap tests cover only part of the allowlist; other consumer semantics and timeout units remain unaudited by tests.",
+    coveredBy: [
+      { path: "test/native-settings-and-actions.test.ts", name: "every native reader of a forwarded setting is classified" },
+      { path: "test/native-settings-and-actions.test.ts", name: "forwarded execution settings keep their native type, default and unit" },
+      { path: "test/execution-settings.test.ts", name: "captures actual OMP registry settings without a legacy Settings.get(string) API" },
+    ],
+    review: "The test pins each key's native type, default, enum values and unit-bearing label. When a listed consumer changes, re-read how it interprets each forwarded key: a meaning change with an unchanged definition passes the test.",
   },
   {
     id: "shell-settings-singleton",
@@ -375,8 +397,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/worker-companion.ts"],
     native: ["config/settings.ts", "exec/bash-executor.ts"],
     assumption: "The companion initializes native shell settings before any successful Settings.init because later calls retain the first singleton and ignore new options.",
-    coveredBy: [],
-    gap: "No native test establishes earlier-singleton isolation, project-config isolation or forwarded direnv mode and load timeout.",
+    coveredBy: [{ path: "test/native-narrow.test.ts", name: "uses forwarded direnv mode and timeout in a fresh companion despite project settings" }],
   },
   {
     id: "native-bash-schema-projection",
@@ -390,8 +411,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/extension.ts"],
     native: ["sdk.ts", "extensibility/extensions/types.ts", "extensibility/extensions/wrapper.ts"],
     assumption: "Native registered wrappers preserve live schema and grammar getters plus loading and approval metadata without acquiring native speculative-execution policy.",
-    coveredBy: [],
-    gap: "Metadata harnesses do not execute the real SDK registry replacement and presentation pipeline.",
+    coveredBy: [{ path: "test/real-session-tools.test.ts", name: "wrapper-live-metadata:" }],
   },
   {
     id: "wrapper-doc-topics",
@@ -430,8 +450,10 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/omp/input-policy.ts"],
     native: ["config/settings.ts", "modes/settings.ts", "modes/controllers/input-controller.ts"],
     assumption: "Native interactive bare-command expansion reads scoped input.bareSlashCommands, folds exact whitespace-free tokens and requires a confirming second Enter in nonempty sessions. The remote policy conservatively blocks recognized local-execution commands before that confirmation, rather than claiming exact native input-consumption parity.",
-    coveredBy: [],
-    gap: "Bare-command tests use native scoped Settings but simulate input dispatch instead of executing the native input controller.",
+    coveredBy: [
+      { path: "test/input-entry.test.ts", name: "RPC does not expand bare commands with either native setting" },
+      { path: "test/input-entry.test.ts", name: "TUI bare-command settings and confirmation" },
+    ],
   },
   {
     id: "worker-native-preview-queue",
@@ -515,8 +537,8 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/extension.ts", "src/omp/input-policy.ts"],
     native: ["autoresearch/index.ts", "autoresearch/tools/run-experiment.ts"],
     assumption: "Autoresearch activation enables init_experiment/run_experiment/log_experiment/update_notes and deactivation removes them; exact runningExperiment state remains private.",
-    coveredBy: [],
-    gap: "Handler regressions cover the four names and admission snapshot; native autoresearch mode transitions and its private experiment subprocess are source-audited, not executed.",
+    coveredBy: [{ path: "test/real-session-lifecycle.test.ts", name: "autoresearch-tool-availability:" }],
+    review: "The test executes the native mode switch and tool set. The experiment subprocess is not run: when the listed native files change, re-check that run_experiment still spawns directly in ctx.cwd and that no new autoresearch tool or command bypasses the four guarded names.",
   },
   {
     id: "todo-input-consumption",
@@ -537,7 +559,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     plugin: ["src/extension.ts"],
     native: ["session/agent-session.ts", "session/agent-session-handle.ts", "session/session-advisors.ts", "config/model-resolver.ts", "cli/auth-gateway-cli.ts", "extensibility/extensions/runner.ts"],
     assumption: "Cursor is provider cursor/API cursor-agent. On the concrete owning AgentSession, narrowed with isLocalAgentSession, getAdvisorStats reports every live advisor effective model; generic peer overview handles do not expose those models. before_agent_start ctx.abort advances promptGeneration before commit and prevents provider dispatch.",
-    coveredBy: [],
-    gap: "Registered-handler regressions cover main/advisor admission and abort invocation; full native prompt-generation cancellation and advisor fallback timing are source-audited, not executed.",
+    coveredBy: [{ path: "test/real-session-turns.test.ts", name: "cursor-turn-admission:" }],
+    review: "The test proves a main-model turn is cancelled before provider dispatch. Advisor model fallback is not executed: when the listed native files change, re-check when an advisor switches to a Cursor model and that admission still runs before its first request.",
   },
 ];

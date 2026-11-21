@@ -9,6 +9,7 @@ import {
   versionDriftHint,
 } from "../src/omp/runtime-contract.ts";
 import { ompHostCompatibility } from "../src/omp/host-identity.ts";
+import { SUPPORTED_SDK_VERSION } from "../src/omp/sdk-contract.ts";
 import {
   PROTOCOL_VERSION,
   REMOTE_TOOL_NAMES,
@@ -189,12 +190,13 @@ describe("OMP version-drift diagnostics", () => {
     expect(versionDriftHint(undefined, undefined)).toContain("local OMP unknown, companion built for unknown");
   });
 
-  test("host compatibility check flags a stale plugin build at load time", () => {
+  test("host compatibility admits only the exact verified OMP release", () => {
     expect(ompHostCompatibility("18.2.3", "18.2.3")).toMatchObject({ compatible: true, advice: undefined });
-    const stale = ompHostCompatibility("18.2.3", "18.1.19");
+    const stale = ompHostCompatibility("18.2.4", "18.2.3");
     expect(stale.compatible).toBe(false);
-    expect(stale.advice).toMatch(/built for OMP 18\.1\.19 but the running host is 18\.2\.3.*build:worker:all/);
+    expect(stale.advice).toMatch(/verified for OMP 18\.2\.3, but the running host is 18\.2\.4; remote connection is disabled.*bun run upgrade 18\.2\.4/);
+    expect(ompHostCompatibility(undefined, "18.2.3")).toMatchObject({ compatible: false });
     expect(ompHostCompatibility(undefined, "18.2.3").advice).toMatch(/Could not determine the running OMP version/);
-    expect(ompHostCompatibility("18.2.3", undefined).advice).toMatch(/not built with a pinned OMP version/);
+    expect(ompHostCompatibility(SUPPORTED_SDK_VERSION).compatible).toBe(true);
   });
 });

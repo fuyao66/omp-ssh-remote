@@ -1,6 +1,7 @@
 import { readFile, realpath, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { isRecord } from "../protocol.ts";
+import { SUPPORTED_SDK_VERSION } from "./sdk-contract.ts";
 
 const OMP_HOST_PACKAGE = "@oh-my-pi/pi-coding-agent";
 
@@ -81,39 +82,28 @@ export function ompCompiledHostVersion(): string | undefined {
 export type OmpHostCompatibility = {
   /** Version of the actual running OMP entry/executable, not a bundled utility. */
   installedHostVersion: string | undefined;
-  /** OMP version the plugin bundle and companion workers were compiled against. */
-  compiledHostVersion: string | undefined;
-  /** True only when both versions are known and equal. */
+  /** OMP version the plugin bundle and companion workers were built and accepted against. */
+  compiledHostVersion: string;
+  /** True only when the running host is exactly the accepted version. */
   compatible: boolean;
-  /** Human-readable remediation when the versions differ or are unknown. */
+  /** Why remote connection is refused, with the upgrade command to run. */
   advice: string | undefined;
 };
 
 /**
- * Compare the running host's version against the version the plugin was
- * built for. The companion worker is a native OMP runtime compiled at plugin
- * build time, so a host upgrade without a rebuild is the single most common
- * cause of `schema is incompatible` handshake rejections. Detecting it at
- * session start turns a mid-connect failure into an actionable notice.
+ * The plugin depends on native OMP semantics that are verified for exactly one
+ * release. Schema checks cannot detect semantic drift, so any other running host
+ * refuses remote connection; local OMP keeps working. Source runs (tests, dev)
+ * have no compiled define and use the declared SDK version, which check:sdk pins.
  */
 export function ompHostCompatibility(
   installedHostVersion: string | undefined,
-  compiledHostVersion: string | undefined = ompCompiledHostVersion(),
+  compiledHostVersion: string = ompCompiledHostVersion() ?? SUPPORTED_SDK_VERSION,
 ): OmpHostCompatibility {
-  const compatible =
-    installedHostVersion !== undefined &&
-    compiledHostVersion !== undefined &&
-    installedHostVersion === compiledHostVersion;
-  let advice: string | undefined;
-  if (!compatible) {
-    if (installedHostVersion === undefined) {
-      advice = "Could not determine the running OMP version; the remote handshake will still verify tool schemas.";
-    } else if (compiledHostVersion === undefined) {
-      advice = `omp-ssh-remote was not built with a pinned OMP version; the running host is ${installedHostVersion}. Rebuild the plugin (bun run build && bun run build:worker:all).`;
-    } else {
-      advice = `omp-ssh-remote was built for OMP ${compiledHostVersion} but the running host is ${installedHostVersion}. Update the plugin's pinned OMP dependencies to ${installedHostVersion}, run bun run build && bun run build:worker:all, then reload the extension and reconnect.`;
-    }
-  }
+  const compatible = installedHostVersion === compiledHostVersion;
+  const advice = compatible ? undefined : installedHostVersion === undefined
+    ? `Could not determine the running OMP version; omp-ssh-remote ${compiledHostVersion} refuses remote connection because its native semantics are verified only for that exact release.`
+    : `omp-ssh-remote is verified for OMP ${compiledHostVersion}, but the running host is ${installedHostVersion}; remote connection is disabled. In the plugin repository run \`bun run upgrade ${installedHostVersion}\`, then restart OMP.`;
   return { installedHostVersion, compiledHostVersion, compatible, advice };
 }
 

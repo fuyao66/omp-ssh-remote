@@ -9,6 +9,7 @@ import { cfgBareSlashCommands } from "@oh-my-pi/pi-coding-agent/modes/settings";
 
 const HOST_COMMAND_ALTERNATIVES: Readonly<Record<string, string>> = {
   "/git": "Use Git commands through remote bash instead.",
+  "/commit": "Use git commit through remote bash instead.",
   "/security": "Use remote read and bash to inspect the remote project instead.",
   "/wt": "Use git worktree through remote bash instead.",
   "/move": "Use remote bash to move remote project files instead.",
@@ -16,6 +17,9 @@ const HOST_COMMAND_ALTERNATIVES: Readonly<Record<string, string>> = {
   "/remove-dir": "Use explicit remote paths rather than changing local directory context.",
   "/review": "Use git diff through remote bash, then remote read to review the changes.",
   "/annotate": "Use remote read to inspect source files instead.",
+  "/green": "It reads the local Git branch and tags; ask for the CI fix with the remote branch named instead.",
+  "/tan": "Its forked background agent does not attach to the remote workspace; spawn a task instead.",
+  "/cleanse": "Its checkers and fixer agents run in the local project; run the diagnostics through remote bash instead.",
   "/autoresearch": "Autoresearch executes Git and experiments locally; use remote tools instead.",
 };
 
@@ -24,6 +28,8 @@ const HOST_COMMAND_ALTERNATIVES: Readonly<Record<string, string>> = {
 // /switch consumes aliases (builtin-modes.ts:470-505); /todo append stores
 // literal task text (helpers/todo.ts:160-185; todo-command-controller.ts:265-306).
 const CONSUMED_MENTION_BUILTINS: ReadonlySet<string> = new Set(["switch"]);
+// Bundled custom commands (extensibility/custom-commands/bundled) that act on the host; native bare expansion includes custom commands.
+const BUNDLED_HOST_COMMANDS: ReadonlySet<string> = new Set(["review", "annotate", "green"]);
 
 /** Match native resolveMentionPath without reading or materializing host contents. */
 async function hasHostFileMention(text: string, cwd: string): Promise<boolean> {
@@ -50,12 +56,12 @@ export async function remoteInputPolicy(
     if (settings && cfgBareSlashCommands.get(settings)) {
       const folded = event.text.toLowerCase();
       const token = lookupBuiltinSlashCommand(event.text) ? event.text : folded;
-      if (lookupBuiltinSlashCommand(token) || token === "review" || token === "annotate") text = `/${token}`;
+      if (lookupBuiltinSlashCommand(token) || BUNDLED_HOST_COMMANDS.has(token)) text = `/${token}`;
     }
   }
   const parsed = parseSlashCommand(text);
   const builtin = parsed ? lookupBuiltinSlashCommand(parsed.name) : undefined;
-  // Bundled /review and /annotate are custom commands, not registry entries;
+  // Bundled /review, /annotate and /green are custom commands, not registry entries;
   // unlike builtins, their command names do not accept a colon separator.
   const command = builtin ? `/${builtin.name}` : text.split(/\s+/, 1)[0]!;
   const alternative = Object.hasOwn(HOST_COMMAND_ALTERNATIVES, command)

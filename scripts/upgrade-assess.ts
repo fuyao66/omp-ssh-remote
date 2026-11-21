@@ -1,5 +1,5 @@
 /**
- * Read-only OMP upgrade assessment: `bun run upgrade:assess <version> [--from <version>] [--out report.md]`.
+ * Read-only OMP upgrade assessment: `bun run upgrade:assess <version> [--from <version>] [--out report.md] [--json report.json]`.
  *
  * The baseline is the installed SDK, or `--from` when the pins were already bumped.
  *
@@ -16,14 +16,38 @@ import { SDK_SOURCE_ADAPTATIONS, SUPPORTED_SDK_VERSION } from "../src/omp/sdk-co
 import { SEMANTIC_SDK_CONTRACTS } from "./sdk-semantic-contracts.ts";
 
 const root = resolve(import.meta.dir, "..");
-const SDK_PACKAGES = ["omptype", "pi-agent-core", "pi-natives", "pi-coding-agent", "pi-tui", "pi-utils"] as const;
+export const SDK_PACKAGES = ["omptype", "pi-agent-core", "pi-natives", "pi-coding-agent", "pi-tui", "pi-utils"] as const;
 type SdkPackage = (typeof SDK_PACKAGES)[number];
 
 /** One native file, keyed as `<package>/<path inside the package>`, with the reasons the plugin depends on it. */
 type Dependency = { pkg: SdkPackage; file: string; reasons: Set<string> };
 
+type NativeFile = { pkg: SdkPackage; file: string };
+type AssessedFile = NativeFile & { reasons: string[] };
+type ChangedFile = AssessedFile & { added?: string; removed?: string };
+
+export interface UpgradeAssessment {
+  baseline: string;
+  target: string;
+  anchorFailures: number;
+  missing: AssessedFile[];
+  changed: ChangedFile[];
+  breaking: string[];
+  changelogFound: boolean;
+  bunRequirement: string | null;
+}
+
+/** Contract paths are relative to coding-agent/src, including links to sibling packages. */
+export function contractNativeFile(native: string): NativeFile {
+  const sibling = /^\.\.\/\.\.\/([^/]+)\/(.+)$/.exec(native);
+  if (!sibling) return { pkg: "pi-coding-agent", file: `src/${native}` };
+  const pkg = sibling[1] as SdkPackage;
+  if (!SDK_PACKAGES.includes(pkg)) throw new Error(`Unknown SDK package in semantic contract: ${native}`);
+  return { pkg, file: sibling[2]! };
+}
+
 function usage(): never {
-  console.error("usage: bun run upgrade:assess <version> [--from <version>] [--out report.md]");
+  console.error("usage: bun run upgrade:assess <version> [--from <version>] [--out report.md] [--json report.json]");
   process.exit(2);
 }
 
@@ -74,7 +98,7 @@ function importedFile(specifier: string, packageDir: string): string | undefined
   return undefined;
 }
 
-async function collectDependencies(installed: Record<SdkPackage, string>): Promise<Map<string, Dependency>> {
+async function collectDependencies(installed: Record<SdkPackage, string>, baseline: Record<SdkPackage, string>): Promise<Map<string, Dependency>> {
   const dependencies = new Map<string, Dependency>();
   const add = (pkg: SdkPackage, file: string, reason: string) => {
     const key = `${pkg}/${file}`;
@@ -84,20 +108,19 @@ async function collectDependencies(installed: Record<SdkPackage, string>): Promi
   };
   for await (const path of walk(join(root, "src"))) {
     const source = await readFile(path, "utf8");
-    for (const [, specifier] of source.matchAll(/from\s+"(@oh-my-pi\/[^"]+)"|import\(\s*"(@oh-my-pi\/[^"]+)"\s*\)/g)) {
+    for (const [, staticImport, dynamicImport] of source.matchAll(/from\s+["'](@oh-my-pi\/[^"']+)["']|import\(\s*["'](@oh-my-pi\/[^"']+)["']\s*\)/g)) {
+      const specifier = staticImport ?? dynamicImport;
       if (!specifier) continue;
       const pkg = /^@oh-my-pi\/([^/]+)/.exec(specifier)?.[1] as SdkPackage | undefined;
       if (!pkg || !SDK_PACKAGES.includes(pkg)) continue;
-      const file = importedFile(specifier, installed[pkg]);
+      const file = importedFile(specifier, baseline[pkg]) ?? importedFile(specifier, installed[pkg]);
       if (file) add(pkg, file, `import in ${relative(root, path)}`);
     }
   }
   for (const contract of SEMANTIC_SDK_CONTRACTS) {
     for (const native of contract.native) {
-      // Contract paths are relative to coding-agent/src; siblings use ../../<package>/<path>.
-      const sibling = /^\.\.\/\.\.\/([^/]+)\/(.+)$/.exec(native);
-      if (sibling) add(sibling[1] as SdkPackage, sibling[2]!, `contract ${contract.id}`);
-      else add("pi-coding-agent", `src/${native}`, `contract ${contract.id}`);
+      const { pkg, file } = contractNativeFile(native);
+      add(pkg, file, `contract ${contract.id}`);
     }
   }
   for (const adaptation of SDK_SOURCE_ADAPTATIONS) {
@@ -106,48 +129,51 @@ async function collectDependencies(installed: Record<SdkPackage, string>): Promi
   return dependencies;
 }
 
-function changelogSince(changelog: string, from: string): string[] {
+function changelogSince(changelog: string, from: string, target: string): string[] {
   const breaking: string[] = [];
-  const sections = changelog.split(/^## \[/m).slice(1);
-  for (const section of sections) {
-    const version = section.slice(0, section.indexOf("]"));
-    if (version === from) break;
-    if (version === "Unreleased") continue;
-    const block = /### Breaking Changes\n([\s\S]*?)(?=\n### |\n## |$)/.exec(section)?.[1];
-    for (const line of block?.split("\n") ?? []) if (line.startsWith("- ")) breaking.push(`${version}: ${line.slice(2)}`);
+  const sections = [...changelog.matchAll(/^## \[([^\]\r\n]+)\][^\r\n]*\r?\n([\s\S]*?)(?=^## |(?![\s\S]))/gm)];
+  const start = sections.findIndex(section => section[1] === target);
+  const end = sections.findIndex((section, index) => index >= start && section[1] === from);
+  if (start < 0 || end < 0) throw new Error(`Cannot locate changelog range ${from} → ${target}; inspect the upstream changelog manually`);
+  for (const [, version, body] of sections.slice(start, end)) {
+    const block = /^### Breaking Changes[ \t]*\r?\n([\s\S]*?)(?=^### |(?![\s\S]))/mi.exec(body)?.[1];
+    if (!block?.trim()) continue;
+    const items = block.trim().split(/\r?\n(?=[-+*] |\d+\. )/);
+    for (const item of items) breaking.push(`${version}: ${item.replace(/^(?:[-+*] |\d+\. )/, "").trim()}`);
   }
   return breaking;
 }
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  const option = (name: string): string | undefined => {
-    const index = args.indexOf(name);
-    if (index < 0) return undefined;
-    const value = args[index + 1];
-    if (!value || value.startsWith("--")) usage();
-    return value;
-  };
-  const out = option("--out");
-  const from = option("--from");
-  const target = args.find((arg, index) => !arg.startsWith("--") && !["--out", "--from"].includes(args[index - 1] ?? ""));
-  if (!target) usage();
+  const target = args.shift();
+  if (!target || target.startsWith("-")) usage();
+  const options = new Map<string, string>();
+  for (let i = 0; i < args.length; i += 2) {
+    const [name, value] = [args[i]!, args[i + 1]];
+    if (!["--out", "--from", "--json"].includes(name) || options.has(name) || !value || value.startsWith("-")) usage();
+    options.set(name, value);
+  }
+  const out = options.get("--out");
+  const from = options.get("--from");
+  const json = options.get("--json");
 
   const scratch = await mkdtemp(join(tmpdir(), "omp-upgrade-assess-"));
   try {
-    // Dependency discovery always resolves imports against the installed SDK; only the diff baseline moves.
+    // Consult both versions so a dependency that disappeared from the installed target is still reported.
     const resolver = Object.fromEntries(SDK_PACKAGES.map(pkg => [pkg, installedPackageDir(pkg)])) as Record<SdkPackage, string>;
     const installed = {} as Record<SdkPackage, string>;
     const targets = {} as Record<SdkPackage, string>;
     for (const pkg of SDK_PACKAGES) {
-      installed[pkg] = from ? await fetchTarget(pkg, from, join(scratch, "from")) : resolver[pkg];
       targets[pkg] = await fetchTarget(pkg, target, join(scratch, "to"));
+      installed[pkg] = from === target ? targets[pkg] : from ? await fetchTarget(pkg, from, join(scratch, "from")) : resolver[pkg];
     }
     const baseline = from ?? SUPPORTED_SDK_VERSION;
 
     const lines: string[] = [`# OMP upgrade assessment: ${baseline} → ${target}`, ""];
     const agentManifest = JSON.parse(await readFile(join(targets["pi-coding-agent"], "package.json"), "utf8")) as { engines?: { bun?: string } };
-    lines.push(`- Target requires Bun ${agentManifest.engines?.bun ?? "(unspecified)"}; local Bun ${Bun.version}.`, "");
+    const bunRequirement = agentManifest.engines?.bun ?? null;
+    lines.push(`- Target requires Bun ${bunRequirement ?? "(unspecified)"}; local Bun ${Bun.version}.`, "");
 
     lines.push("## Source adaptations against the target", "", "| adaptation | anchor | expected | found |", "|---|---|---|---|");
     let anchorFailures = 0;
@@ -162,33 +188,42 @@ async function main(): Promise<void> {
     }
     lines.push("");
 
-    const dependencies = [...(await collectDependencies(resolver)).values()].sort((a, b) => `${a.pkg}/${a.file}`.localeCompare(`${b.pkg}/${b.file}`));
-    const changed: string[] = [];
-    const missing: string[] = [];
+    const dependencies = [...(await collectDependencies(resolver, installed)).values()].sort((a, b) => `${a.pkg}/${a.file}`.localeCompare(`${b.pkg}/${b.file}`));
+    const changed: ChangedFile[] = [];
+    const missing: AssessedFile[] = [];
     let unchanged = 0;
     for (const dependency of dependencies) {
       const before = join(installed[dependency.pkg], dependency.file);
       const after = join(targets[dependency.pkg], dependency.file);
-      const label = `\`${dependency.pkg}/${dependency.file}\``;
-      const reasons = [...dependency.reasons].sort().join("; ");
-      if (!existsSync(after)) { missing.push(`- ${label} — ${reasons}`); continue; }
-      if (!existsSync(before)) { changed.push(`- ${label} (new in target) — ${reasons}`); continue; }
+      const entry = { pkg: dependency.pkg, file: dependency.file, reasons: [...dependency.reasons].sort() };
+      if (!existsSync(after)) { missing.push(entry); continue; }
+      if (!existsSync(before)) { changed.push(entry); continue; }
       const numstat = (await run(["git", "diff", "--no-index", "--numstat", before, after], root)).trim();
       if (!numstat) { unchanged++; continue; }
       const [added, removed] = numstat.split(/\s+/);
-      changed.push(`- ${label} +${added} −${removed} — ${reasons}`);
+      changed.push({ ...entry, added, removed });
     }
     lines.push(`## Native dependencies (${dependencies.length}: ${changed.length} changed, ${missing.length} missing, ${unchanged} unchanged)`, "");
-    if (missing.length) lines.push("### Missing in target (must fix)", "", ...missing, "");
-    if (changed.length) lines.push("### Changed (review the diff against the listed contract or import)", "", ...changed, "");
+    const formatEntry = ({ pkg, file, reasons, added, removed }: ChangedFile, changed = false) =>
+      `- \`${pkg}/${file}\`${changed ? added === undefined ? " (new in target)" : ` +${added} −${removed}` : ""} — ${reasons.join("; ")}`;
+    if (missing.length) lines.push("### Missing in target (must fix)", "", ...missing.map(item => formatEntry(item)), "");
+    if (changed.length) lines.push("### Changed (review the diff against the listed contract or import)", "", ...changed.map(item => formatEntry(item, true)), "");
 
     const changelogPath = join(targets["pi-coding-agent"], "CHANGELOG.md");
-    const breaking = existsSync(changelogPath) ? changelogSince(await readFile(changelogPath, "utf8"), baseline) : [];
-    lines.push(`## Breaking changes since ${baseline} (${breaking.length})`, "", ...breaking.map(item => `- ${item}`), "");
+    const changelogFound = existsSync(changelogPath);
+    const breaking = changelogFound ? changelogSince(await readFile(changelogPath, "utf8"), baseline, target) : [];
+    lines.push(`## Breaking changes since ${baseline}`, "");
+    if (!changelogFound) lines.push("**Manual review required: the target package has no CHANGELOG.md.**", "");
+    else if (breaking.length) lines.push("**Manual review required: upstream declares breaking changes.**", "", ...breaking.map(item => `- ${item}`), "");
+    else lines.push("None listed.", "");
     lines.push("Contract assumptions: scripts/sdk-semantic-contracts.ts. Procedure: README › Upgrading OMP.", "");
 
     const report = lines.join("\n");
     if (out) await writeFile(resolve(out), report);
+    if (json) {
+      const assessment: UpgradeAssessment = { baseline, target, anchorFailures, missing, changed, breaking, changelogFound, bunRequirement };
+      await writeFile(resolve(json), `${JSON.stringify(assessment, null, 2)}\n`);
+    }
     console.log(report);
     if (anchorFailures || missing.length) process.exitCode = 1;
   } finally {
@@ -196,4 +231,4 @@ async function main(): Promise<void> {
   }
 }
 
-await main();
+if (import.meta.main) await main();

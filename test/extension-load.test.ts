@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import remoteRuntimeExtension, {
   remoteWrapperRenderer,
 } from "../src/extension.ts";
+import { SUPPORTED_SDK_VERSION } from "../src/omp/sdk-contract.ts";
 
 describe("OMP extension loading", () => {
   test("registers commands and a model-visible status tool without a state handler", async () => {
@@ -65,7 +66,7 @@ describe("OMP extension loading", () => {
         pendingRemoteAstProposals: 0,
         hostCompatibility: {
           installedHostVersion: null,
-          compiledHostVersion: null,
+          compiledHostVersion: SUPPORTED_SDK_VERSION,
           compatible: false,
           advice: expect.stringContaining("Could not determine the running OMP version"),
         },

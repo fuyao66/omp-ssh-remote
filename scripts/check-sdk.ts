@@ -143,10 +143,12 @@ async function main(): Promise<void> {
       }
     }
     const gaps = SEMANTIC_SDK_CONTRACTS.filter(contract => contract.gap).length;
-    return `${SEMANTIC_SDK_CONTRACTS.length} entries; paths + test references verified; ${gaps} manual-review gaps (not semantic verification)`;
+    const reviews = SEMANTIC_SDK_CONTRACTS.filter(contract => contract.review).length;
+    return `${SEMANTIC_SDK_CONTRACTS.length} entries; paths + test references verified; ${reviews} with upgrade-time review notes; ${gaps} untested gaps`;
   });
   for (const contract of SEMANTIC_SDK_CONTRACTS) {
-    if (contract.gap) checks.push({ check: `semantic gap: ${contract.id}`, status: "WARN", detail: contract.gap });
+    if (contract.gap) checks.push({ check: `semantic gap: ${contract.id}`, status: "FAIL", detail: contract.gap });
+    if (contract.gap) failures.push(`${contract.id}: no executable coverage; ${contract.gap}`);
   }
   console.log(`OMP SDK contract: ${SUPPORTED_SDK_VERSION}`);
   console.table(checks);

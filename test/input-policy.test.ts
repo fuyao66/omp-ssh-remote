@@ -100,7 +100,8 @@ async function harness(selected: boolean, bareSlashCommands = false, cwd = "/loc
   };
 }
 
-const commands = ["/git", "/security", "/wt", "/move", "/add-dir", "/remove-dir", "/review", "/annotate"];
+const commands = ["/git", "/commit", "/security", "/wt", "/move", "/add-dir", "/remove-dir", "/tan", "/cleanse", "/review", "/annotate", "/green"];
+const bundledCommands = ["/review", "/annotate", "/green"];
 
 describe("remote native input policy", () => {
   for (const selected of [false, true]) {
@@ -127,7 +128,7 @@ describe("remote native input policy", () => {
   });
 
   for (const selected of [false, true]) {
-    test.each(["/worktree", ...commands.filter(command => !["/review", "/annotate"].includes(command)).map(command => `${command}:argument`), "/worktree:argument"])(
+    test.each(["/worktree", ...commands.filter(command => !bundledCommands.includes(command)).map(command => `${command}:argument`), "/worktree:argument"])(
       `native alias and colon syntax %s while ${selected ? "remote" : "local"}`, async text => {
         const h = await harness(selected);
         try {
@@ -148,7 +149,7 @@ describe("remote native input policy", () => {
     expect(lookupBuiltinSlashCommand("sec")).toBeUndefined();
   });
 
-  test.each([...commands.map(command => command.toUpperCase()), "/WORKTREE", "/sec", "/review:argument", "/annotate:argument"])("preserves native non-command %s", async text => {
+  test.each([...commands.map(command => command.toUpperCase()), "/WORKTREE", "/sec", "/review:argument", "/annotate:argument", "/green:argument"])("preserves native non-command %s", async text => {
     const h = await harness(true);
     try {
       expect(await h.submit(text)).toBeUndefined();

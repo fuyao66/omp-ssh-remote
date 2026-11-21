@@ -309,7 +309,15 @@ type RemoteExtensionState = {
   editMode?: EditModeSetting;
   /** Active tool names of the local session; forwarded so the remote bash interceptor sees the real tool set. */
   activeToolNames: () => string[] | undefined;
+  /** Fixed for the process: running OMP versus the release this bundle is verified for. */
+  hostCompatibility?: OmpHostCompatibility;
 };
+
+/** Native semantics are verified for one OMP release; any other host fails closed before SSH. */
+function assertSupportedHost(state: RemoteExtensionState): void {
+  const compatibility = state.hostCompatibility;
+  if (!compatibility?.compatible) throw new Error(compatibility?.advice ?? "omp-ssh-remote has not verified the running OMP version yet; retry after session start.");
+}
 type RemoteFamily = Omit<FamilyBrokerFamily, "members"> & {
   localCwd: string;
   remoteCwd: string;
@@ -1346,6 +1354,8 @@ async function reconnectRemoteRuntime(
   if (live && !options.force) {
     throw new Error("Remote runtime transport is still connected; pass --force to replace it");
   }
+  // State errors explain more than a version refusal; check the version before any mutation or SSH.
+  assertSupportedHost(state);
   const previous = state.client;
   state.client = undefined;
   state.binding = crypto.randomUUID();
@@ -1467,6 +1477,7 @@ async function connectOwner(
   input: OwnerConnectInput,
 ): Promise<{ request: RemoteConnectRequest; ready: ReadyMessage; remoteCwd: string; cacheAudit: RemoteWorkerCacheAudit }> {
   if (!isMainThread) throw new Error("A native worker-thread session cannot create a remote family. Connect from the main session before spawning remote tasks.");
+  assertSupportedHost(state);
   if (state.transaction) throw new Error(`Remote connection is already in progress${input.inProgressHint}`);
   if (state.selected) throw new Error(`A remote runtime is already selected; ${input.alreadySelectedHint}`);
   if (!input.sessionFile) {
@@ -1599,10 +1610,10 @@ export default async function remoteRuntimeExtension(
     if (!session) throw new Error("Remote intent cannot be persisted without the current home-thread session");
     await persistRemoteIntent(() => pi.appendEntry(REMOTE_INTENT_ENTRY, { version: 1, remote }), session.sessionManager);
   };
-  // Compare the running host against the version this bundle (and its
-  // companion workers) were compiled for. A mismatch is the usual root cause of
-  // "schema is incompatible" handshake rejections after `omp update`.
+  // The running OMP must be exactly the release this bundle and its workers were
+  // verified against; otherwise connect and reconnect refuse before any SSH work.
   const hostCompatibility = ompHostCompatibility(await resolveOmpHostVersion().catch(() => undefined));
+  state.hostCompatibility = hostCompatibility;
   let hostCompatibilityNotified = false;
 
   pi.registerTool({

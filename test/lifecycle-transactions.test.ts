@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { REMOTE_TOOL_NAMES } from "../src/protocol.ts";
+import { SUPPORTED_SDK_VERSION } from "../src/omp/sdk-contract.ts";
 import * as ssh from "../src/ssh.ts";
 import * as identity from "../src/omp/host-identity.ts";
 import * as deployment from "../src/deploy.ts";
@@ -70,7 +71,7 @@ const transport = spyOn(ssh, "buildSshWorkerCommand").mockImplementation(() => {
   if (release) releases.push(release);
   return [process.execPath, "-e", worker, release, JSON.stringify(nativeToolManifests ?? null)];
 });
-const hostIdentity = spyOn(identity, "resolveOmpHostVersion").mockResolvedValue("18.16.0");
+const hostIdentity = spyOn(identity, "resolveOmpHostVersion").mockResolvedValue(SUPPORTED_SDK_VERSION);
 const discoveryBoundary = spyOn(configuration, "loadConfiguredSshHosts").mockImplementation(async () => {
   await discovery?.wait(); return [];
 });
@@ -1077,6 +1078,19 @@ test("connect requires task.workerThreads: 0 before SSH discovery or deployment"
   expect(transport.mock.calls.length).toBe(transportCalls + 1);
   expect((await owner.status()).mode).toBe("remote");
   expect(broker.hasOwner(owner.sessionFile)).toBe(true);
+});
+
+test("a running OMP other than the verified release refuses connect before SSH discovery", async () => {
+  hostIdentity.mockResolvedValueOnce("0.0.1");
+  const owner = await harness();
+  const discoveryCalls = discoveryBoundary.mock.calls.length;
+  const transportCalls = transport.mock.calls.length;
+  const refusal = new RegExp(`verified for OMP ${SUPPORTED_SDK_VERSION.replaceAll(".", "\\.")}, but the running host is 0\\.0\\.1.*bun run upgrade 0\\.0\\.1`);
+  await expect(owner.execute("remote_connect", { target: "fixture.invalid" })).rejects.toThrow(refusal);
+  await expect(owner.command("remote-connect", "fixture.invalid")).rejects.toThrow(refusal);
+  expect(discoveryBoundary.mock.calls.length).toBe(discoveryCalls);
+  expect(transport.mock.calls.length).toBe(transportCalls);
+  expect((await owner.status()).mode).toBe("local");
 });
 
 test("connect refuses enabled autoresearch before deployment", async () => {
