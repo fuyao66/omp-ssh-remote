@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { RemoteRuntimeClient } from "../src/client.ts";
@@ -154,8 +155,8 @@ async function idleNativeChild(owner: Harness, id: string) {
 /** Count real native subscriptions without replacing event delivery or cleanup. */
 function observeSettlementListeners(session: AgentSession) {
   const holds = new Set<() => void>(), changes = new Set<Parameters<AgentRegistry["onChange"]>[0]>();
-  const registry = AgentRegistry.global(), subscribe = session.subscribeIrcWakeHolds, onChange = registry.onChange;
-  const holdSpy = spyOn(session, "subscribeIrcWakeHolds").mockImplementation(function (listener) {
+  const registry = AgentRegistry.global(), subscribe = session.subscribeWakeState, onChange = registry.onChange;
+  const holdSpy = spyOn(session, "subscribeWakeState").mockImplementation(function (listener) {
     holds.add(listener);
     const unsubscribe = subscribe.call(session, listener);
     return () => { holds.delete(listener); unsubscribe(); };
@@ -219,7 +220,7 @@ async function nativeExecutorChild(owner: Harness, family: Family, id: string) {
     agent: { name: id, description: "Native warm revival fixture", systemPrompt: "Reply with Fixture ready.",
       source: "project", tools: ["read", "write", "bash"] },
     task: "Persisted native revival fixture.", description: "Native warm revival fixture",
-    structured: false, keepAlive: true, artifactsDir: `${family.root}/subagent`,
+    keepAlive: true, artifactsDir: `${family.root}/subagent`,
     modelOverride: `${provider}/${model}`, modelRegistry, authStorage: auth, settings,
     enableLsp: false, enableMCP: false, noContextFiles: true, skills: [], promptTemplates: [], rules: [],
     preloadedCustomToolPaths: [],
@@ -438,6 +439,20 @@ test("remote reads schedule after earlier same-batch effects; local reads stay s
   expect(resolveToolConcurrency(owner.tool("bash") as unknown as AgentTool<any>, { command: "true" })).toBe("shared");
   await owner.execute("remote_exit", { force: true });
   expect(resolveToolConcurrency(read, { path: "src/a.ts" })).toBe("shared");
+});
+
+test("remote Bash notify is refused before any host job, service or worker call", async () => {
+  // No remote channel delivers notify matches; an async job would otherwise return "running" and drop the regex.
+  const { owner } = await connected();
+  for (const params of [
+    { command: "tail -f log", async: true, notify: "ERROR" },
+    { command: "tail -f log", notify: "ERROR" },
+    { command: "serve", name: "svc", notify: "ready" },
+  ]) {
+    await expect(owner.execute("bash", params)).rejects.toThrow("notify is unavailable in remote workspaces.");
+  }
+  expect(existsSync(join(directory, "native-bash"))).toBe(false);
+  await owner.execute("remote_exit", { force: true });
 });
 
 test("transport death rejects wrapped filesystem tools without native local fallback", async () => {

@@ -33,8 +33,8 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "worker-tool-session",
     plugin: ["src/runtime.ts"],
-    native: ["tools/index.ts", "sdk.ts", "tools/eval.ts"],
-    assumption: "The synthetic shared ToolSession supplies the settings, histories, artifact allocation, registries and execution context required by the native tool constructors.",
+    native: ["tools/index.ts", "tools/tool-state.ts", "sdk.ts", "tools/eval.ts"],
+    assumption: "The synthetic ToolSession shares one ToolConversationState (edit snapshots and conflict history), supplies a session-bound localProtocolOptions and spill allocator, and presents tool lookup and disposal hooks to the native constructors.",
     coveredBy: [
       { path: "test/worker.test.ts", name: "native workspace tools share one filesystem and snapshot state" },
       { path: "test/worker.test.ts", name: "native Python eval keeps kernel state in the remote ToolSession" },
@@ -45,7 +45,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     id: "worker-session-teardown",
     plugin: ["src/runtime.ts", "src/worker-companion.ts"],
     native: ["session/agent-session.ts", "sdk.ts", "launch/services.ts", "exec/bash-executor.ts"],
-    assumption: "Native session disposal runs ToolSession dispose callbacks (service completion unsubscription with preservePending), awaits drainAbortedShells for the session id and its :async: keys, and releaseShellSessions drops the session's persistent shells; persistent shells are keyed by getSessionId.",
+    assumption: "Native tool disposal unsubscribes service completion with preservePending and drains session shells. Companion teardown additionally stops this owner’s live lease-held project proc units via a probe-only connection, then disposes tools and closes its shared daemon client.",
     coveredBy: [
       { path: "test/runtime-dispose.test.ts", name: "dispose runs tool dispose callbacks once and releases the owner's persistent shell" },
     ],
@@ -53,12 +53,13 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "effective-lsp-switch",
     plugin: ["src/extension.ts", "src/runtime.ts"],
-    native: ["sdk.ts", "main.ts", "tools/write.ts", "edit/index.ts", "tools/read.ts", "task/index.ts", "task/executor.ts"],
-    assumption: "Native write/edit gate formatting and diagnostics on ToolSession.enableLsp && lsp.enabled. enableLsp is fixed at session construction (--no-lsp; a subagent's spawn-time parent AND task.enableLsp) and is independent of the lsp tool's presence; SDK 18.20 exposes it only as the native tools' private `session` field, which the plugin reads per session.",
+    native: ["sdk.ts", "main.ts", "tools/write.ts", "edit/index.ts", "tools/read.ts", "task/index.ts", "task/executor.ts", "lsp/client.ts", "tools/index.ts"],
+    assumption: "The native session flag defaults to !restrictToolNames unless explicitly supplied. Native write/edit and LSP query availability combine that flag with lsp.enabled. task.enableLsp=false overlays the child’s formatOnWrite, diagnosticsOnWrite and diagnosticsOnEdit settings, without disabling queries. The worker does not take a shared-LSP hold.",
     coveredBy: [
       { path: "test/native-parity.test.ts", name: "the session LSP switch is read from the ToolSession native write/edit gate on" },
       { path: "test/lifecycle-transactions.test.ts", name: "remote runtimes follow each session's own native enableLsp, not inferred tool lists or task settings" },
       { path: "test/runtime-dispose.test.ts", name: "the forwarded effective LSP switch reaches the worker session" },
+      { path: "test/runtime-dispose.test.ts", name: "native task LSP overlays disable writethrough but retain queries and keep worker LSP private" },
     ],
   },
   {
@@ -108,15 +109,15 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "worker-eval-subprocess-ipc",
     plugin: ["src/worker.ts", "src/worker-js-eval.ts"],
-    native: ["eval/js/context-manager.ts", "eval/js/process-entry.ts", "launch/protocol.ts", "launch/broker.ts"],
+    native: ["eval/js/context-manager.ts", "eval/js/process-entry.ts", "eval/js/worker-entry.ts", "subprocess/worker-client.ts"],
     assumption: "Native JavaScript Eval re-enters the worker using its hidden process argument and Node IPC messages including closed acknowledgement.",
     coveredBy: [{ path: "test/worker.test.ts", name: "native JavaScript eval keeps VM state in the remote ToolSession" }],
   },
   {
     id: "compiled-worker-bootstrap",
     plugin: ["src/worker.ts", "src/worker-js-eval.ts"],
-    native: ["eval/js/process-entry.ts", "launch/broker.ts", "../../pi-utils/src/postmortem.ts"],
-    assumption: "Installing process handlers before native re-entry imports preserves signal ownership and compiled-worker Eval and daemon lifetimes.",
+    native: ["eval/js/process-entry.ts", "exec/shell-process-worker.ts", "daemon/server.ts", "../../pi-utils/src/worker-host.ts", "../../pi-utils/src/postmortem.ts"],
+    assumption: "The entry installs process signal handlers before loading process-mode implementations and buffers the native Eval thread’s startup inbox before import. The companion, daemon, shell process, Eval process and Eval fallback thread do not initialize one another’s entry graph.",
     coveredBy: [],
     gap: "Bootstrap ordering is source-checked; source-mode worker tests do not execute the compiled binary or establish native signal-handler ordering.",
   },
@@ -138,8 +139,8 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "artifact-storage-layout",
     plugin: ["src/omp/artifacts.ts"],
-    native: ["session/artifacts.ts"],
-    assumption: "ArtifactManager allocates decimal IDs in files prefixed by that ID and a sanitized tool suffix beneath its directory.",
+    native: ["session/artifacts.ts", "internal-urls/local-root.ts"],
+    assumption: "Native spill allocation exclusively claims <id>.log under the ToolSession’s local:// root. The companion binds that private session root and republishes spill IDs as remote-artifact://<namespace>/<id>, not host-local paths.",
     coveredBy: [{ path: "test/worker.test.ts", name: "truncated bash output is recoverable through remote artifact selectors" }],
   },
   {
@@ -153,28 +154,21 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     ],
   },
   {
-    id: "artifact-materialization-limit",
-    plugin: ["src/omp/artifacts.ts"],
-    native: ["internal-urls/artifact-protocol.ts"],
-    assumption: "Native artifact locate remains available without reading bytes while full resolution rejects files larger than 8 MiB.",
-    coveredBy: [],
-    gap: "No native/remote protocol comparison exercises the 8 MiB materialization boundary and independent locate behavior.",
-  },
-  {
     id: "artifact-output-publication",
     plugin: ["src/omp/artifacts.ts"],
     native: ["tools/output-meta.ts", "tools/bash.ts", "exec/bash-executor.ts", "../../pi-tui/src/tools/output-meta.ts", "../../pi-tui/src/tools/bash.ts"],
-    assumption: "Native truncated and minimized Bash results expose artifact IDs and generated raw-output references that can be republished as bound remote references; the renderer retains the remote recovery target.",
+    assumption: "Native truncation metadata and exactly generated Bash raw-output footers refer to local://<id>.log. The worker converts these owned references before sending results; numeric IDs must not trigger the host’s native spill renderer.",
     coveredBy: [
       { path: "test/worker.test.ts", name: "truncated bash output is recoverable through remote artifact selectors" },
       { path: "test/worker.test.ts", name: "minimized bash metadata and rendered output recover the same bound remote artifact" },
+      { path: "test/worker.test.ts", name: "a remote spill does not resolve to the host session's local://1.log" },
     ],
   },
   {
     id: "artifact-output-shapes",
     plugin: ["src/omp/artifacts.ts"],
     native: ["tools/output-meta.ts", "edit/index.ts", "../../pi-tui/src/tools/output-meta.ts", "../../pi-tui/src/tools/bash.ts"],
-    assumption: "Native OutputMeta slots (including minimized raw captures), Edit per-file results, sampled-output selectors and exact generated footers remain the structures recognized by remote artifact publication.",
+    assumption: "Native OutputMeta slots, Edit per-file results and selectors retain their typed shape; native spill sources, generated notices and raw-output footers now use local://<id>.log, not artifact://.",
     coveredBy: [],
     gap: "Native Bash minimization and rendering are covered; exhaustive Edit, sampling and footer publication tests still construct synthetic metadata instead of exercising every native producer.",
   },
@@ -192,15 +186,15 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     id: "process-list-rendering",
     plugin: ["src/omp/process-routing.ts"],
     native: ["internal-urls/proc-protocol.ts", "../../pi-tui/src/tools/read.ts"],
-    assumption: "Merged process results retain details.proc jobs, agents and daemons in the shape consumed by the native Read renderer.",
+    assumption: "Merged proc listings retain details.proc jobs, agents and daemons; service rows are native UnitSnapshots keyed by key, with pids, state and policy rather than old broker fields.",
     coveredBy: [],
     gap: "Merge tests supply synthetic results and never render a merged native process listing.",
   },
   {
     id: "conflict-registration",
     plugin: ["src/omp/conflict-resources.ts", "src/runtime.ts", "src/omp/artifacts.ts"],
-    native: ["tools/conflict-detect.ts", "tools/read.ts"],
-    assumption: "Native Read calls the overridable ConflictHistory.register during recursive multi-path reads and reuses unchanged conflict IDs for publication.",
+    native: ["tools/conflict-detect.ts", "tools/read.ts", "tools/tool-state.ts"],
+    assumption: "Native Read calls the overridable ConflictHistory.register on the conversation state (ToolSession.state), including recursive multi-path reads, and reuses unchanged conflict IDs.",
     coveredBy: [{ path: "test/conflict-resources.test.ts", name: "native runtime emits structured ids for multi-path, concurrent and repeated reads only" }],
   },
   {
@@ -288,20 +282,21 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   },
   {
     id: "remote-capture-native-consumers",
-    plugin: ["src/omp/remote-capture.ts"],
+    plugin: ["src/omp/remote-capture.ts", "src/omp/captured-bash.ts", "src/omp/async-bash.ts"],
     native: ["async/job-manager.ts", "job-widgets/types.ts", "job-widgets/pipe-source.ts", "job-widgets/runtime.ts"],
-    assumption: "Native pipe sources and widgets accept stable mirrored streams with UTF-16 output cursors, byte pipe cursors, retention gaps and incremental UTF-8 decoder state.",
+    assumption: "Native widgets consume stable mirrored streams with UTF-16 output cursors, byte pipe cursors, retention gaps and incremental UTF-8 decoder state. Managed Bash publishes its spill before folding text and metadata into the host job, so native proc and job renderers never synthesize a host-local link from the worker's numeric ID.",
     coveredBy: [
       { path: "test/remote-capture.test.ts", name: "native PipeTextSources keep their decoder across split UTF-8 and reset at byte gaps" },
       { path: "test/remote-capture.test.ts", name: "the native widget runtime consumes genuine incremental captures exactly once" },
       { path: "test/worker-capture.test.ts", name: "pre-tail bytes feed proc streams and native validated numeric widgets exactly once" },
+      { path: "test/worker-capture.test.ts", name: "managed Bash publishes the spill to local job text without a host-local artifact ID" },
     ],
   },
   {
     id: "service-instance-ownership",
     plugin: ["src/omp/service-lifecycle.ts", "src/omp/service-jobs.ts"],
-    native: ["tools/bash.ts", "launch/services.ts", "launch/protocol.ts", "launch/client.ts", "launch/broker.ts"],
-    assumption: "Native service receipts identify PID and owner while broker describe supplies a generation UUID whose instance-scoped stop cannot kill a same-name replacement.",
+    native: ["tools/bash.ts", "launch/services.ts", "daemon/protocol.ts", "daemon/client.ts", "daemon/units.ts"],
+    assumption: "Native Bash receipts identify a PID, and the daemon’s project-scoped proc describe returns the owner and launch generation. Unit IDs can survive relaunch, so stop must match the atomic generation guard, not the unit ID.",
     coveredBy: [
       { path: "test/worker.test.ts", name: "instance-scoped stop refuses replacement and is repeatable for the owned instance" },
       { path: "test/worker.test.ts", name: "same-name preflight failure cannot roll back the existing instance" },
@@ -311,8 +306,8 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "service-completion-notifications",
     plugin: ["src/omp/service-jobs.ts"],
-    native: ["async/job-manager.ts", "launch/broker.ts", "launch/protocol.ts"],
-    assumption: "Native broker notifies owners on natural completion but suppresses daemon-completed after explicit stop, requiring terminal and replaced launch receipts to settle without that event.",
+    native: ["async/job-manager.ts", "daemon/units.ts", "daemon/protocol.ts", "session/launch-completion.ts"],
+    assumption: "The daemon emits owner-scoped completed events containing a UnitSnapshot for natural exits, replaying until acknowledged. Explicit stop suppresses the event; a terminal or replaced launch receipt or a native proc stop receipt settles the host coordination job without it.",
     coveredBy: [
       { path: "test/worker.test.ts", name: "owner receives a launch-completion event when its daemon exits" },
       { path: "test/worker.test.ts", name: "another worker explicitly stopping readiness settles the terminal launch without a completion event" },
@@ -323,7 +318,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     id: "service-prelaunch-capacity-and-stop-parser",
     plugin: ["src/omp/service-jobs.ts"],
     native: ["async/job-manager.ts", "internal-urls/proc-protocol.ts"],
-    assumption: "Native job capacity rejects before remote launch and successful proc stop results expose details.proc.action and daemon.name for explicit host completion.",
+    assumption: "Native job capacity rejects before remote launch. Successful proc stop results expose details.proc.action=stop and the UnitSnapshot key and generation in details.proc.daemon.",
     coveredBy: [],
     gap: "No native integration test exhausts capacity before launch or drives completeStoppedService with a real proc stop result.",
   },
@@ -387,7 +382,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     id: "native-bash-schema-projection",
     plugin: ["src/omp/runtime-contract.ts", "src/runtime.ts"],
     native: ["tools/bash.ts", "tools/settings.ts", "exec/settings.ts"],
-    assumption: "Native Bash settings expose async only as an optional local orchestration boolean while launch.enabled controls service fields in the worker execution schema.",
+    assumption: "Native Bash still exposes optional async for host scheduling and name/ready for services. Its new notify field appears whenever async or services are enabled; it has no remote delivery channel and is excluded from the remote execution schema comparison.",
     coveredBy: [{ path: "test/bash-runtime-contract.test.ts", name: "actual native schema matrix preserves service capability=" }],
   },
   {
@@ -408,7 +403,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "remote-read-batch-ordering",
     plugin: ["src/extension.ts"],
-    native: ["../../pi-agent-core/src/agent-loop.ts", "../../pi-agent-core/src/types.ts", "tools/read.ts", "extensibility/extensions/runner.ts"],
+    native: ["../../pi-agent-core/src/agent-loop.ts", "../../pi-agent-core/src/types.ts", "tools/read.ts", "extensibility/extensions/runner.ts", "extensibility/extensions/wrapper.ts", "extensibility/extensions/types.ts"],
     assumption: "Native read awaits toolCall.earlierEffectsSettled (earlier shared non-read-tier calls in its batch). ExtensionContext from runner.createContext omits toolCall, so remote-routed reads declare exclusive concurrency instead; a throwing resolver also schedules exclusive. Drop this once the SDK exposes toolCall to registered tools.",
     coveredBy: [{ path: "test/lifecycle-transactions.test.ts", name: "remote reads schedule after earlier same-batch effects; local reads stay shared" }],
   },
@@ -483,7 +478,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     id: "native-artifact-immutable-media",
     plugin: ["src/omp/artifacts.ts", "src/omp/artifact-input.ts"],
     native: ["session/artifacts.ts", "tools/read.ts", "internal-urls/router.ts", "../../pi-tui/src/chat/assistant-message.ts"],
-    assumption: "ArtifactManager.getPath defines filename lookup; mounted immutable artifact-store URLs retain native read selectors and suppress editable conflict provenance, while remote media results omit the local-file mediaPath fast path.",
+    assumption: "ArtifactManager.getPath resolves the exact numeric log in the session-local root. The companion’s immutable file-backed URL keeps ranged reads without editable conflict provenance, and remote media results omit the host-local mediaPath fast path.",
     coveredBy: [
       { path: "test/native-parity.test.ts", name: "native artifact reads retain immutable selectors and never register editable conflicts" },
       { path: "test/native-parity.test.ts", name: "remote media bytes never retain a local TUI mediaPath" },
@@ -503,7 +498,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     id: "live-descendant-registry",
     plugin: ["src/extension.ts"],
     native: ["registry/agent-registry.ts", "registry/agent-lifecycle.ts", "registry/persisted-agents.ts", "task/executor.ts", "session/agent-session.ts", "session/agent-session-handle.ts"],
-    assumption: "Persisted session paths scope descendants through detached intermediates. Native lifecycle can park idle main-thread descendants; registry and wake-hold events expose pending native work that blocks this transition. Connect refuses live worker-thread descendants regardless of their reported activity.",
+    assumption: "Persisted session paths scope descendants through detached intermediates. Native lifecycle can park idle main-thread descendants; registry and subscribeWakeState events expose changes relevant to known blockers. Connect refuses live worker-thread descendants regardless of their reported activity.",
     coveredBy: [{ path: "test/lifecycle-transactions.test.ts" }],
   },
   {

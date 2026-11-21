@@ -107,20 +107,20 @@ export function stableJson(value: unknown): string {
 }
 
 /**
- * Only `async` is owned by the local job adapter (which removes it before
- * transport). Service name/readiness and every execution field stay exact.
- * Apply to host metadata only: companions must advertise the execution schema.
+ * `async` belongs to the host job adapter. `notify` has no remote delivery
+ * channel; the native schema exposes it whenever async or services are on.
+ * Check all other Bash fields exactly.
  */
 export function projectOmpBashExecutionSchema(parameters: unknown): unknown {
-  if (!isRecord(parameters) || !isRecord(parameters.properties) || !("async" in parameters.properties))
-    return parameters;
-  if (stableJson(parameters.properties.async) !== stableJson({ type: "boolean" }) ||
-      (Array.isArray(parameters.required) && parameters.required.includes("async"))) {
+  if (!isRecord(parameters) || !isRecord(parameters.properties)) return parameters;
+  if ("async" in parameters.properties &&
+      (stableJson(parameters.properties.async) !== stableJson({ type: "boolean" }) ||
+      (Array.isArray(parameters.required) && parameters.required.includes("async")))) {
     throw new Error("Local OMP bash async schema is incompatible with the adapter: expected an optional boolean");
   }
   return {
     ...parameters,
-    properties: Object.fromEntries(Object.entries(parameters.properties).filter(([key]) => key !== "async")),
+    properties: Object.fromEntries(Object.entries(parameters.properties).filter(([key]) => key !== "async" && key !== "notify")),
   };
 }
 
@@ -205,10 +205,13 @@ export function validateOmpReadyMessage(
       );
     }
     const localParameters = name === "bash" ? projectOmpBashExecutionSchema(local.parameters) : local.parameters;
-    if (stableJson(remote.parameters) !== stableJson(localParameters)) {
+    const remoteParameters = name === "bash" && isRecord(remote.parameters) && isRecord(remote.parameters.properties)
+      ? { ...remote.parameters, properties: Object.fromEntries(Object.entries(remote.parameters.properties).filter(([key]) => key !== "notify")) }
+      : remote.parameters;
+    if (stableJson(remoteParameters) !== stableJson(localParameters)) {
       const drift = describeSchemaDrift(
         localParameters,
-        remote.parameters,
+        remoteParameters,
       );
       throw new Error(
         `Remote OMP tool ${name} schema is incompatible with the local tool${drift ? ` (${drift})` : ""}; ${versionDriftHint(localHostVersion, hostVersion)}`,

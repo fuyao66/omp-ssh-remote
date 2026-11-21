@@ -47,6 +47,33 @@ const spec: JobWidgetSpec = {
 };
 
 describe("real worker capture through native local consumers", () => {
+  test("managed Bash publishes the spill to local job text without a host-local artifact ID", async () => {
+    const manager = new AsyncJobManager({ onJobComplete: () => {} });
+    const command = "echo MANAGED_SPILL_SENTINEL; seq 1 20000";
+    try {
+      const started = await startRemoteAsyncBashJob({
+        manager, ownerId: "Main", command, remoteCwd: cwd,
+        params: { command, async: true },
+        execute: (params, signal, update, onCapture, bashScope) =>
+          client.execute("bash", "managed-spill", params, signal, update, { bashScope, onCapture }) as Promise<AgentToolResult>,
+      });
+      const id = (started.details as { async: { jobId: string } }).async.jobId;
+      const job = manager.getJob(id)!;
+      await job.promise;
+      expect(job.status).toBe("completed");
+      const uri = job.resultText?.match(/remote-artifact:\/\/[a-f0-9-]+\/\d+\b/)?.[0];
+      expect(uri).toBeDefined();
+      expect(job.resultText).not.toMatch(/local:\/\/\d+\.log/);
+      expect(job.latestDetails?.meta?.truncation?.artifactId).toBeUndefined();
+      const proc = await new ReadTool(localSession(manager)).execute("managed-spill-proc", { path: `proc://${id}` });
+      expect(text(proc)).not.toMatch(/local:\/\/\d+\.log/);
+      const spill = await client.execute("read", "managed-spill-read", { path: `${uri}:1-2` }) as AgentToolResult;
+      expect(text(spill)).toContain("MANAGED_SPILL_SENTINEL");
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   test("pre-tail bytes feed proc streams and native validated numeric widgets exactly once", async () => {
     const manager = new AsyncJobManager({ onJobComplete: () => {} });
     let id = "";

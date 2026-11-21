@@ -35,12 +35,12 @@ import {
   runRemoteForegroundBashJob,
   type RemoteAsyncBashJobOptions,
 } from "./omp/async-bash.ts";
-import { startRemoteService, completeService, completeStoppedService } from "./omp/service-jobs.ts";
+import { startRemoteService, completeService, completeProcReceipt } from "./omp/service-jobs.ts";
 import { withReadinessSteering } from "./omp/readiness-steering.ts";
 import { remoteWrapperApproval } from "./omp/approval-targets.ts";
 import { isProcessListingPath, mergeProcessListings } from "./omp/process-routing.ts";
 import { buildLaunchCompletionBatchMessage } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
-import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
+import type { DaemonCompletionEvent } from "@oh-my-pi/pi-coding-agent/daemon/protocol";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { isLocalAgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
@@ -84,9 +84,10 @@ export function captureLocalExecutionSettings(): RemoteExecutionSettings {
 /**
  * Native write/edit gate formatting and diagnostics on `ToolSession.enableLsp &&
  * lsp.enabled` (`tools/write.ts`, `edit/index.ts`). `lsp.*` settings are forwarded;
- * enableLsp is fixed when the session is built (`--no-lsp`, a subagent's spawn-time
- * `task.enableLsp`) and SDK 18.20 exposes it only on the native tools' `session`
- * field. Tests construct the native tools so a renamed field fails loudly.
+ * enableLsp is fixed when the session is built (`--no-lsp` or the SDK's
+ * tool-restriction default). Read it from the native tools' ToolSession.
+ * task.enableLsp only overlays the child's three writethrough settings; capture
+ * those from the child's effective Settings without disabling LSP queries.
  */
 export function nativeSessionLspEnabled(tool: unknown): boolean | undefined {
   const session = (tool as { session?: { enableLsp?: boolean } } | undefined)?.session;
@@ -479,7 +480,7 @@ async function settleDescendantIrcWakes(
           }
           for (const session of sessions) {
             if (isLocalAgentSession(session) && !subscriptions.has(session)) {
-              subscriptions.set(session, session.subscribeIrcWakeHolds(inspect));
+              subscriptions.set(session, session.subscribeWakeState(inspect));
             }
           }
         } catch (error) { finish(error); }
@@ -530,7 +531,7 @@ async function parkIdleDescendants(
         if (ref.session) void lifecycle.ensureLive(ref.id).catch(() => {});
       }
     });
-    const unsubscribeWake = isLocalAgentSession(refSession) ? refSession.subscribeIrcWakeHolds(() => {
+    const unsubscribeWake = isLocalAgentSession(refSession) ? refSession.subscribeWakeState(() => {
       if (registry.get(ref.id) === ref && ref.session === refSession && descendantBlockerReason(ref)) {
         woke = true;
         if (ref.session) void lifecycle.ensureLive(ref.id).catch(() => {});
@@ -761,7 +762,7 @@ function ownershipState(state: RemoteExtensionState, ctx?: ExtensionContext) {
 }
 
 /**
- * Native read awaits toolCall.earlierEffectsSettled before reading, but SDK 18.20's
+ * Native read awaits toolCall.earlierEffectsSettled before reading, but SDK 19.0.1's
  * ExtensionContext does not expose toolCall, so a remote read cannot wait for an
  * earlier shared remote bash in its batch. Exclusive scheduling restores that order
  * (at the cost of serializing remote reads). Throws count as exclusive natively.
@@ -1025,6 +1026,10 @@ function registerWrapper(
       ensureCurrent();
       if (nested && target !== "remote" && !isOutReplyWrite(name, params)) throw new Error(`Eval tool.${name}: host resource unavailable from the remote runtime`);
       const serviceName = name === "bash" && target === "remote" && typeof params.name === "string" ? params.name.trim() || undefined : undefined;
+      // No remote channel delivers notify matches. Refuse before any job or service exists so the
+      // regex is never silently dropped; blank notify means absent, as natively.
+      if (name === "bash" && target === "remote" && typeof params.notify === "string" && params.notify.trim())
+        throw new Error("notify is unavailable in remote workspaces.");
       if (name === "bash" && target === "remote" && params.async === true && !serviceName) {
         return startRemoteAsyncBashJob(remoteBashJobOptions(toolCallId, params, state, ctx, rawOnUpdate));
       }
@@ -1070,7 +1075,7 @@ function registerWrapper(
       }
       ensureCurrent();
       if (name === "write" && target === "remote" && state.client) {
-        completeStoppedService(state.client, result);
+        completeProcReceipt(state.client, result);
       }
       if (
         (name === "ast_edit" ||
@@ -1210,20 +1215,22 @@ function bindLaunchCompletionDelivery(
 ): void {
   client.onEvent((event) => {
     if (event.event !== "launch-completion") return;
-    const notification = event.payload as unknown as DaemonCompletionNotification;
-    if (!notification?.daemon || typeof notification.daemon !== "object") throw new Error("Invalid remote launch completion");
-    if (completeService(client, notification.daemon.name, notification)) return;
-    const message = buildLaunchCompletionBatchMessage([notification]);
-    pi.sendMessage(
-      {
-        customType: message.customType,
-        content: message.content,
-        display: message.display,
-        details: message.details,
-        attribution: message.attribution,
-      },
-      { deliverAs: "followUp", triggerTurn: true },
-    );
+    const notification = event.payload as unknown as DaemonCompletionEvent;
+    if (notification?.ev !== "completed" || typeof notification.unit?.key !== "string")
+      throw new Error("Invalid remote launch completion");
+    completeService(client, notification.unit.key, notification, () => {
+      const message = buildLaunchCompletionBatchMessage([notification]);
+      pi.sendMessage(
+        {
+          customType: message.customType,
+          content: message.content,
+          display: message.display,
+          details: message.details,
+          attribution: message.attribution,
+        },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+    });
   });
 }
 

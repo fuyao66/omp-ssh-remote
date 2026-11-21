@@ -116,7 +116,7 @@ export default async function taskSmoke(pi: ExtensionAPI) {
     nativeSessions.set(ctx.agent.id, native);
     const status = await native.getToolByName("remote_workspace_status").execute(crypto.randomUUID(), {}, AbortSignal.timeout(40_000));
     // ReadTool opens procfs in the companion itself; Bash runs under the native
-    // daemon broker and therefore cannot identify its companion with `$PPID`.
+    // daemon and therefore cannot identify its companion with `$PPID`.
     const identity = await native.getToolByName("read").execute(crypto.randomUUID(), { path: "/proc/self/stat:raw" }, AbortSignal.timeout(40_000));
     assert(!identity.isError, JSON.stringify(identity));
     const stat = identity.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n")
@@ -183,7 +183,7 @@ export default async function taskSmoke(pi: ExtensionAPI) {
       assert.equal(initial.session!.instanceKey, child.instanceKey, "Observer and authoritative registry disagree on session instance");
       const agent = { name: "task", description: "Native task acceptance", systemPrompt: "Follow the deterministic acceptance assignment.", source: "project" as const };
       const follow = (phase: string, signal?: AbortSignal) => runSubagentFollowUpTurn({ id, agent,
-        message: `ACCEPTANCE_TURN=${id}:${phase}`, structured: false, signal, completionProbe: false, softRequestBudget: 0, maxRuntimeMs: 90_000 });
+        message: `ACCEPTANCE_TURN=${id}:${phase}`, signal, completionProbe: false, softRequestBudget: 0, maxRuntimeMs: 90_000 });
       await post("checkpoint", { phase: "before-child-reconnect", id });
       const reconnected = await follow("reconnect");
       assert.equal(reconnected.exitCode, 0, JSON.stringify(reconnected));

@@ -17,7 +17,7 @@ import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { createXdevState, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
-import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
+import type { DaemonCompletionEvent } from "@oh-my-pi/pi-coding-agent/daemon/protocol";
 import { drainAbortedShells, releaseShellSessions } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
@@ -40,7 +40,7 @@ import { bindRemoteResourceResult } from "./resource-routing.ts";
 import type { executeOwnedRemoteService, stopRemoteServiceInstance, ServiceStopReceipt } from "./omp/service-lifecycle.ts";
 import { mayMutateLsp, type LspMutation, type LspDiagnostics, type LspOperation } from "./omp/lsp-diagnostics.ts";
 import { LspDiagnosticRevisions } from "./omp/lsp-revisions.ts";
-import { cfgLspDiagnosticsOnEdit, cfgLspDiagnosticsOnWrite } from "@oh-my-pi/pi-coding-agent/lsp/settings";
+import { cfgLspDiagnosticsOnEdit, cfgLspDiagnosticsOnWrite, cfgLspEnabled } from "@oh-my-pi/pi-coding-agent/lsp/settings";
 export interface RemoteNativeTool {
   readonly name: string;
   readonly description: string;
@@ -96,8 +96,8 @@ export type NativeWorkerRuntime = {
 export type NativeWorkerRuntimeOptions = {
   /** Owner identity for remote supervised processes (local OMP session id). */
   sessionId?: string;
-  /** Receives broker completion notifications for daemons this owner started. */
-  onLaunchCompletion?: (notification: DaemonCompletionNotification) => void | Promise<void>;
+  /** Receives terminal notifications for services this owner started. */
+  onLaunchCompletion?: (notification: DaemonCompletionEvent) => void | Promise<void>;
   /** Worker-native mutation ordering and late diagnostics, owned by this session. */
   onLspMutation?: (mutation: LspMutation) => void;
   onDeferredDiagnostics?: (diagnostics: LspDiagnostics) => void;
@@ -116,7 +116,7 @@ export type NativeWorkerRuntimeOptions = {
   /** Host-authorized invocation; omitted in frontend schema-only snapshots. */
   invokeTool?: RemoteNativeTool["execute"] extends (...args: infer A) => infer R
     ? (name: RemoteToolName, ...args: A) => R : never;
-  /** Worker-only broker adapter; frontend schema snapshots do not need it. */
+  /** Worker-only daemon adapter; frontend schema snapshots do not need it. */
   serviceLifecycle?: {
     execute: typeof executeOwnedRemoteService;
     stop: typeof stopRemoteServiceInstance;
@@ -175,13 +175,17 @@ export async function createNativeWorkerRuntime(
     restrictToolNames: true,
     settings,
     taskDepth: options.taskDepth ?? 0,
-    conflictHistory,
+    state: { conflictHistory },
     getSessionFile: () => null,
     getSessionSpawns: () => "",
     getSessionId: () => sessionId,
-    getArtifactsDir: () => artifacts.manager.dir,
+    getArtifactsDir: () => artifacts.manager.sessionDir,
     getArtifactManager: () => artifacts.manager,
-    allocateOutputArtifact: (type) => artifacts.manager.allocatePath(type),
+    allocateOutputArtifact: () => artifacts.manager.allocatePath(),
+    localProtocolOptions: {
+      getArtifactsDir: () => artifacts.manager.sessionDir,
+      getSessionId: () => artifacts.namespace,
+    },
     registerDisposeCallback: (callback) => {
       disposeCallbacks.add(callback);
       return () => {
@@ -207,6 +211,7 @@ export async function createNativeWorkerRuntime(
       queueDeferredDiagnostics: entry => { if (!entry.isStale()) revisions.diagnostics(entry); },
     } : {}),
     isToolActive: (name) => (name !== "edit" || resolveEditMode(session) !== "none") &&
+      (name !== "lsp" || cfgLspEnabled.get(settings)) &&
       REMOTE_TOOL_NAMES.includes(name as (typeof REMOTE_TOOL_NAMES)[number]),
     getToolByName: name => {
       const bareName = stripXdUrlPrefix(name);
@@ -293,6 +298,8 @@ export async function createNativeWorkerRuntime(
       } finally { release.resolve(); }
     };
     tool.execute = async (id, params, signal, onUpdate, context) => {
+      // Keep handshake metadata stable without exposing a disabled native tool.
+      if (tool.name === "lsp" && !cfgLspEnabled.get(settings)) throw new Error("LSP is disabled in this session");
       const resolved = await resolveRemoteArtifactArgs(tool.name, params);
       const update = onUpdate ? (value: unknown) => onUpdate(artifacts.publish(value, tool.name)) : undefined;
       const serviceName = tool.name === "bash" && typeof resolved.name === "string" ? resolved.name.trim() : "";
@@ -317,7 +324,7 @@ export async function createNativeWorkerRuntime(
   Object.values(tools).forEach(publishTool);
   const evalCallableNames = NESTED_TOOL_NAMES;
   for (const name of evalCallableNames) {
-    if (name === "edit" && editMode === "none") continue;
+    if (!session.isToolActive?.(name)) continue;
     const tool = tools[name];
     callableTools.set(name, { name: tool.name, description: tool.description,
       parameters: tool.parameters, customWireName: tool.customWireName,

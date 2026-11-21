@@ -1,5 +1,7 @@
 /**
- * Read-only OMP upgrade assessment: `bun run upgrade:assess <version> [--out report.md]`.
+ * Read-only OMP upgrade assessment: `bun run upgrade:assess <version> [--from <version>] [--out report.md]`.
+ *
+ * The baseline is the installed SDK, or `--from` when the pins were already bumped.
  *
  * Downloads the target SDK packages into a fresh temporary directory (never executed), then reports
  * what an upgrade must review: source-adaptation anchors against the target, every native file the
@@ -7,7 +9,7 @@
  * CHANGELOG's breaking changes since the supported version. It changes nothing in the repository.
  */
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { SDK_SOURCE_ADAPTATIONS, SUPPORTED_SDK_VERSION } from "../src/omp/sdk-contract.ts";
@@ -21,7 +23,7 @@ type SdkPackage = (typeof SDK_PACKAGES)[number];
 type Dependency = { pkg: SdkPackage; file: string; reasons: Set<string> };
 
 function usage(): never {
-  console.error("usage: bun run upgrade:assess <version> [--out report.md]");
+  console.error("usage: bun run upgrade:assess <version> [--from <version>] [--out report.md]");
   process.exit(2);
 }
 
@@ -46,7 +48,7 @@ function installedPackageDir(pkg: SdkPackage): string {
 /** Each package gets its own empty directory; archives are extracted, never executed. */
 async function fetchTarget(pkg: SdkPackage, version: string, scratch: string): Promise<string> {
   const directory = join(scratch, pkg);
-  await run(["mkdir", "-p", directory], scratch);
+  await mkdir(directory, { recursive: true });
   const tarball = (await run(["npm", "pack", `@oh-my-pi/${pkg}@${version}`, "--silent", "--registry=https://registry.npmjs.org"], directory)).trim().split("\n").at(-1);
   if (!tarball) throw new Error(`npm pack produced no archive for @oh-my-pi/${pkg}@${version}`);
   await run(["tar", "xzf", tarball], directory);
@@ -119,18 +121,31 @@ function changelogSince(changelog: string, from: string): string[] {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  const target = args.find(arg => !arg.startsWith("--"));
-  const outIndex = args.indexOf("--out");
-  const out = outIndex >= 0 ? args[outIndex + 1] : undefined;
-  if (!target || (outIndex >= 0 && !out)) usage();
+  const option = (name: string): string | undefined => {
+    const index = args.indexOf(name);
+    if (index < 0) return undefined;
+    const value = args[index + 1];
+    if (!value || value.startsWith("--")) usage();
+    return value;
+  };
+  const out = option("--out");
+  const from = option("--from");
+  const target = args.find((arg, index) => !arg.startsWith("--") && !["--out", "--from"].includes(args[index - 1] ?? ""));
+  if (!target) usage();
 
-  const installed = Object.fromEntries(SDK_PACKAGES.map(pkg => [pkg, installedPackageDir(pkg)])) as Record<SdkPackage, string>;
   const scratch = await mkdtemp(join(tmpdir(), "omp-upgrade-assess-"));
   try {
+    // Dependency discovery always resolves imports against the installed SDK; only the diff baseline moves.
+    const resolver = Object.fromEntries(SDK_PACKAGES.map(pkg => [pkg, installedPackageDir(pkg)])) as Record<SdkPackage, string>;
+    const installed = {} as Record<SdkPackage, string>;
     const targets = {} as Record<SdkPackage, string>;
-    for (const pkg of SDK_PACKAGES) targets[pkg] = await fetchTarget(pkg, target, scratch);
+    for (const pkg of SDK_PACKAGES) {
+      installed[pkg] = from ? await fetchTarget(pkg, from, join(scratch, "from")) : resolver[pkg];
+      targets[pkg] = await fetchTarget(pkg, target, join(scratch, "to"));
+    }
+    const baseline = from ?? SUPPORTED_SDK_VERSION;
 
-    const lines: string[] = [`# OMP upgrade assessment: ${SUPPORTED_SDK_VERSION} → ${target}`, ""];
+    const lines: string[] = [`# OMP upgrade assessment: ${baseline} → ${target}`, ""];
     const agentManifest = JSON.parse(await readFile(join(targets["pi-coding-agent"], "package.json"), "utf8")) as { engines?: { bun?: string } };
     lines.push(`- Target requires Bun ${agentManifest.engines?.bun ?? "(unspecified)"}; local Bun ${Bun.version}.`, "");
 
@@ -147,7 +162,7 @@ async function main(): Promise<void> {
     }
     lines.push("");
 
-    const dependencies = [...(await collectDependencies(installed)).values()].sort((a, b) => `${a.pkg}/${a.file}`.localeCompare(`${b.pkg}/${b.file}`));
+    const dependencies = [...(await collectDependencies(resolver)).values()].sort((a, b) => `${a.pkg}/${a.file}`.localeCompare(`${b.pkg}/${b.file}`));
     const changed: string[] = [];
     const missing: string[] = [];
     let unchanged = 0;
@@ -168,8 +183,8 @@ async function main(): Promise<void> {
     if (changed.length) lines.push("### Changed (review the diff against the listed contract or import)", "", ...changed, "");
 
     const changelogPath = join(targets["pi-coding-agent"], "CHANGELOG.md");
-    const breaking = existsSync(changelogPath) ? changelogSince(await readFile(changelogPath, "utf8"), SUPPORTED_SDK_VERSION) : [];
-    lines.push(`## Breaking changes since ${SUPPORTED_SDK_VERSION} (${breaking.length})`, "", ...breaking.map(item => `- ${item}`), "");
+    const breaking = existsSync(changelogPath) ? changelogSince(await readFile(changelogPath, "utf8"), baseline) : [];
+    lines.push(`## Breaking changes since ${baseline} (${breaking.length})`, "", ...breaking.map(item => `- ${item}`), "");
     lines.push("Contract assumptions: scripts/sdk-semantic-contracts.ts. Procedure: README › Upgrading OMP.", "");
 
     const report = lines.join("\n");

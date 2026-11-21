@@ -20,6 +20,7 @@ export function hostSessionHandle(
     isStreaming: false,
     runStartedAt: undefined,
     ircWakesPending: false,
+    hasPendingWake: false,
     messages: [],
     get sessionFile() { return getSessionFile(); },
     model: undefined,

@@ -187,7 +187,7 @@ export default async function lspSmoke(pi: ExtensionAPI) {
       const read = text(await ok("read", { path: fixture })); const header = read.match(/\[[^\]\n]+#[A-Fa-f0-9]+\]/)?.[0]; assert(header, read);
       const edited = await ok("edit", { input: `${header}\nPUT 1.=1:\n+EDIT_ERROR` }); assert.match(JSON.stringify(edited.details), /EDIT_ERROR/); assert.equal(await disk(fixture), "EDIT_ERROR\n"); report("edit_diagnostics", { source: "deterministic-fixture", inline: true });
       drain();
-      const unsupported = await failure({ action: "implementation", file: fixture, line: 1, symbol: "EDIT_ERROR" }, /[Mm]ethod not found/);
+      const unsupported = await failure({ action: "implementation", file: fixture, line: 1, symbol: "EDIT_ERROR" }, /does not implement textDocument\/implementation/);
       await failure({ action: "request", file: fixture, query: "smoke/fail" }, /intentional fixture failure/); report("unsupported_vs_failure", { unsupported, explicitFailure: "intentional fixture failure" }, "classified");
       const controller = new AbortController();
       const hanging = request("smoke/hang", {}, controller.signal).then(result => ({ result, error: undefined }), error => ({ result: undefined, error }));

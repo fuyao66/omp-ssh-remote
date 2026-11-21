@@ -1,12 +1,14 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { watch } from "node:fs";
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { OMP_RUNTIME_HANDSHAKE } from "../src/omp/runtime-contract.ts";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
-import { daemonClientForProject } from "@oh-my-pi/pi-coding-agent/launch/client";
+import { probeDaemon } from "@oh-my-pi/pi-coding-agent/daemon/client";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { projectScope } from "@oh-my-pi/pi-coding-agent/daemon/protocol";
 import { startRemoteService } from "../src/omp/service-jobs.ts";
 import { executeOwnedRemoteService } from "../src/omp/service-lifecycle.ts";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
@@ -18,12 +20,14 @@ test("worker bootstrap isolates native re-entry imports and installs signal owne
   const entry = await readFile(join(import.meta.dir, "../src/worker.ts"), "utf8");
   const staticImports = [...entry.matchAll(/^import .* from "([^"]+)";/gm)].map(match => match[1]);
   expect(staticImports.sort()).toEqual([
-    "@oh-my-pi/pi-coding-agent/launch/protocol",
+    "@oh-my-pi/pi-coding-agent/daemon/protocol",
     "@oh-my-pi/pi-utils/postmortem",
+    "@oh-my-pi/pi-utils/worker-host",
+    "node:os", "node:path", "node:worker_threads",
   ]);
   expect(entry.match(/installProcessHandlers\(\)/g)).toHaveLength(1);
   const installed = entry.indexOf("installProcessHandlers();");
-  for (const module of ["./worker-js-eval.ts", "@oh-my-pi/pi-coding-agent/launch/broker", "./worker-companion.ts"]) {
+  for (const module of ["./worker-js-eval.ts", "@oh-my-pi/pi-coding-agent/daemon/server", "@oh-my-pi/pi-coding-agent/exec/shell-process-worker", "@oh-my-pi/pi-coding-agent/eval/js/worker-entry", "./worker-companion.ts"]) {
     expect(entry.indexOf(`import("${module}")`)).toBeGreaterThan(installed);
   }
   const jsHost = await readFile(join(import.meta.dir, "../src/worker-js-eval.ts"), "utf8");
@@ -34,11 +38,20 @@ test("worker bootstrap isolates native re-entry imports and installs signal owne
   }
 });
 
+const priorDaemonDir = process.env.OMP_DAEMON_DIR;
+const priorDaemonTcp = process.env.OMP_DAEMON_TCP;
+const priorHome = process.env.HOME;
 const ownerSessionId = "native-worker-owner";
 let cwd: string;
+let daemonHome: string;
 let client: RemoteRuntimeClient;
 
 beforeAll(async () => {
+  // Every worker here derives its private daemon dir from HOME; never touch a deployed companion's daemon.
+  daemonHome = await mkdtemp(join(tmpdir(), "omp-ssh-remote-home-"));
+  process.env.HOME = daemonHome;
+  process.env.OMP_DAEMON_DIR = join(daemonHome, ".cache", "omp-ssh-remote-daemon");
+  delete process.env.OMP_DAEMON_TCP;
   cwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-"));
   client = new RemoteRuntimeClient({
     command: ["bun", join(import.meta.dir, "../src/worker.ts")],
@@ -62,9 +75,15 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  if (priorDaemonDir === undefined) delete process.env.OMP_DAEMON_DIR;
+  else process.env.OMP_DAEMON_DIR = priorDaemonDir;
+  if (priorDaemonTcp !== undefined) process.env.OMP_DAEMON_TCP = priorDaemonTcp;
   await client.close();
   expect(await client.waitForExit()).toBe(0);
   await rm(cwd, { recursive: true, force: true });
+  if (priorHome === undefined) delete process.env.HOME;
+  else process.env.HOME = priorHome;
+  await rm(daemonHome, { recursive: true, force: true });
 });
 
 describe("native worker round trip", () => {
@@ -76,6 +95,36 @@ describe("native worker round trip", () => {
     const artifact = recovered as AgentToolResult<{ rowPrefixes: boolean }>;
     expect(artifact.content.filter(part => part.type === "text").map(part => part.text).join("\n").split("\n")).toEqual(expect.arrayContaining(["10000", "10001", "10002"]));
     expect(artifact.details?.rowPrefixes).toBe(false);
+  });
+
+  test("a remote spill does not resolve to the host session's local://1.log", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "omp-spill-collision-"));
+    const hostLocal = join(temporary, "local");
+    const worker = new RemoteRuntimeClient({ command: [process.execPath, join(import.meta.dir, "../src/worker.ts")] });
+    try {
+      await mkdir(hostLocal);
+      await writeFile(join(hostLocal, "1.log"), "host-only collision sentinel\n");
+      const host = await InternalUrlRouter.instance().resolve("local://1.log", {
+        localProtocolOptions: { getArtifactsDir: () => temporary },
+      });
+      expect(host.content).toBe("host-only collision sentinel\n");
+      await worker.initialize(temporary, OMP_RUNTIME_HANDSHAKE);
+      // Native Bash reserves spill 0 even for the short first command.
+      await worker.execute("bash", "reserve-zero", { command: "true" });
+      const result = await worker.execute("bash", "spill-one", { command: "echo remote-only-sentinel; seq 1 20000" });
+      const serialized = JSON.stringify(result);
+      const uri = serialized.match(/remote-artifact:\/\/[a-f0-9-]+\/1\b/)?.[0];
+      expect(uri).toBeDefined();
+      expect(serialized).not.toContain("local://1.log");
+      const remote = await worker.execute("read", "read-spill-one", { path: `${uri}:1-2` });
+      expect(JSON.stringify(remote)).toContain("remote-only-sentinel");
+      expect(JSON.stringify(remote)).not.toContain("host-only collision sentinel");
+      const bash = await worker.execute("bash", "bash-spill-one", { command: `head -1 '${uri}'` });
+      expect(JSON.stringify(bash)).toContain("remote-only-sentinel");
+    } finally {
+      await worker.close();
+      await rm(temporary, { recursive: true, force: true });
+    }
   });
 
   test("minimized bash metadata and rendered output recover the same bound remote artifact", async () => {
@@ -112,7 +161,7 @@ describe("native worker round trip", () => {
     test(`${via} cannot authorize editing a column-truncated line`, async () => {
       const path = `long-${via}.txt`;
       const original = `LONG_SENTINEL${"x".repeat(20_000)}TAIL_SENTINEL\n`;
-      await client.execute("write", `long-write-${via}`, { path, content: original });
+      await writeFile(join(cwd, path), original);
       const preview = await client.execute(via, `long-preview-${via}`, via === "read" ? { path } : { path, pattern: "LONG_SENTINEL" });
       const header = JSON.stringify(preview).match(/\[long-(?:read|grep)\.txt#[A-F0-9]+\]/)?.[0];
       expect(header).toBeDefined();
@@ -244,13 +293,13 @@ describe("native worker round trip", () => {
     expect(JSON.stringify(result)).toContain("remote_persisted");
   });
 
-  test("job shells neither inherit nor mutate the foreground session shell", async () => {
+  test("job shells inherit a snapshot without mutating the foreground session shell", async () => {
     const scope = { bashScope: "job" as const };
     await client.execute("bash", "isolation-export", { command: "export OMP_REMOTE_SCOPE=foreground" });
     const first = await client.execute("bash", "isolated-first", { name: "", command: 'printf "INHERITED=%s" "${OMP_REMOTE_SCOPE-unset}"; export OMP_REMOTE_SCOPE=job' }, undefined, undefined, scope);
-    expect(JSON.stringify(first)).toContain("INHERITED=unset");
+    expect(JSON.stringify(first)).toContain("INHERITED=foreground");
     const second = await client.execute("bash", "isolated-second", { name: "  ", command: 'printf "NEXT=%s" "${OMP_REMOTE_SCOPE-unset}"' }, undefined, undefined, scope);
-    expect(JSON.stringify(second)).toContain("NEXT=unset");
+    expect(JSON.stringify(second)).toContain("NEXT=foreground");
     const foreground = await client.execute("bash", "foreground-intact", { command: 'printf "FOREGROUND=%s" "$OMP_REMOTE_SCOPE"' });
     expect(JSON.stringify(foreground)).toContain("FOREGROUND=foreground");
   });
@@ -465,7 +514,7 @@ describe("native worker round trip", () => {
     ).rejects.toThrow("Async bash execution is disabled");
   });
 
-  test("remote hub supervises a process through the worker-hosted broker", async () => {
+  test("remote hub supervises a process through the worker-hosted daemon", async () => {
     const name = `probe-${process.pid}`;
     const started = await client.execute("bash", "service-start", {
       name,
@@ -591,16 +640,16 @@ describe("native worker round trip", () => {
         }, signal) as AgentToolResult);
       void started.catch(() => {});
       await created.promise;
-      const before = await observer.execute("read", "before-external-stop", { path: `proc://${name}` }) as AgentToolResult<{ proc: { daemon: { id: string; pid: number; state: string } } }>;
+      const before = await observer.execute("read", "before-external-stop", { path: `proc://${name}` }) as AgentToolResult<{ proc: { daemon: { generation: string; pids: number[]; state: string } } }>;
       expect(before.details!.proc.daemon.state).toBe("starting");
-      expect(await observer.stopService(name, before.details!.proc.daemon.id)).toHaveProperty("status", "stopped");
+      expect(await observer.stopService(name, before.details!.proc.daemon.generation)).toHaveProperty("status", "stopped");
       const result = await started;
       expect(result).toHaveProperty("details.service.ownership", "terminal");
       const job = manager.getAllJobs()[0]!;
       await job.promise;
       expect(job.status).toBe("completed");
       expect(job.resultText).toContain('"operation":"launch-settled"');
-      expect(() => process.kill(before.details!.proc.daemon.pid, 0)).toThrow();
+      expect(() => process.kill(before.details!.proc.daemon.pids[0]!, 0)).toThrow();
       expect(client.isClosed).toBe(false);
     } finally {
       watcher.close();
@@ -662,7 +711,7 @@ describe("native worker round trip", () => {
       expect(process.kill(replacementPid!, 0)).toBe(true);
     } finally {
       await client.execute("write", "lookup-cleanup", { path: `proc://${name}/kill`, content: "" }).catch(() => {});
-      (await daemonClientForProject(cwd)).close();
+
     }
   }, 30_000);
 });
@@ -706,8 +755,8 @@ describe("hub launch ownership", () => {
       const snapshots: Array<{ owner: string; pid: number }> = [];
       for (const [index, worker] of [first, second].entries()) {
         await worker.execute("bash", `omitted-${index}`, { name: names[index], command: "echo ready; sleep 30", pty: false, ready: { log: "ready" } });
-        const status = await observer.execute("read", `owner-${index}`, { path: `proc://${names[index]}` }) as AgentToolResult<{ proc: { daemon: { owner: string; pid: number } } }>;
-        snapshots.push(status.details!.proc.daemon);
+        const status = await observer.execute("read", `owner-${index}`, { path: `proc://${names[index]}` }) as AgentToolResult<{ proc: { daemon: { owner: string; pids: number[] } } }>;
+        snapshots.push({ owner: status.details!.proc.daemon.owner, pid: status.details!.proc.daemon.pids[0]! });
       }
       expect(snapshots[0]!.owner).toStartWith("omp-ssh-remote:");
       expect(snapshots[1]!.owner).toStartWith("omp-ssh-remote:");
@@ -717,14 +766,14 @@ describe("hub launch ownership", () => {
       expect(process.kill(snapshots[1]!.pid, 0)).toBe(true);
       const explicit = await observer.execute("bash", "explicit-owner", { name: "explicit-owner", command: "echo ready; sleep 30", pty: false, ready: { log: "ready" } });
       expect(explicit).toHaveProperty("details.service.ownership", "owned");
-      const status = await observer.execute("read", "explicit-status", { path: "proc://explicit-owner" }) as AgentToolResult<{ proc: { daemon: { owner: string; pid: number } } }>;
+      const status = await observer.execute("read", "explicit-status", { path: "proc://explicit-owner" }) as AgentToolResult<{ proc: { daemon: { owner: string; pids: number[] } } }>;
       expect(status.details!.proc.daemon.owner).toBe(" explicit observer ");
       second.kill();
       expect(await second.waitForExit()).toBe(143);
       expect(() => process.kill(snapshots[1]!.pid, 0)).toThrow();
-      expect(process.kill(status.details!.proc.daemon.pid, 0)).toBe(true);
+      expect(process.kill(status.details!.proc.daemon.pids[0]!, 0)).toBe(true);
       await observer.close();
-      expect(() => process.kill(status.details!.proc.daemon.pid, 0)).toThrow();
+      expect(() => process.kill(status.details!.proc.daemon.pids[0]!, 0)).toThrow();
     } finally {
       await first.close().catch(() => {});
       await second.close().catch(() => {});
@@ -735,7 +784,7 @@ describe("hub launch ownership", () => {
 
   test("owner receives a launch-completion event when its daemon exits", async () => {
     const eventCwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-hub-evt-"));
-    const owner = "session-owner-events";
+    const owner = `session-owner-events-${crypto.randomUUID()}`;
     const worker = new RemoteRuntimeClient({
       command: ["bun", join(import.meta.dir, "../src/worker.ts")],
     });
@@ -754,8 +803,8 @@ describe("hub launch ownership", () => {
       });
       // The test-level timeout bounds this; the awaited signal is the real event.
       const payload = await completion;
-      const daemon = payload.daemon as Record<string, unknown>;
-      expect(daemon.name).toBe(name);
+      const daemon = payload.unit as Record<string, unknown>;
+      expect(daemon.key).toBe(name);
       expect(daemon.owner).toBe(owner);
       expect(["exited", "failed"]).toContain(String(daemon.state));
       expect(daemon.exitCode).toBe(3);
@@ -765,11 +814,39 @@ describe("hub launch ownership", () => {
     }
   }, 60_000);
 
+  test("a draining companion stops only its own launches, not a same-session replacement's", async () => {
+    // A forced reconnect starts the replacement before the old companion finishes teardown.
+    const sharedCwd = await mkdtemp(join(tmpdir(), "omp-ssh-remote-overlap-"));
+    const owner = `overlap-owner-${crypto.randomUUID()}`;
+    const spawn = () => new RemoteRuntimeClient({ command: ["bun", join(import.meta.dir, "../src/worker.ts")] });
+    const old = spawn();
+    const replacement = spawn();
+    const pid = (result: unknown) => (result as AgentToolResult<{ service: { pid: number } }>).details!.service.pid;
+    try {
+      await old.initialize(sharedCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: owner });
+      await replacement.initialize(sharedCwd, OMP_RUNTIME_HANDSHAKE, undefined, { sessionId: owner });
+      const start = (worker: RemoteRuntimeClient, name: string) =>
+        worker.execute("bash", `start-${name}`, { name, command: "echo ready; sleep 60", pty: false, ready: { log: "ready" } });
+      const oldPid = pid(await start(old, "old-svc"));
+      const newPid = pid(await start(replacement, "new-svc"));
+      await old.close();
+      expect(() => process.kill(oldPid, 0)).toThrow();
+      expect(process.kill(newPid, 0)).toBe(true);
+      await replacement.close();
+      expect(() => process.kill(newPid, 0)).toThrow();
+    } finally {
+      await old.close().catch(() => {});
+      await replacement.close().catch(() => {});
+      await rm(sharedCwd, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("CLI-owned worker awaits service cleanup on SIGHUP, SIGTERM and raw transport EOF", async () => {
     for (const mode of ["sighup", "sigterm", "eof"] as const) {
       const ownedCwd = await mkdtemp(join(tmpdir(), `omp-worker-${mode}-`));
+      // Explicit env: Bun.spawn's default does not reflect the HOME override above.
       const worker = Bun.spawn([process.execPath, join(import.meta.dir, "../src/worker.ts")], {
-        stdin: "pipe", stdout: "pipe", stderr: "pipe",
+        stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { ...process.env },
       });
       const errors = new Response(worker.stderr).text();
       const frames = decodeFrames(worker.stdout)[Symbol.asyncIterator]();
@@ -787,16 +864,15 @@ describe("hub launch ownership", () => {
           if (frame.type === "error") throw new Error(JSON.stringify(frame.error));
           started = frame.type === "result" && frame.id === "start";
         }
-        const broker = await daemonClientForProject(ownedCwd);
-        const status = await broker.request({ op: "describe", name: "owned" });
-        if (status.op !== "describe") throw new Error("Unexpected daemon status reply");
-        const daemon = status.daemon;
-        expect(daemon.pid).toBeNumber();
+        const daemon = await probeDaemon();
+        if (!daemon) throw new Error("Expected the worker-owned daemon to be reachable");
+        const { unit } = await daemon.request({ op: "describe", unit: { kind: "proc", scope: projectScope(ownedCwd), key: "owned" } });
+        daemon.close();
+        expect(unit.pids[0]).toBeNumber();
         if (mode === "eof") await worker.stdin.end();
         else worker.kill(mode === "sighup" ? "SIGHUP" : "SIGTERM");
         expect(await worker.exited).toBe(mode === "sighup" ? 129 : mode === "sigterm" ? 143 : 0);
-        expect(() => process.kill(daemon!.pid!, 0)).toThrow();
-        broker.close();
+        expect(() => process.kill(unit.pids[0]!, 0)).toThrow();
       } finally {
         if (worker.exitCode === null) worker.kill("SIGKILL");
         await worker.exited; await errors; await rm(ownedCwd, { recursive: true, force: true });
@@ -872,8 +948,8 @@ describe("forwarded execution settings", () => {
       const uri = JSON.stringify(result).match(/remote-artifact:\/\/([a-f0-9-]+)\/(\d+)/);
       expect(uri).not.toBeNull();
       const { readdir, stat } = await import("node:fs/promises");
-      const { homedir } = await import("node:os");
-      const artifactDir = join(homedir(), ".cache/omp-ssh-remote/artifacts", uri![1]!);
+      // The workers' HOME, not os.homedir(), which Bun resolves once per process.
+      const artifactDir = join(process.env.HOME!, ".cache/omp-ssh-remote/artifacts", uri![1]!, "local");
       const file = (await readdir(artifactDir)).find(name => name.startsWith(`${uri![2]}.`))!;
       expect((await stat(join(artifactDir, file))).size).toBeLessThan(1.1 * 1024 * 1024);
       const tail = await worker.execute("read", "cap-tail", { path: `${uri![0]}:-3:raw` });

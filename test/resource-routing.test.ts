@@ -172,8 +172,8 @@ describe("bound remote conflict resources", () => {
       await local.tools.read.execute("local-register", { path: "file.txt:conflicts" });
       const params = { path: "file.txt:conflicts" };
       const nativeRead = await remote.tools.read.execute("remote-register", params) as AgentToolResult;
-      expect(local.session.conflictHistory!.entries().map(entry => entry.id)).toEqual([1]);
-      expect(remote.session.conflictHistory!.entries().map(entry => entry.id)).toEqual([1]);
+      expect(local.session.state!.conflictHistory!.entries().map(entry => entry.id)).toEqual([1]);
+      expect(remote.session.state!.conflictHistory!.entries().map(entry => entry.id)).toEqual([1]);
       expect(nativeRead.details).toMatchObject({ remoteResources: { conflictIds: [1] } });
       const published = bindRemoteResourceResult("read", params, nativeRead, remote.resourceBinding);
       expect(published).toBe(nativeRead);
@@ -191,7 +191,7 @@ describe("bound remote conflict resources", () => {
       expect(written.isError).not.toBe(true);
       expect(await readFile(remoteFile, "utf8")).toBe("remote-before\nremote-ours\nremote-after\n");
       expect(await readFile(localFile)).toEqual(localBefore);
-      expect(local.session.conflictHistory!.get(1)?.absolutePath).toBe(localFile);
+      expect(local.session.state!.conflictHistory!.get(1)?.absolutePath).toBe(localFile);
       expect(() => resourceExecutionTarget("write", writeArgs, "workspace-two")).toThrow("stale workspace binding");
       expect(() => resolveRemoteResourceArgs("write", writeArgs, "workspace-two")).toThrow("stale workspace binding");
       expect(pathShouldStayLocal("write", { path: "conflict://1", content: "@ours" })).toBe(true);

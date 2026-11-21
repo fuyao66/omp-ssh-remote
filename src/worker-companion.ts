@@ -3,7 +3,7 @@ import { dapSessionManager } from "@oh-my-pi/pi-coding-agent/dap";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { disposeAllKernelSessions } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import { shutdownAll as shutdownAllLspClients } from "@oh-my-pi/pi-coding-agent/lsp/client";
-import { closeDaemonClients } from "@oh-my-pi/pi-coding-agent/launch/client";
+import { closeDaemonClient } from "@oh-my-pi/pi-coding-agent/daemon/client";
 import { ensureTheme } from "@oh-my-pi/pi-tui/theme";
 import { createNativeWorkerRuntime, type NativeWorkerRuntime } from "./runtime.ts";
 import { stopOwnedRemoteDaemons } from "./omp/hub-cleanup.ts";
@@ -14,6 +14,7 @@ import {
   TOOL_RUNTIME_VERSION,
   decodeFrames,
   encodeMessage,
+  isRecord,
   parseRequest,
   type ExecuteRequest,
   type InitializeRequest,
@@ -30,6 +31,8 @@ import { captureExecutionSettings } from "./omp/execution-settings.ts";
 let runtime: NativeWorkerRuntime | undefined;
 const active = new Map<string, { controller: AbortController; steering: AbortController; done: Promise<void> }>();
 let cleanupPromise: Promise<void> | undefined;
+/** Generations this companion's launch receipts proved; teardown stops only these. */
+const launchedGenerations = new Set<string>();
 const pendingEvents = new Map<string, { resolve(): void; reject(reason: Error): void }>();
 let nextInvocation = 1;
 const pendingInvocations = new Map<string, {
@@ -58,7 +61,7 @@ async function cleanupWorker(reason: Error): Promise<void> {
       if (dapSessionManager.listSessions().length >= before) break;
     }
     if (runtime) {
-      await stopOwnedRemoteDaemons(runtime.cwd, runtime.sessionId);
+      await stopOwnedRemoteDaemons(runtime.cwd, runtime.sessionId, launchedGenerations);
     }
     await Promise.race([
       Promise.allSettled([disposeAllKernelSessions(), disposeAllVmContexts(), shutdownAllLspClients()]),
@@ -69,7 +72,7 @@ async function cleanupWorker(reason: Error): Promise<void> {
     // and drains cancelled shells' TERM→KILL wave. Artifacts are freed with it:
     // once the transport is gone, remote-artifact:// reads are unreachable.
     await runtime?.dispose().catch(() => undefined);
-    await closeDaemonClients().catch(() => undefined);
+    await closeDaemonClient().catch(() => undefined);
   })();
   return cleanupPromise;
 }
@@ -118,7 +121,17 @@ async function initialize(request: InitializeRequest): Promise<void> {
     editMode: request.editMode,
     bashServices: request.bashServices,
     resourceBinding: request.resourceBinding,
-    serviceLifecycle: { execute: executeOwnedRemoteService, stop: stopRemoteServiceInstance },
+    serviceLifecycle: {
+      // Teardown stops only instances this companion's launch receipts proved. A launch whose
+      // call failed after the daemon acknowledged it ends with its lease, as in native OMP.
+      execute: async (...args) => {
+        const result = await executeOwnedRemoteService(...args);
+        const service = isRecord(result) && isRecord(result.details) && isRecord(result.details.service) ? result.details.service : undefined;
+        if (service?.ownership === "owned" && typeof service.id === "string") launchedGenerations.add(service.id);
+        return result;
+      },
+      stop: stopRemoteServiceInstance,
+    },
     onLspMutation: mutation => send({ type: "event", event: "lsp-mutation", payload: mutation }),
     onDeferredDiagnostics: diagnostics => send({ type: "event", event: "lsp-diagnostics", payload: diagnostics }),
     onLspOperation: (operation, phase) => send({ type: "event", event: phase === "begin" ? "lsp-operation-begin" : "lsp-operation-end", payload: operation }),

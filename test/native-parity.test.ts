@@ -184,7 +184,7 @@ describe("native workspace parity", () => {
     const runtime = await createNativeWorkerRuntime(cwd, { editMode: "hashline" });
     const store = await createRemoteArtifacts({ sweep: false });
     try {
-      const file = await store.manager.allocatePath("read");
+      const file = await store.manager.allocatePath();
       await writeFile(file.path, "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n");
       const uri = `remote-artifact://${store.namespace}/${file.id}`;
       const nativePath = await store.manager.getPath(file.id);

@@ -2,6 +2,8 @@ import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
+import { parseSpillUrl, spillUrl } from "@oh-my-pi/pi-utils";
+import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls/local-root";
 import { InternalUrlRouter, type ProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import {
   formatFullOutputReference,
@@ -12,13 +14,21 @@ import {
 
 const root = () => join(homedir(), ".cache/omp-ssh-remote/artifacts");
 const NAMESPACE_NAME = /^[a-f0-9-]{36}$/;
-/** Mirrors the native artifact:// gate: path consumers locate, only materialization reads bytes. */
+/** Limit materialization of the immutable remote view, not ranged reads. */
 const MAX_INLINE_ARTIFACT_BYTES = 8 * 1024 * 1024;
 
 async function resolveArtifactPath(namespace: string, id: string): Promise<string> {
-  const path = await new ArtifactManager(join(root(), namespace)).getPath(id);
+  const sessionDir = join(root(), namespace);
+  const path = await spillManager(sessionDir, namespace).getPath(id);
   if (!path) throw new Error(`Remote artifact not found: remote-artifact://${namespace}/${id}`);
   return path;
+}
+
+function spillManager(sessionDir: string, namespace: string): ArtifactManager {
+  return new ArtifactManager(resolveLocalRoot({
+    getArtifactsDir: () => sessionDir,
+    getSessionId: () => namespace,
+  }), sessionDir);
 }
 
 const ARTIFACT_URL = /^remote-artifact:\/\/([a-f0-9-]{36})(?:\/(\d+))?\/?$/;
@@ -31,12 +41,12 @@ function parseArtifactUrl(href: string): { namespace: string; id?: string } {
 
 /**
  * The embedded shell resolves operands through this read-only filesystem mount, never shell source.
- * A namespace is a virtual directory, not its physical one: ids map to `<id>.<suffix>` files,
+ * A namespace is a virtual directory, not its physical one: ids map to `<id>.log` files,
  * and no-follow metadata (`ls -l`) walks the parent before locating the leaf.
  */
 const remoteArtifactHandler: ProtocolHandler = {
   scheme: "remote-artifact",
-  spec: { backing: "file", selectors: "lines", immutable: true, artifactStore: true },
+  spec: { backing: "file", selectors: "lines", immutable: true },
   async locate(url) {
     const { namespace, id } = parseArtifactUrl(url.href);
     return id === undefined ? null : resolveArtifactPath(namespace, id);
@@ -194,7 +204,7 @@ export async function createRemoteArtifacts(
     };
     await writeFile(join(dir, ARTIFACT_OWNER_FILE), JSON.stringify(owner), { mode: 0o600 });
   }
-  const manager = new ArtifactManager(dir);
+  const manager = spillManager(dir, namespace);
   const publish = (value: unknown, toolName?: string): unknown => {
     const record = (item: unknown): Record<string, unknown> | undefined =>
       item !== null && typeof item === "object" && !Array.isArray(item) ? item as Record<string, unknown> : undefined;
@@ -203,8 +213,8 @@ export async function createRemoteArtifacts(
     const remote = (id: string): string => `remote-artifact://${namespace}/${id}`;
     const nativeId = (id: unknown): id is string => typeof id === "string" && /^\d+$/.test(id);
     const mapUri = (uri: string): string => {
-      const match = /^artifact:\/\/(\d+)$/.exec(uri);
-      return match ? remote(match[1]!) : uri;
+      const id = parseSpillUrl(uri);
+      return id !== undefined && spillUrl(id) === uri ? remote(String(id)) : uri;
     };
     const recoveries = new Map<string, string>();
     const sampledIds = new Set<string>();
@@ -212,7 +222,7 @@ export async function createRemoteArtifacts(
       if (source?.type === "report" && !(elided && elided > 0)) {
         return `Read ${remote(id)} for full report (${source.value})`;
       }
-      const text = formatFullOutputReference(id, elided).replace(`artifact://${id}`, remote(id));
+      const text = formatFullOutputReference(id, elided).replace(spillUrl(id), remote(id));
       return source?.type === "report" ? `${text} (report: ${source.value})` : text;
     };
     // Only typed OutputMeta artifact slots own ids. Rich values and arbitrary
@@ -232,7 +242,7 @@ export async function createRemoteArtifacts(
       if (meta.limits?.columnTruncated) {
         const column = { ...meta.limits.columnTruncated };
         const id = column.artifactId;
-        const nativeSampleSelector = nativeId(id) && column.selectorBase === `artifact://${id}`;
+        const nativeSampleSelector = nativeId(id) && column.selectorBase === spillUrl(id);
         if (typeof column.selectorBase === "string") column.selectorBase = mapUri(column.selectorBase);
         if (nativeId(id)) {
           const uri = remote(id);
@@ -294,14 +304,24 @@ export async function createRemoteArtifacts(
       const hasNotice = originalNotice.length > 0 && text.endsWith(originalNotice);
       let body = hasNotice ? text.slice(0, -originalNotice.length) : text;
       if (toolName === "bash") {
-        const { artifactId } = stripRawOutputArtifactNotice(body);
+        // The executor writes the footer inside the output; Bash may append wall-time,
+        // fork or exit-code notices after it, so the native last-line parser alone misses it.
+        const typedId = originalMeta?.minimized?.artifactId;
+        const artifactId = stripRawOutputArtifactNotice(body).artifactId ?? (nativeId(typedId) ? typedId : undefined);
         if (artifactId !== undefined) {
-          const footer = `[raw output: artifact://${artifactId}]`;
-          const end = body.trimEnd().length;
-          // The native helper identifies the footer. Replace that exact suffix,
-          // not its trimmed body, so every other whitespace byte survives.
-          body = body.slice(0, end - footer.length) + `[raw output: ${remote(artifactId)}]` + body.slice(end);
-          if (!sampledIds.has(artifactId)) published.add(remote(artifactId));
+          const footer = `[raw output: ${spillUrl(artifactId)}]`;
+          // Replace the last whole-line occurrence (trailing blanks allowed); every other byte survives.
+          const wholeLine = (at: number): boolean => {
+            if (at > 0 && body[at - 1] !== "\n") return false;
+            const end = body.indexOf("\n", at + footer.length);
+            return /^\s*$/.test(body.slice(at + footer.length, end < 0 ? undefined : end));
+          };
+          let at = body.lastIndexOf(footer);
+          while (at >= 0 && !wholeLine(at)) at = at === 0 ? -1 : body.lastIndexOf(footer, at - 1);
+          if (at >= 0) {
+            body = body.slice(0, at) + `[raw output: ${remote(artifactId)}]` + body.slice(at + footer.length);
+            if (!sampledIds.has(artifactId)) published.add(remote(artifactId));
+          }
         }
       }
       const notice = hasNotice ? formatOutputNotice(meta) : "";

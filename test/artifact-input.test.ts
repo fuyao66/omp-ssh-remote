@@ -11,7 +11,7 @@ const namespaces: RemoteArtifacts[] = [];
 afterEach(async () => { await Promise.all(namespaces.splice(0).map(store => store.dispose())); });
 async function artifact() {
   const store = await createRemoteArtifacts({ sweep: false }); namespaces.push(store);
-  const file = await store.manager.allocatePath("input");
+  const file = await store.manager.allocatePath();
   await writeFile(file.path, "real artifact bytes\n");
   return { ...file, uri: `remote-artifact://${store.namespace}/${file.id}` };
 }
@@ -76,10 +76,10 @@ describe("native remote artifact shell filesystem", () => {
           mountRemoteArtifactScheme();
           const runtime = await createNativeWorkerRuntime(${JSON.stringify(temporary)});
           try {
-            const file = await runtime.session.getArtifactManager().allocatePath("bash");
+            const file = await runtime.session.getArtifactManager().allocatePath();
             assert(file.path.startsWith(process.env.HOME + "/"), file.path);
             await writeFile(file.path, "real artifact bytes\\n");
-            const namespace = dirname(file.path).split("/").at(-1);
+            const namespace = dirname(dirname(file.path)).split("/").at(-1);
             const uri = "remote-artifact://" + namespace + "/" + file.id;
             const text = value => value.content.filter(block => block.type === "text").map(block => block.text ?? "").join("\\n");
             for (const operand of [uri, "'" + uri + "'", '"' + uri + '"']) {
@@ -137,13 +137,13 @@ describe("native remote artifact shell filesystem", () => {
     }
   });
 
-  test("native artifact lookup preserves literal filenames without interpreting shell syntax", async () => {
+  test("native spill lookup resolves only the exact numeric log filename", async () => {
     mountRemoteArtifactScheme();
     const file = await artifact();
     const unsafe = join(dirname(file.path), `${file.id}.log'; touch MARKER; #`);
     await rm(file.path);
     await writeFile(unsafe, "not an artifact filename");
     expect(await resolveRemoteArtifactArgs("read", { path: file.uri })).toEqual({ path: file.uri });
-    expect(await InternalUrlRouter.instance().locate(file.uri)).toBe(unsafe);
+    await expect(InternalUrlRouter.instance().locate(file.uri)).rejects.toThrow("Remote artifact not found");
   });
 });

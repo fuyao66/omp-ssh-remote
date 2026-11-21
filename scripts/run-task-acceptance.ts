@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { formatTitleUserMessage } from "@oh-my-pi/pi-coding-agent/tiny/message-preproc";
 
-type Proc = { pid: number; ppid: number; start: string; stdinOpen: boolean; marker: boolean; ssh: boolean; runtime: boolean; runtimeMode: "companion" | "daemon-broker" | "js-eval" | "unknown" | "none" };
+type Proc = { pid: number; ppid: number; start: string; stdinOpen: boolean; marker: boolean; ssh: boolean; runtime: boolean; runtimeMode: "companion" | "daemon" | "js-eval" | "unknown" | "none" };
 const bundle = resolve(import.meta.dir, "../.cache/smoke/task-smoke.js");
 assert(await Bun.file(bundle).exists(), "Build helper first: bun scripts/build-smoke.ts task");
 assert(Bun.env.REMOTE_CONNECT_ARGS, "REMOTE_CONNECT_ARGS is required");
@@ -39,7 +39,7 @@ for name in os.listdir('/proc'):
   args=[arg for arg in cmd.split('\\0') if arg]; runtime='/omp-ssh-remote/' in exe
   mode='none'
   if runtime:
-   if '__omp_worker_daemon_broker' in args: mode='daemon-broker'
+   if '__omp_worker_daemon' in args: mode='daemon'
    elif '__omp_worker_js_eval_process' in args: mode='js-eval'
    elif len(args)==1: mode='companion'
    else: mode='unknown'

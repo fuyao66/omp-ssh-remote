@@ -33,7 +33,7 @@ const uuid = (seed: string) => `${seed.repeat(8)}-${seed.repeat(4)}-${seed.repea
 describe("remote artifact namespace hygiene", () => {
   test("worker namespace records its owner and dispose removes it", async () => {
     const artifacts = await createRemoteArtifacts({ sweep: false });
-    const dir = artifacts.manager.dir;
+    const dir = artifacts.manager.sessionDir!;
     const owner = JSON.parse(await readFile(join(dir, ARTIFACT_OWNER_FILE), "utf8")) as {
       pid: number;
       bootId: string;

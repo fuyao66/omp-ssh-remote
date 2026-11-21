@@ -57,9 +57,9 @@ describe("bash local orchestration and remote execution contracts", () => {
       if (!built.success) throw new AggregateError(built.logs, `${name} boundary build failed`);
       bundles[name] = (await Promise.all(built.outputs.map(output => output.text()))).join("\n");
     }
-    expect(bundles.extension).not.toContain("@oh-my-pi/pi-coding-agent/launch/client");
+    expect(bundles.extension).not.toContain("@oh-my-pi/pi-coding-agent/daemon/client");
     expect(bundles.extension).not.toContain("src/omp/service-lifecycle.ts");
-    expect(bundles.worker).toContain("@oh-my-pi/pi-coding-agent/launch/client");
+    expect(bundles.worker).toContain("@oh-my-pi/pi-coding-agent/daemon/client");
     expect(bundles.worker).toContain("executeOwnedRemoteService");
   });
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { formatOutputNotice, type OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { createRemoteArtifacts, resolveRemoteArtifacts, type RemoteArtifacts } from "../src/omp/artifacts.ts";
@@ -42,18 +42,18 @@ describe("remote artifact publication", () => {
     const artifacts = await createArtifacts();
     const application = {
       artifactId: "customer-field",
-      nested: { artifactId: "123", literal: "artifact://12345", meta: { truncation: { artifactId: "456" } } },
+      nested: { artifactId: "123", literal: "local://12345.log", meta: { truncation: { artifactId: "456" } } },
       items: [{ artifactId: "array-field" }],
     };
     const views = [
-      { text: "JSON anchor artifact://12345", view: { kind: "json", value: application } },
-      { text: "table artifact://67890", view: {
-        kind: "table", columns: [{ head: "artifact://12345", key: "artifactId" }],
-        rows: [["customer-field", "artifact://67890"]],
+      { text: "JSON anchor local://12345.log", view: { kind: "json", value: application } },
+      { text: "table local://67890.log", view: {
+        kind: "table", columns: [{ head: "local://12345.log", key: "artifactId" }],
+        rows: [["customer-field", "local://67890.log"]],
       } },
-      { text: "markdown anchor", view: { kind: "markdown", text: "# Literal\n[record](artifact://12345)\nartifact://67890" } },
+      { text: "markdown anchor", view: { kind: "markdown", text: "# Literal\n[record](local://12345.log)\nlocal://67890.log" } },
     ];
-    const body = "literal artifact://12345; suffix artifact://67890abc; embedded remote-artifact://24680";
+    const body = "literal local://12345.log; suffix local://67890.logabc; embedded remote-artifact://24680";
     const input = {
       content: [{ type: "text", text: body }],
       details: {
@@ -74,14 +74,14 @@ describe("remote artifact publication", () => {
   test("adapts only owned numeric ID slots, preserves metadata, and changes only the exact native notice suffix", async () => {
     const artifacts = await createArtifacts();
     const meta = {
-      truncation: { ...truncation("12"), nested: { artifactId: "application-id", uri: "artifact://13" } },
-      source: { type: "internal" as const, value: "artifact://12" },
-      diagnostics: { summary: "one", messages: ["literal artifact://13"] },
+      truncation: { ...truncation("12"), nested: { artifactId: "application-id", uri: "local://13.log" } },
+      source: { type: "internal" as const, value: "local://12.log" },
+      diagnostics: { summary: "one", messages: ["literal local://13.log"] },
       pagedSource: true as const,
       artifactId: "application-meta-id", extra: { artifactId: "application-id" },
       limits: { resultLimit: { reached: 4 }, extra: { artifactId: "application-id" } },
     };
-    const body = "  literal artifact://12\n\n";
+    const body = "  literal local://12.log\n\n";
     const input = textResult(meta, body);
     const original = structuredClone(input);
     const published = artifacts.publish(input) as typeof input;
@@ -103,7 +103,7 @@ describe("remote artifact publication", () => {
     const input = {
       content: [
         { type: "text", text: "earlier" + notice },
-        { type: "text", text: "literal artifact://21" + notice + " not the generated suffix\n" },
+        { type: "text", text: "literal local://21.log" + notice + " not the generated suffix\n" },
         { type: "image", data: "unchanged" },
       ],
       details: { meta },
@@ -190,7 +190,7 @@ describe("remote artifact publication", () => {
     const artifacts = await createArtifacts();
     const meta: OutputMeta = { limits: { columnTruncated: {
       maxColumn: 80, artifactId: "60", artifactElidedBytes: 8192,
-      lines: { first: 100, last: 200 }, selectorBase: "artifact://60",
+      lines: { first: 100, last: 200 }, selectorBase: "local://60.log",
     } } };
     const published = artifacts.publish(textResult(meta)) as TextResult;
     expect(published.details.meta.limits?.columnTruncated).toEqual({
@@ -209,19 +209,19 @@ describe("remote artifact publication", () => {
 
   test("maps only whole native URIs in typed source/selector metadata and preserves already-remote and unknown fields", async () => {
     const artifacts = await createArtifacts();
-    for (const uri of ["artifact://70", "literal artifact://70", "artifact://70suffix", "artifact://70:raw:1-1", "remote-artifact://12345", "remote-artifact://other/70"]) {
+    for (const uri of ["local://70.log", "literal local://70.log", "local://70.logsuffix", "local://70.log:raw:1-1", "remote-artifact://12345", "remote-artifact://other/70"]) {
       const meta = {
         source: { type: "internal" as const, value: uri },
         limits: { columnTruncated: { maxColumn: 80, lines: { first: 1, last: 1 }, selectorBase: uri } },
-        unknown: { source: { type: "internal", value: "artifact://70" }, artifactId: "70" },
+        unknown: { source: { type: "internal", value: "local://70.log" }, artifactId: "70" },
       };
-      const input = { content: [{ type: "text", text: `literal ${uri}` }], details: { meta, applicationUri: "artifact://70" } };
+      const input = { content: [{ type: "text", text: `literal ${uri}` }], details: { meta, applicationUri: "local://70.log" } };
       const published = artifacts.publish(input) as typeof input;
-      const expected = uri === "artifact://70" ? `remote-artifact://${artifacts.namespace}/70` : uri;
+      const expected = uri === "local://70.log" ? `remote-artifact://${artifacts.namespace}/70` : uri;
       expect(published.details.meta.source.value).toBe(expected);
       expect(published.details.meta.limits.columnTruncated.selectorBase).toBe(expected);
       expect(published.details.meta.unknown).toEqual(meta.unknown);
-      expect(published.details.applicationUri).toBe("artifact://70");
+      expect(published.details.applicationUri).toBe("local://70.log");
       expect(published.content).toEqual(input.content);
       expect(artifacts.publish(published)).toEqual(published);
     }
@@ -230,12 +230,12 @@ describe("remote artifact publication", () => {
   test("adapts verified Edit per-file metadata only, preserving diffs, snapshots, and nested application metadata", async () => {
     const artifacts = await createArtifacts();
     const input = {
-      content: [{ type: "text", text: "edit artifact://80; application text" }],
+      content: [{ type: "text", text: "edit local://80.log; application text" }],
       details: {
-        diff: "combined artifact://80", oldText: "artifact://80", newText: "artifact://81",
+        diff: "combined local://80.log", oldText: "local://80.log", newText: "local://81.log",
         perFileResults: [
-          { path: "a.ts", diff: "-artifact://80\n+artifact://81", oldText: "artifact://80", meta: { truncation: truncation("80") } },
-          { path: "b.ts", diff: "literal artifact://81", meta: { truncation: truncation("81", { artifactElidedBytes: 2048 }) } },
+          { path: "a.ts", diff: "-local://80.log\n+local://81.log", oldText: "local://80.log", meta: { truncation: truncation("80") } },
+          { path: "b.ts", diff: "literal local://81.log", meta: { truncation: truncation("81", { artifactElidedBytes: 2048 }) } },
           { path: "not-a-native-result", meta: { truncation: truncation("82") } },
         ],
         application: { perFileResults: [{ path: "c.ts", diff: "data", meta: { truncation: { artifactId: "83" } } }] },
@@ -263,8 +263,8 @@ describe("remote artifact publication", () => {
   test("adapts only Bash's exact generated raw footer and preserves every surrounding byte", async () => {
     const artifacts = await createArtifacts();
     const meta = { truncation: truncation("90") };
-    const prefix = "  literal artifact://90\n[raw output: artifact://91]\nnot a footer\r\n\t\n";
-    const body = prefix + "[raw output: artifact://90] \t\r\n";
+    const prefix = "  literal local://90.log\n[raw output: local://91.log]\nnot a footer\r\n\t\n";
+    const body = prefix + "[raw output: local://90.log] \t\r\n";
     const input = textResult(meta, body);
     const published = artifacts.publish(input, "bash") as typeof input;
     const uri = `remote-artifact://${artifacts.namespace}/90`;
@@ -275,8 +275,8 @@ describe("remote artifact publication", () => {
     expect(artifacts.publish(published, "bash")).toEqual(published);
     expect(textContent(artifacts.publish({ content: [{ type: "text", text: body }] }, "eval"))).toEqual([body]);
     for (const text of [
-      "prefix [raw output: artifact://90]", "[raw output: artifact://90]\nmore output",
-      "[raw output: artifact://90suffix]", "[raw output: remote-artifact://existing/90]",
+      "prefix [raw output: local://90.log]", "[raw output: local://90.log]\nmore output",
+      "[raw output: local://90.logsuffix]", "[raw output: remote-artifact://existing/90]",
     ]) {
       expect(textContent(artifacts.publish({ content: [{ type: "text", text }] }, "bash"))).toEqual([text]);
     }
@@ -297,9 +297,14 @@ describe("remote artifact publication", () => {
     expect(textContent(published)).toEqual(["application output", `Read ${uri} for full output`]);
     expect(input).toEqual(original);
     expect(artifacts.publish(published, "bash")).toEqual(published);
-    const footer = artifacts.publish(textResult({ minimized }, "summary\n[raw output: artifact://93]"), "bash") as TextResult;
+    const footer = artifacts.publish(textResult({ minimized }, "summary\n[raw output: local://93.log]"), "bash") as TextResult;
     expect(textContent(footer)).toEqual([`summary\n[raw output: ${uri}]`]);
-    for (const artifactId of [uri, "not-native", "artifact://93"]) {
+    // Bash appends wall-time, fork and exit-code notices after the executor's footer.
+    const notices = "\n\nWall time: 1.40 seconds\nRan in a copy of the busy session shell; changes here won't persist.\n\n[exit code 2]";
+    const trailed = artifacts.publish(textResult({ minimized }, `summary\n[raw output: local://93.log]\n${notices}`), "bash") as TextResult;
+    expect(textContent(trailed)).toEqual([`summary\n[raw output: ${uri}]\n${notices}`]);
+    expect(textContent(trailed).join("\n")).not.toContain("local://93.log");
+    for (const artifactId of [uri, "not-native", "local://93.log"]) {
       const result = textResult({ minimized: { ...minimized, artifactId } });
       expect(artifacts.publish(result, "bash")).toEqual(result);
     }
@@ -313,9 +318,9 @@ describe("remote artifact publication", () => {
       { truncation: truncation(id, { artifactElidedBytes: 4096 }) },
       { limits: { columnTruncated: { maxColumn: 80, artifactId: id, artifactElidedBytes: 4096 } } },
     ];
-    const prefix = "  literal artifact://92\n";
+    const prefix = "  literal local://92.log\n";
     for (const meta of metadata) {
-      const input = textResult(meta, prefix + `[raw output: artifact://${id}] \t\r\n`);
+      const input = textResult(meta, prefix + `[raw output: local://${id}.log] \t\r\n`);
       const original = structuredClone(input);
       const published = artifacts.publish(input, "bash") as TextResult;
       const content = textContent(published);
@@ -345,8 +350,9 @@ describe("remote artifact publication", () => {
 
   test("published recovery references resolve to the actual remote artifact bytes", async () => {
     const artifacts = await createArtifacts();
-    const path = join(artifacts.manager.dir, "99.eval.log");
+    const path = join(artifacts.manager.dir, "99.log");
     const bytes = "exact recovered output\n😀\nartifact://literal";
+    await mkdir(artifacts.manager.dir, { recursive: true });
     await writeFile(path, bytes);
     const published = artifacts.publish(textResult({ truncation: truncation("99") }));
     const reference = /remote-artifact:\/\/[^\s]+/.exec(textContent(published).at(-1)!)![0];

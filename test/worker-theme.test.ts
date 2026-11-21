@@ -29,7 +29,7 @@ test("companion initializes the theme before native LSP diagnostics format a no-
     await client.initialize(cwd, OMP_RUNTIME_HANDSHAKE);
     const result = await client.execute("lsp", "theme-no-server", { action: "diagnostics", file });
     expect(result).toMatchObject({
-      content: [{ type: "text", text: expect.stringContaining(`${file}: No language server found`) }],
+      content: [{ type: "text", text: expect.stringContaining(`${file}: No language server handles .omp-theme-regression files`) }],
       details: { action: "diagnostics" },
     });
     expect(result).not.toMatchObject({ isError: true });

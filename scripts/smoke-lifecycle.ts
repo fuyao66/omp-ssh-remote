@@ -227,7 +227,8 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       record("async-wait-returned", { jobId });
       const job = manager.getJob(jobId); assert(job); await job.promise;
       assert.equal(job.status, "completed");
-      assert(job.resultText?.includes("ASYNC_SCOPE=unset"));
+      // SDK 19 seeds a background job from a copy of the session shell: it sees earlier exports, never writes back (checked below).
+      assert(job.resultText?.includes("ASYNC_SCOPE=foreground"));
       assert(job.resultText?.includes(expectedIdentity));
       console.log("SESSION_ENV_ASYNC_PASS");
       assert(text(await invoke("bash", { command: 'printf "%s" "$OMP_SMOKE_SCOPE"' })).includes("foreground"));
@@ -247,7 +248,7 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       console.log("SERVICE_READINESS_RETURNED", text(started));
       assert(text(await invoke("read", { path: `proc://${service}` })).includes("starting"));
       const listing = await invoke("read", { path: "proc://" });
-      assert((listing.details as any)?.proc?.daemons?.some((daemon: any) => daemon.name === service));
+      assert((listing.details as any)?.proc?.daemons?.some((daemon: any) => daemon.key === service));
       await assert.rejects(() => invoke("grep", { path: `proc://${jobId};proc://${service}`, pattern: "SERVICE" }), /Mixed local and remote/);
       console.log("PROCESS_ROUTING_PASS");
       console.log("SERVICE_PROC_READ_PASS");

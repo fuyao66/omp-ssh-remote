@@ -11,10 +11,14 @@
  *                 "cppEnv": { "REMOTE_CPP_PROJECT_ROOT": "..." } }] }
  * `connect` is the `/remote-connect` argument string; `auditSsh` is the explicit SSH argv the task
  * acceptance uses to audit remote processes (it never kills them).
+ *
+ * Real-host steps drive `$OMP_BINARY` (default `omp`); it must report the pinned SDK version, so a
+ * candidate can be accepted from an isolated install before the global OMP is replaced.
  */
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { SUPPORTED_SDK_VERSION } from "../src/omp/sdk-contract.ts";
 
 const root = resolve(import.meta.dir, "..");
 type Host = { name: string; connect: string; auditSsh: string[]; cppEnv?: Record<string, string> };
@@ -66,6 +70,14 @@ async function main(): Promise<void> {
     { label: "acceptance helpers", command: ["bun", "scripts/build-smoke.ts", "all"] },
   ];
   const outcomes: Outcome[] = [];
+  // Acceptance against a different host OMP than the pins would accept the wrong pairing.
+  const binary = Bun.env.OMP_BINARY ?? "omp";
+  const version = Bun.spawnSync([binary, "--version"]).stdout.toString().trim();
+  if (version !== `omp/${SUPPORTED_SDK_VERSION}`) {
+    console.error(`${binary} --version reports "${version}", expected omp/${SUPPORTED_SDK_VERSION}; set OMP_BINARY`);
+    outcomes.push({ label: "host OMP version", ok: false, seconds: 0 });
+    return report(outcomes);
+  }
   for (const step of local) {
     const outcome = await runStep(step);
     outcomes.push(outcome);

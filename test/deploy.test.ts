@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -66,6 +66,35 @@ describe("managed native worker cache", () => {
       await lease.dispose(); lease = undefined;
       expect(commit(root, "c")).toMatchObject({ retained: { builds: 2 }, deleted: { replicas: 1 }, busy: { replicas: 0 } });
     } finally { await lease?.dispose(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  test("live daemon executable protects its old worker generation without a companion lease", async () => {
+    const root = await mkdtemp(join(tmpdir(), "worker-daemon-busy-"));
+    const directory = await build(root, "a");
+    const executable = join(directory, "worker-linux-x64");
+    // A live ELF process (not a script/interpreter) with the native daemon selector and no worker lock.
+    // GC classifies by the kernel's executable path, not argv or process ancestry.
+    await copyFile("/bin/bash", executable);
+    const daemon = Bun.spawn([executable, "-c", 'printf "READY\\n"; read -r hold', "__omp_worker_daemon"], {
+      stdin: "pipe", stdout: "pipe", stderr: "inherit",
+    });
+    const reader = daemon.stdout.getReader();
+    try {
+      expect(new TextDecoder().decode((await reader.read()).value)).toBe("READY\n");
+      expect(await readlink(`/proc/${daemon.pid}/exe`)).toBe(executable);
+      commit(root, "a");
+      await build(root, "b"); commit(root, "b");
+      await build(root, "c");
+      expect(commit(root, "c")).toMatchObject({ retained: { builds: 3 }, busy: { builds: 1, replicas: 1 } });
+      daemon.stdin.end();
+      await daemon.exited;
+      expect(commit(root, "c")).toMatchObject({ retained: { builds: 2 }, deleted: { replicas: 1 }, busy: { replicas: 0 } });
+    } finally {
+      reader.releaseLock();
+      if (daemon.exitCode === null) daemon.kill();
+      await daemon.exited;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("deduplicates aliases by hash without removing busy replicas", async () => {

@@ -105,7 +105,7 @@ describe("read-owned conflict registrations", () => {
       for (const file of ["one.txt", "two.txt", "three.txt", "four.txt"]) await writeFile(join(cwd, file), conflict);
       await writeFile(join(cwd, "literal.txt"), "conflict://999 is documentation, not a native registration\n");
       const multi = await runtime.tools.read.execute("multi", { path: "one.txt;two.txt" });
-      const history = runtime.session.conflictHistory!;
+      const history = runtime.session.state!.conflictHistory!;
       const multiIds = history.entries().filter(entry => ["one.txt", "two.txt"].includes(entry.displayPath)).map(entry => entry.id);
       expect(multiIds).toHaveLength(2);
       expect([...(conflictIds(multi) ?? [])].sort((a, b) => a - b)).toEqual([...multiIds].sort((a, b) => a - b));

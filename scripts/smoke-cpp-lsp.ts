@@ -59,6 +59,8 @@ export default async function cppLspSmoke(pi: ExtensionAPI) {
       return result.details?.wallTimeNoticeEmitted ? text(result).replace(/\n\nWall time: [^\n]*$/, "") : text(result);
     };
     const disk = (path: string) => shell(`cat -- ${quote(path)}`);
+    // Sequential: SDK 19 runs overlapping bash calls in a forked shell and appends a notice to their output.
+    const disks = async (paths: string[]) => { const out: string[] = []; for (const path of paths) out.push(await disk(path)); return out; };
     const put = (path: string, content: string) => invoke("write", { path, content });
     const reconnectArgs = (cwd: string): string => {
       const request = parseConnectArgs(args);
@@ -115,12 +117,12 @@ export default async function cppLspSmoke(pi: ExtensionAPI) {
       const references = await untilReferences(math, "sum_values", 4);
       assert.match(references, /main\.cpp:5/); assert.match(references, /main\.cpp:6/); assert.match(references, /math\.hpp:3/);
       report("cross_file_references", { expected: 4, actual: count(references, "reference"), references });
-      const before = await Promise.all([header, math, main].map(disk));
+      const before = await disks([header, math, main]);
       await lsp("rename", { file: math, line: 3, symbol: "sum_values", new_name: "total_values", apply: false });
-      assert.deepEqual(await Promise.all([header, math, main].map(disk)), before);
+      assert.deepEqual(await disks([header, math, main]), before);
       report("rename_preview", { unchangedFiles: 3 });
       await lsp("rename", { file: math, line: 3, symbol: "sum_values", new_name: "total_values", apply: true });
-      const after = await Promise.all([header, math, main].map(disk));
+      const after = await disks([header, math, main]);
       assert.deepEqual(after, before.map(source => source.replaceAll("sum_values", "total_values")));
       report("rename_apply_disk", { changedFiles: 3, expectedOccurrences: 4, actualOccurrences: after.join("").match(/total_values/g)?.length });
       const clean = sources["diagnostic.cpp"];

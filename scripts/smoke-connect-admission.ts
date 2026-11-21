@@ -76,7 +76,7 @@ export default async function connectAdmissionSmoke(pi: ExtensionAPI) {
       const cleanup = () => { clearTimeout(timer); for (const stop of unsubscribe) stop(); };
       const timer = setTimeout(() => { cleanup(); gate.reject(new Error("Native wake settlement timed out")); }, 30_000);
       const inspect = () => { if (check()) { cleanup(); gate.resolve(); } };
-      unsubscribe.push(registry.onChange(inspect), session.subscribeRunState(inspect), session.subscribeIrcWakeHolds(inspect));
+      unsubscribe.push(registry.onChange(inspect), session.subscribeRunState(inspect), session.subscribeWakeState(inspect));
       inspect(); return gate.promise;
     };
     const id = `admit_${run}`;
@@ -116,7 +116,7 @@ export default async function connectAdmissionSmoke(pi: ExtensionAPI) {
       const host = await invoke("bash", { command: "hostname" });
       await post("remote-host", { hostname: host.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n").trim() });
       const agent = { name: "task", description: "Admission probe", systemPrompt: "Follow the deterministic assignment.", source: "project" as const };
-      const follow = (phase: string) => runSubagentFollowUpTurn({ id, agent, message: `ADMISSION_TURN=${id}:${phase}`, structured: false,
+      const follow = (phase: string) => runSubagentFollowUpTurn({ id, agent, message: `ADMISSION_TURN=${id}:${phase}`,
         completionProbe: false, softRequestBudget: 0, maxRuntimeMs: 90_000 });
       const revived = await follow("revived"); assert.equal(revived.exitCode, 0, JSON.stringify(revived)); assert(revived.output.includes(`REMOTE_ACK_${run}`));
       assert.notEqual(registry.get(id)!.session!.instanceKey, child.instanceKey);
