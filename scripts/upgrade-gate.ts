@@ -2,8 +2,9 @@
  * Upgrade gate: `bun run upgrade:gate [--release | --lsp] [--hosts a,b]`.
  *
  * Local checks, both worker builds, then the core real-host acceptance on every configured host:
- * the lifecycle smoke and the native task acceptance (subagent inheritance, reconnect, nested Eval,
- * output capture, restart fail-closed). `--lsp` adds the LSP matrix, plus the C/C++ suite on hosts
+ * the lifecycle smoke, the native task acceptance (subagent inheritance, reconnect, nested Eval,
+ * output capture, restart fail-closed) and rich output (Eval views, image files read as pixels).
+ * `--lsp` adds the LSP matrix, plus the C/C++ suite on hosts
  * that configure `cppEnv`. Run it only after `bun run upgrade:assess` says what changed upstream.
  * `--release` requires x64 and arm64 hosts, the complete LSP matrix, and a compiled worker smoke.
  *
@@ -106,6 +107,7 @@ async function main(): Promise<void> {
     const steps: Step[] = [
       { label: `${host.name}: lifecycle`, command: ["bun", "scripts/run-smoke.ts", "lifecycle"], env },
       { label: `${host.name}: native tasks`, command: ["bun", "scripts/run-task-acceptance.ts"], env: { ...env, TASK_ACCEPTANCE_AUDIT_SSH: JSON.stringify(host.auditSsh) } },
+      { label: `${host.name}: rich output`, command: ["bun", "scripts/run-smoke.ts", "rich-output"], env },
     ];
     if (lsp) {
       steps.push({ label: `${host.name}: LSP`, command: ["bun", "scripts/run-smoke.ts", "lsp"], env });

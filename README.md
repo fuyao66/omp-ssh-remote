@@ -27,7 +27,7 @@ If the command stops, read `.cache/upgrade-<version>.md` for the blockers and th
 
 `bun run upgrade <version> --dry-run` stops after eligibility checks, before any release or global changes. Add `--skip-gate` only to exercise the workflow locally: skipping the gate is itself a release blocker. `bun run upgrade:self-test` tests the eligibility rules without touching Git, SSH or the global install.
 
-Other suites (`bun scripts/run-smoke.ts cache|capture|rich-output`, `scripts/run-connect-admission.ts`, `benchmark:omp`) are for changes in their own areas, not every upgrade.
+Other suites (`bun scripts/run-smoke.ts cache|capture`, `scripts/run-connect-admission.ts`, `benchmark:omp`) are for changes in their own areas, not every upgrade.
 
 ## Documentation
 

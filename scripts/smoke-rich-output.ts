@@ -40,8 +40,15 @@ export default async function(pi: ExtensionAPI) {
     ];
     const local = new Map<string, any>();
     const file = `/tmp/omp-rich-output-${process.pid}-${crypto.randomUUID()}.json`;
-    let connected = false; let fileCreated = false;
+    // One path for both reads; it exists only locally before connect and only remotely after.
+    const png = `/tmp/omp-rich-output-${process.pid}-${crypto.randomUUID()}.png`;
+    let connected = false; let fileCreated = false; let pngCreated = false;
+    const imageBlocks = (r: any) => r.content.filter((block: any) => block.type === "image").map((block: any) => ({ mimeType: block.mimeType, data: block.data }));
     try {
+      await Bun.write(png, Buffer.from(image, "base64"));
+      const localPng = await invoke("read", { path: png });
+      await Bun.file(png).delete();
+      assert.equal(imageBlocks(localPng).length, 1, "native control did not read the PNG as an image");
       for (const sample of cases) {
         console.log("RICH_LOCAL_CASE", sample.name);
         const result = await invoke("eval", { language: sample.language, code: sample.code, title: sample.name });
@@ -58,8 +65,7 @@ export default async function(pi: ExtensionAPI) {
         const control = local.get(sample.name);
         assert.deepEqual(json(views(result)), json(views(control)), `${sample.name}: native rich data changed across SSH`);
         assert.deepEqual(result.details.cells.map((cell: any) => cell.code), control.details.cells.map((cell: any) => cell.code), `${sample.name}: echoed source changed`);
-        const images = (r: any) => r.content.filter((block: any) => block.type === "image").map((block: any) => ({ mimeType: block.mimeType, data: block.data }));
-        assert.deepEqual(images(result), images(control), `${sample.name}: image bytes changed`);
+        assert.deepEqual(imageBlocks(result), imageBlocks(control), `${sample.name}: image bytes changed`);
         if (!sample.image) assert.equal(text(result), text(control), `${sample.name}: application text changed`);
         console.log("RICH_OUTPUT_EXACT_PASS", sample.name);
       }
@@ -68,11 +74,20 @@ export default async function(pi: ExtensionAPI) {
       assert(text(await invoke("grep", { path: file, pattern: literal })).includes(literal), "Search pattern rewrote literal data");
       assert(/\btrue\b/.test(text(await invoke("read", { path: `${file}?q=.ref==${JSON.stringify(literal)}` }))), "JSON query rewrote literal data");
       console.log("OPAQUE_INPUT_ROUNDTRIP_PASS");
+      await invoke("bash", { command: `printf %s '${image}' | base64 -d > '${png}'` }); pngCreated = true;
+      assert(!(await Bun.file(png).exists()), "Remote bash wrote the PNG on the local host");
+      const remotePng = await invoke("read", { path: png });
+      assert.deepEqual(imageBlocks(remotePng), imageBlocks(localPng), "Remote image read changed the bytes the model receives");
+      assert.equal(remotePng.details?.mediaPath, undefined, "Remote image result points the TUI at a host-local path");
+      await invoke("bash", { command: `rm -f -- '${png}'` }); pngCreated = false;
+      console.log("REMOTE_IMAGE_READ_PASS");
       await invoke("bash", { command: `rm -f -- '${file}'` }); fileCreated = false;
       await commands.get("remote-exit")!.handler("", ctx); connected = false;
-      console.log("RICH_OUTPUT_SMOKE_PASS: native JSON/table/Markdown/image data, code, output and anchors are preserved across SSH.");
+      console.log("RICH_OUTPUT_SMOKE_PASS: native JSON/table/Markdown/image data, image file reads, code, output and anchors are preserved across SSH.");
     } finally {
       if (fileCreated && connected) await invoke("bash", { command: `rm -f -- '${file}'` }).catch(console.error);
+      if (pngCreated && connected) await invoke("bash", { command: `rm -f -- '${png}'` }).catch(console.error);
+      await Bun.file(png).delete().catch(() => {});
       if (connected) await commands.get("remote-exit")!.handler("--force", ctx).catch(console.error);
     }
     process.exit(0);
