@@ -21,13 +21,13 @@ export type SemanticSdkContract = {
 /** Review every assumption after an SDK bump; only genuine native execution belongs in coveredBy. */
 export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
-    id: "standalone-thread-rpc",
-    plugin: ["src/thread-rpc.ts", "src/thread-runtime.ts"],
-    native: ["thread/rpc.ts"],
-    assumption: "RpcLink can be instantiated over an explicit send/listen endpoint without the CLI worker pool. Async callbacks remain reentrant, AbortSignals and errors retain native encoding, and close rejects pending calls and aborts imported signals. The socket carrier supplies framing, byte bounds and peer-loss ownership; no synchronous RPC channel or shared-buffer transfer is used.",
+    id: "native-task-worker-threads",
+    plugin: ["src/extension.ts"],
+    native: ["task/settings.ts", "config/registry.ts", "config/settings.ts", "thread/subagent-worker.ts"],
+    assumption: "cfgTaskWorkerThreads.get reads the effective task.workerThreads value from native scoped settings. Zero disables native subagent worker placement; a positive value enables worker placement when the host supports it.",
     coveredBy: [
-      { path: "test/thread-rpc.test.ts" },
-      { path: "test/thread-runtime.test.ts" },
+      { path: "test/omp-runtime.test.ts", name: "native subagent worker setting retains its registered id and reads effective values" },
+      { path: "test/lifecycle-transactions.test.ts", name: "connect requires task.workerThreads: 0 before SSH discovery or deployment" },
     ],
   },
   {
@@ -502,8 +502,8 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "live-descendant-registry",
     plugin: ["src/extension.ts"],
-    native: ["registry/agent-registry.ts", "registry/agent-lifecycle.ts", "registry/persisted-agents.ts", "task/executor.ts", "session/agent-session.ts", "session/agent-session-handle.ts", "thread/session-publisher.ts", "thread/remote-agent-session.ts"],
-    assumption: "Persisted session paths scope descendants through parked intermediates. Same-thread idle children may park through native lifecycle; subscribeIrcWakeHolds and registry events expose completion of a held, queued, or compaction-delayed wake obligation, but elapsed time never authorizes parking. Worker-homed mirrors lack an atomic home-thread idle/no-wake check and disposal join, so live handles stay blocked even when mirrored idle. Reassess this restriction when upgrading the SDK.",
+    native: ["registry/agent-registry.ts", "registry/agent-lifecycle.ts", "registry/persisted-agents.ts", "task/executor.ts", "session/agent-session.ts", "session/agent-session-handle.ts"],
+    assumption: "Persisted session paths scope descendants through detached intermediates. Native lifecycle can park idle main-thread descendants; registry and wake-hold events expose pending native work that blocks this transition. Connect refuses live worker-thread descendants regardless of their reported activity.",
     coveredBy: [{ path: "test/lifecycle-transactions.test.ts" }],
   },
   {

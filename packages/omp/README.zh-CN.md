@@ -20,7 +20,7 @@ OMP SSH Remote 将 Oh My Pi 控制面保留在本机，同时通过 SSH 在远�
 
 普通非隔离子代理继承连接配置，但各自使用独立 companion。准入比较远端执行契约和原生工具 schema。`task isolated:true` 继续明确拒绝。保留宿主原生审批规则；wrapper 在 session 初始化、首个模型请求前安装，不在连接时临时注册。
 
-原生 worker-thread 子代理通过进程内 `BroadcastChannel` 访问主线程唯一权威的 family broker；通道只传递归属元数据和连接配置。每个子代理独立启动 SSH companion。共享撤销标记在 owner 退出时立即失效，即使关闭通知尚未送达，也不能迟到发布连接或执行工作区操作。原生 agent、job、审批和对话仍在本机；插件不修改 `task.workerThreads`。
+远端会话及其子代理在本机 OMP 主线程上运行。建立连接要求 `task.workerThreads` 的实际生效值为 `0`。可在 OMP 的 `config.yml` 中设置 `task.workerThreads: 0`，或在设置中选择 **Tasks → Subagent Worker Threads → Main thread only**。插件不会修改此设置。工作线程中的子代理如果继承了远端工作区意图，会将工作区标为不可用，不会回退到本机执行工作区工具；没有远端意图的子代理仍在本机执行。
 
 Eval 的远端 `tool.*` 工具回调与顶层工具共用宿主调用路径：companion 发起调用请求，本机 OMP 执行原生审批及工具 hook，再由已注册的 remote wrapper 派发回远端。`tool.bash` 也走这条路径，继续接受宿主原生 Bash 审批。两个入口共用服务启动、显式停止和本机协调任务。每个回调只属于当前有效的 Eval 请求及工作区绑定，取消或更换连接后失效。除 `out://` 回复设备外，嵌套调用不能访问本机资源、递归调用 Eval 或暂存 AST 编辑；companion 不另建审批引擎。
 
@@ -298,11 +298,7 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 - 不支持远端到本机 artifact bridge；
 - 白名单之外的 settings 在 companion 中保持编译默认值，不提供任意 settings 透传；
 - 每个 session 或子代理各占一个 companion 进程；并发子代理各消耗一条 SSH 通道和一个 worker 进程；
-- 已有子代理时的连接规则：
-  - 同线程空闲子代理通过原生生命周期停放；再次发消息会重建 session 并绑定远端。若只剩原生 IRC 唤醒义务，连接会监听状态变化，最多等待一秒，再重新检查准入。唤醒义务可能是任务收尾持有的锁、排队 IRC 或等待压缩的工作，并不证明存在排队消息。
-  - 不会等待或停止运行中的任务。存活的 worker-thread session 须先由原生生命周期停放（通常在空闲 TTL 后），或由用户明确停止。插件无法依据镜像状态原子检查子线程活动并停放；立即重试无助于解除这个限制。
-  - 请先连接再启动本地子代理。连接后新建的 worker-thread 子代理正常继承远端；已有 family 内的重连不要求停放后代。worker-thread session 不能独立创建远端 family。
-  - 同线程停放保留原生空闲 TTL 的待处理 IRC 竞态。尚无 transcript 且父链指向 owner 的子代理保守地视为运行中。
+- 尽量在启动子代理前连接。运行中的后代会阻止建立新连接；工作线程中的后代即使显示空闲，只要会话仍存活，也会阻止连接。可通过 `/hub` 显式停止这些会话。主线程中空闲且没有待处理工作的后代由原生生命周期机制停放，恢复时继承远端工作区。
 - 单个输出 frame 不能超过 16 MiB；
 - 宿主 Git 状态／overlay 和状态栏 Git 信息描述本机仓库，而非绑定的远端工作区；
 - 计划自动保存（`plan.autosave`）写入本机 `.omp/plans/`；
@@ -313,7 +309,3 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 - 连接和每轮开始前会拒绝 Cursor 模型及当前使用 Cursor 的 advisor。经 `tool_call` 的 advisor 工作区调用会被阻止，但 Cursor advisor 的直接操作绕过该 hook；后续 advisor 模型变化不受持续门控，绑定期间不支持此类用法；
 - 启用 autoresearch 工具时拒绝连接；原生未暴露私有的实验运行状态，请先关闭 autoresearch 并等待已有实验停止；
 - browser、desktop、模型凭据、memory 和本机 session 控制面不进入远端。
-
-原生 worker-thread 子代理仍各用独立 SSH 连接，但其 SSH/SCP 进程句柄和准备租约由 OMP 主线程持有。每个子代理通过私有、经过认证的本地 socket 使用 OMP 原生 RPC；socket 断开也是该资源作用域的结束信号。主线程取消准备、释放租约并关闭传输，等待进程实际退出；优雅关闭失败时可升级为 SIGKILL。仅关闭管道，或进程仍以 `Z` 状态存在，均不算清理完成。
-
-本地 IPC 通道失效后，只有显式重连才能在同一有效 family 代次下重新建立通道；不能恢复已撤销的授权，也不会退回本机执行。改变的是进程句柄和退出监听器的线程归属，而非操作系统的父子进程关系。未新增监督进程、心跳或全局回收器，也未改变原生停放／恢复的生命周期及 `task.workerThreads` 设置。

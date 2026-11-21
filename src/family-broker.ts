@@ -9,8 +9,6 @@ export interface FamilyBrokerFamily {
   ownerSessionFile: string;
   members: Set<FamilyBrokerMember>;
   closing: boolean;
-  generation?: string;
-  revocation?: SharedArrayBuffer;
   lineage?: Set<string>;
 }
 
@@ -48,20 +46,6 @@ export function sessionBelongsToFamily(ownerSessionFile: string, candidateSessio
   return resolve(candidateSessionFile).startsWith(`${sessionFamilyRoot(ownerSessionFile)}${sep}`);
 }
 
-/** Shared memory is only a revocation fence, never a transport or a liveness oracle. */
-export function familyLease(family: FamilyBrokerFamily): { generation: string; revocation: SharedArrayBuffer } {
-  family.generation ??= crypto.randomUUID();
-  family.revocation ??= new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-  if (family.closing) Atomics.store(new Int32Array(family.revocation), 0, 1);
-  return { generation: family.generation, revocation: family.revocation };
-}
-
-export function assertFamilyLeaseActive(family: FamilyBrokerFamily): void {
-  if (family.closing || (family.revocation && Atomics.load(new Int32Array(family.revocation), 0) !== 0)) {
-    throw new Error("Remote runtime family was revoked; local fallback is disabled");
-  }
-}
-
 class ProcessFamilyBroker implements RemoteFamilyBroker<FamilyBrokerFamily> {
   readonly #active: Map<string, FamilyBrokerFamily>;
   readonly #revoked = new Map<string, FamilyBrokerFamily>();
@@ -75,7 +59,6 @@ class ProcessFamilyBroker implements RemoteFamilyBroker<FamilyBrokerFamily> {
   }
 
   register(family: FamilyBrokerFamily): void {
-    familyLease(family);
     this.#active.set(resolve(family.ownerSessionFile), family);
   }
 
@@ -111,7 +94,6 @@ class ProcessFamilyBroker implements RemoteFamilyBroker<FamilyBrokerFamily> {
 
   revoke(family: FamilyBrokerFamily): void {
     family.closing = true;
-    Atomics.store(new Int32Array(familyLease(family).revocation), 0, 1);
     const owner = resolve(family.ownerSessionFile);
     if (this.#active.get(owner) === family) this.#active.delete(owner);
     for (const member of family.members) this.#retainRevokedRoot(family, member);

@@ -55,7 +55,6 @@ export interface RemoteRuntimeClientApi {
   onEvent(listener: (event: EventMessage) => void | Promise<void>): () => void;
   onClose(listener: (error: Error) => void): () => void;
   readonly isClosed: boolean;
-  activateEvents?(): void;
 }
 
 type PendingCall = {

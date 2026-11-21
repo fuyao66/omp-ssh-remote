@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgTaskWorkerThreads } from "@oh-my-pi/pi-coding-agent/task/settings";
 import {
   captureOmpToolSnapshot,
   createOmpRuntimeHandshake,
@@ -13,6 +15,13 @@ import {
   TOOL_RUNTIME_VERSION,
   type ReadyMessage,
 } from "../src/protocol.ts";
+
+test("native subagent worker setting retains its registered id and reads effective values", () => {
+  expect(cfgTaskWorkerThreads.id).toBe("task.workerThreads");
+  for (const count of [0, 1]) {
+    expect(cfgTaskWorkerThreads.get(Settings.isolated({ "task.workerThreads": count }))).toBe(count);
+  }
+});
 
 const objectSchema = { type: "object" } as const;
 
@@ -79,12 +88,15 @@ describe("OMP capability admission", () => {
   });
 
   test("handshake validateReady uses the captured local tool schemas", () => {
+    const localTools = toolsWith();
     const handshake = createOmpRuntimeHandshake({
       hostVersion: "18.0.4",
-      localTools: toolsWith(),
+      localTools,
     });
+    localTools.find(tool => tool.name === "read")!.parameters = { type: "object", required: ["path"] };
     expect(handshake.host).toBe("omp");
     expect(handshake.hostVersion).toBe("18.0.4");
+    expect(handshake.runtimeVersion).toBe(TOOL_RUNTIME_VERSION);
     expect([...handshake.requestedTools]).toEqual([...REMOTE_TOOL_NAMES]);
     expect(() => handshake.validateReady(ready())).not.toThrow();
     expect(() =>

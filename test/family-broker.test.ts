@@ -110,13 +110,18 @@ describe("process-global remote family lifecycle", () => {
       expect(broker.find(child.sessionFile!)).toBe(family);
       second.getRemoteFamilyBroker<Family>().revoke(family);
       expect(legacy.has(family.ownerSessionFile)).toBe(false);
+      expect(family.closing).toBe(true);
+      expect(family.members.has(child)).toBe(true);
+      expect(family.lineage?.has(child.sessionFile!)).toBe(true);
       expect(broker.find(descendant(child.sessionFile!, "grandchild"))).toBe(family);
       expect(broker.find(child.sessionFile!)).toBe(family);
       expect(broker.find(otherChild.sessionFile!)).toBe(other);
       expect(broker.hasOwner(other.ownerSessionFile)).toBe(true);
+      expect(other.closing).toBe(false);
       broker.revoke(other);
       expect(broker.find(descendant(otherChild.sessionFile!, "grandchild"))).toBe(other);
       second.getRemoteFamilyBroker<Family>().detach(family, child);
+      expect(family.members.size).toBe(0);
       expect(broker.find(descendant(child.sessionFile!, "grandchild"))).toBe(family);
       expect(broker.hasOwner(other.ownerSessionFile)).toBe(false);
       expect(broker.find(descendant(otherChild.sessionFile!, "grandchild"))).toBe(other);

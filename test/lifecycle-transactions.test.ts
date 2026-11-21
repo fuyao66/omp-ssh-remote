@@ -22,6 +22,7 @@ import { isLocalAgentSession, type AgentSessionHandle } from "@oh-my-pi/pi-codin
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { finalizeSubagentLifecycle, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { cfgTaskWorkerThreads } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { createNativeWorkerRuntime } from "../src/runtime.ts";
@@ -186,6 +187,7 @@ async function ensureNativeToolManifests() {
 async function nativeExecutorChild(owner: Harness, family: Family, id: string) {
   await ensureNativeToolManifests();
   const settings = Settings.isolated({
+    "task.workerThreads": 0,
     "task.agentIdleTtlMs": 0, "task.softRequestBudget": 0, "task.completionProbe": false,
   });
   const auth = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
@@ -260,7 +262,7 @@ async function harness(sessionFile = join(directory, "owner.jsonl"), agent: Exte
     },
   } as unknown as ExtensionContext;
   const session = {
-    instanceKey: `main:${crypto.randomUUID()}`, sessionManager: manager, settings: host.settings ?? Settings.isolated(),
+    instanceKey: `main:${crypto.randomUUID()}`, sessionManager: manager, settings: host.settings ?? Settings.isolated({ "task.workerThreads": 0 }),
     // Native tools carry their ToolSession; enableLsp is fixed when the session is built.
     getToolByName: (name: string) => host.enableLsp === undefined ? undefined : { name, session: { enableLsp: host.enableLsp } },
     getAdvisorStats: () => ({ configured: false, advisors: [] }),
@@ -470,7 +472,7 @@ test("connect refuses running grandchildren through parked intermediates", async
   const child = `${ownerId}-child`, grandchild = `${ownerId}-grandchild`;
   registry.register({ id: ownerId, displayName: "owner", kind: "main", session: {
     instanceKey: `main:${crypto.randomUUID()}`,
-    sessionManager: owner.context.sessionManager, getToolByName: () => undefined, settings: Settings.isolated(),
+    sessionManager: owner.context.sessionManager, getToolByName: () => undefined, settings: Settings.isolated({ "task.workerThreads": 0 }),
     getAdvisorStats: () => ({ configured: false, advisors: [] }),
   } as never });
   registry.register({ id: child, displayName: "parked parent", kind: "sub", parentId: ownerId,
@@ -663,7 +665,7 @@ test("a new running child interrupts wake settlement and refuses without deployi
   } finally { registry.unregister(id); listeners.restore(); }
 });
 
-test.each([false, true])("idle worker handle with IRC pending=%s requires native parking without waiting or mutation", async pending => {
+test.each([false, true])("idle worker handle with IRC pending=%s blocks connect without waiting or mutation", async pending => {
   const owner = await harness(), registry = AgentRegistry.global(), lifecycle = AgentLifecycleManager.global();
   const id = "worker-idle", progress: string[] = [];
   const session = { instanceKey: "foreign-thread:idle", ircWakesPending: pending } as AgentSessionHandle;
@@ -676,8 +678,8 @@ test.each([false, true])("idle worker handle with IRC pending=%s requires native
       onProgress: stage => progress.push(stage),
     }));
     expect(error?.message).toContain("worker idle (worker-idle, idle)");
-    expect(error?.message).toContain("worker-thread session requires native parking");
-    expect(error?.message).toContain("immediate retry will not help");
+    expect(error?.message).toContain("worker-thread session must stop before connecting");
+    expect(error?.message).toContain("task.workerThreads: 0");
     expect(error?.message).toContain("open /hub and press x");
     expect(error?.message?.includes("IRC wake held/queued/awaiting compaction")).toBe(pending);
     expect(progress).toEqual([]);
@@ -881,6 +883,38 @@ test("connect refuses a child that starts running before publication and kills t
   } finally { registry.unregister(id); }
 });
 
+test("connect rechecks task.workerThreads after intent persistence and kills the unpublished worker", async () => {
+  const settings = Settings.isolated({ "task.workerThreads": 0 });
+  const owner = await harness(undefined, undefined, { settings });
+  const persistence = gate();
+  const manager = owner.context.sessionManager as SessionManager;
+  const flush = manager.flush.bind(manager);
+  const duringFlush = spyOn(manager, "flush").mockImplementation(async () => {
+    await flush();
+    await persistence.wait();
+  });
+  const connecting = settle(owner.execute("remote_connect", { target: "fixture.invalid" }));
+  try {
+    await Promise.race([persistence.entered, connecting.then(error => {
+      throw new Error("Connect settled before persisting intent", { cause: error });
+    })]);
+    const pending = clients.at(-1)!;
+    expect(pending.isClosed).toBe(false);
+    cfgTaskWorkerThreads.override(settings, 1);
+    persistence.release();
+    const error = await connecting;
+    expect(error?.message).toContain("task.workerThreads: 0");
+    expect((await owner.status()).mode).toBe("local");
+    expect(broker.hasOwner(owner.sessionFile)).toBe(false);
+    await pending.waitForExit();
+    expect(pending.isClosed).toBe(true);
+  } finally {
+    persistence.release();
+    duringFlush.mockRestore();
+    await connecting;
+  }
+});
+
 test("connect refuses initializing children without transcripts but ignores a proven other-root lineage", async () => {
   const owner = await harness(undefined, { kind: "main", id: "Main", name: "owner", depth: 0 });
   const registry = AgentRegistry.global();
@@ -906,7 +940,7 @@ test("connect excludes its own native subagent ref", async () => {
   registry.register({ id: owner.context.agent.id, displayName: "sub owner", kind: "sub",
     sessionFile: owner.sessionFile, session: { sessionManager: owner.context.sessionManager,
       instanceKey: `main:${crypto.randomUUID()}`,
-      getToolByName: () => undefined, settings: Settings.isolated(),
+      getToolByName: () => undefined, settings: Settings.isolated({ "task.workerThreads": 0 }),
       getAdvisorStats: () => ({ configured: false, advisors: [] }),
     } as never, status: "running" });
   try {
@@ -1007,6 +1041,29 @@ test("owner switch refuses live children and closes its worker once children shu
   expect(family.members.size).toBe(0);
 });
 
+test("connect requires task.workerThreads: 0 before SSH discovery or deployment", async () => {
+  const settings = Settings.isolated({ "task.workerThreads": 1 });
+  const owner = await harness(undefined, undefined, { settings });
+  const discoveryCalls = discoveryBoundary.mock.calls.length;
+  const deploymentCalls = deploymentBoundary.mock.calls.length;
+  const transportCalls = transport.mock.calls.length;
+  await expect(owner.execute("remote_connect", { target: "fixture.invalid" })).rejects.toThrow("task.workerThreads: 0");
+  await expect(owner.command("remote-connect", "fixture.invalid")).rejects.toThrow("task.workerThreads: 0");
+  expect(discoveryBoundary.mock.calls.length).toBe(discoveryCalls);
+  expect(deploymentBoundary.mock.calls.length).toBe(deploymentCalls);
+  expect(transport.mock.calls.length).toBe(transportCalls);
+  expect((await owner.status()).mode).toBe("local");
+  expect(broker.hasOwner(owner.sessionFile)).toBe(false);
+
+  cfgTaskWorkerThreads.override(settings, 0);
+  await owner.execute("remote_connect", { target: "fixture.invalid" });
+  expect(discoveryBoundary.mock.calls.length).toBe(discoveryCalls + 1);
+  expect(deploymentBoundary.mock.calls.length).toBe(deploymentCalls + 1);
+  expect(transport.mock.calls.length).toBe(transportCalls + 1);
+  expect((await owner.status()).mode).toBe("remote");
+  expect(broker.hasOwner(owner.sessionFile)).toBe(true);
+});
+
 test("connect refuses enabled autoresearch before deployment", async () => {
   const owner = await harness();
   owner.activeTools.push("run_experiment");
@@ -1035,7 +1092,7 @@ test("Cursor advisor effective models veto connect and bound turns", async () =>
   const advisors = [{ name: "local-review", model: { provider: "cursor", api: "cursor-agent" } }];
   registry.register({ id, displayName: "owner", kind: "main", session: {
     instanceKey: `main:${crypto.randomUUID()}`,
-    sessionManager: owner.context.sessionManager, settings: Settings.isolated(), getToolByName: () => undefined,
+    sessionManager: owner.context.sessionManager, settings: Settings.isolated({ "task.workerThreads": 0 }), getToolByName: () => undefined,
     getAdvisorStats: () => ({ configured: true, advisors }),
   } as never });
   try {
@@ -1176,8 +1233,8 @@ test("deferred native Bash callback observes revocation before issuing a remote 
     expect(deferred).toBeDefined();
     expect(requests).not.toHaveBeenCalled();
     broker.revoke(family);
-    // Deliberately do not close the transport: the shared fence must win
-    // before asynchronous cleanup or native job-callback delivery catches up.
+    // Leave the transport live: the family's closing state must block the deferred
+    // callback before transport cleanup can make it fail for a different reason.
     expect(client.isClosed).toBe(false);
     await expect(deferred!.execute({ command: "printf remote-only" }, new AbortController().signal, () => {}, () => {}))
       .rejects.toThrow(/revoked|local fallback is disabled/i);

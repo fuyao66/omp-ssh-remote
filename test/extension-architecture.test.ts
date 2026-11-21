@@ -18,6 +18,7 @@ import * as ssh from "../src/ssh.ts";
 import * as identity from "../src/omp/host-identity.ts";
 import { SUPPORTED_SDK_VERSION } from "../src/omp/sdk-contract.ts";
 import { createNativeWorkerRuntime, type RemoteNativeTool } from "../src/runtime.ts";
+import { getRemoteFamilyBroker } from "../src/family-broker.ts";
 import remoteRuntimeExtension, {
   closeRemoteFamily,
   consumedResolution,
@@ -454,17 +455,17 @@ describe("extension workspace architecture", () => {
     });
     const owner = member(ownerFile, true);
     const child = member(childFile, false);
-    family.members.add(owner);
-    family.members.add(child);
-    const key = Symbol.for("omp-ssh-remote/session-families");
-    const broker = (globalThis as unknown as Record<symbol, Map<string, Family>>)[key]!;
+    const broker = getRemoteFamilyBroker<Family>();
+    broker.attach(family, owner);
+    broker.attach(family, child);
     const grandchild = await extensionHarness(grandchildFile, undefined, ["read", "write"]);
-    broker.set(ownerFile, family);
+    broker.register(family);
     try {
       await closeRemoteFamily(family);
       await grandchild.emit("session_start");
       expect(closed.sort()).toEqual(["child", "owner"]);
-      expect(broker.has(ownerFile)).toBe(false);
+      expect(family.closing).toBe(true);
+      expect(broker.hasOwner(ownerFile)).toBe(false);
       expect(owner.selected).toBe(false);
       expect(child.selected).toBe(true);
       expect(child.client).toBeUndefined();
@@ -519,11 +520,10 @@ describe("extension workspace architecture", () => {
     } finally {
       // Remove only the seeded fake child; the descendant shutdown removes the
       // last live member, but must not erase its revoked lineage.
-      family.members.delete(child);
+      broker.detach(family, child);
       child.selected = false;
       child.family = undefined;
       await grandchild.emit("session_shutdown");
-      broker.delete(ownerFile);
     }
     expect(family.members.size).toBe(0);
     expect((await grandchild.status()).mode).toBe("local");
