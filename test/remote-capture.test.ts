@@ -6,6 +6,7 @@ import {
   CAPTURE_TEXT_CHUNK_UNITS,
   OUTPUT_CAPTURE_UNITS,
   PIPE_CAPTURE_BYTES,
+  parseJobCapturePayload,
   type JobCapturePayload,
 } from "../src/omp/job-capture.ts";
 import { RemoteJobCapture } from "../src/omp/remote-capture.ts";
@@ -20,7 +21,7 @@ function pipe(
 ): void {
   capture.apply({
     kind: "pipe",
-    info: { id, producer: "producer", consumer: "consumer", total, open },
+    info: { id, producer: "producer", consumer: "consumer", total, open, modified: 0 },
     start,
     end: start + bytes.length,
     dataBase64: Buffer.from(bytes).toString("base64"),
@@ -38,6 +39,18 @@ function source(capture: RemoteJobCapture, id: string) {
 }
 
 describe("remote native job capture", () => {
+  test("lists native pipe metadata with and without a trace node", () => {
+    const capture = new RemoteJobCapture();
+    pipe(capture, Buffer.from("untraced"));
+    const info = { id: 2, producer: "printf traced", consumer: "cat", total: 6, open: true,
+      file: false as const, modified: 1_700_000_000_123.5, node: "0:0:1" };
+    capture.apply({ kind: "pipe", info, start: 0, end: 6, dataBase64: Buffer.from("traced").toString("base64") });
+    expect(capture.streams.list()).toStrictEqual([
+      { id: 1, producer: "producer", consumer: "consumer", total: 8, open: true, file: false, modified: 0 },
+      info,
+    ]);
+  });
+
   test("native PipeTextSources keep their decoder across split UTF-8 and reset at byte gaps", () => {
     const capture = new RemoteJobCapture();
     const bytes = Buffer.from("😀 café");
@@ -169,8 +182,14 @@ describe("remote native job capture", () => {
     expect(() => pipe(capture, Buffer.from("bad"), 2, true, 1, 10)).toThrow(/Nonmonotonic/);
     expect(() => pipe(capture, Buffer.from("x"), 4, true, 1, 5)).toThrow(/Nonmonotonic/);
     expect(() => capture.apply({ kind: "pipe", start: 4, end: 5, dataBase64: "!!!", info: {
-      id: 1, producer: "producer", consumer: "consumer", total: 10, open: true,
+      id: 1, producer: "producer", consumer: "consumer", total: 10, open: true, modified: 0,
     } })).toThrow();
+    for (const patch of [{ file: true }, { modified: undefined }, { modified: "0" }, { modified: NaN },
+      { modified: Infinity }, { node: null }, { node: 1 }]) {
+      expect(() => parseJobCapturePayload({ kind: "pipe", start: 4, end: 4, dataBase64: "", info: {
+        id: 1, producer: "producer", consumer: "consumer", total: 10, open: true, modified: 0, ...patch,
+      } })).toThrow();
+    }
     expect(() => pipe(capture, Buffer.alloc(CAPTURE_PIPE_CHUNK_BYTES + 1), 4)).toThrow();
     expect(capture.streams.read(1)?.data).toEqual(Buffer.from("abcd"));
     pipe(capture, Buffer.from("efghij"), 4, false);

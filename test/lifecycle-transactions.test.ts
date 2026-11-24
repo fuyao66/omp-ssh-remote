@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import { RemoteRuntimeClient } from "../src/client.ts";
 import { REMOTE_TOOL_NAMES } from "../src/protocol.ts";
+import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
+import { mirrorRemotePreview } from "../src/omp/remote-previews.ts";
 import { SUPPORTED_SDK_VERSION } from "../src/omp/sdk-contract.ts";
 import * as ssh from "../src/ssh.ts";
 import * as identity from "../src/omp/host-identity.ts";
@@ -390,15 +392,16 @@ test.each(["session_before_switch", "session_before_branch", "session_before_tre
   expect((await owner.status()).mode).toBe("local");
 });
 
-test("forced reconnect rotates binding, drops remote proposals, and routes to the new worker", async () => {
+test("forced reconnect rotates binding, withdraws remote previews, and routes to the new worker", async () => {
   const { owner, family } = await connected(), state = owner.state(family);
   const old = state.client!, binding = state.binding;
   const previous = await owner.execute("read", { path: "/remote/before" });
-  state.proposalSources.push("local", "remote", "remote");
+  const queue = new ToolChoiceQueue();
+  for (const id of ["w-1", "w-2"]) mirrorRemotePreview(state.remotePreviews, queue, { id, sourceToolName: "ast_edit" }, () => undefined);
   const result = await owner.execute("remote_reconnect", { force: true });
   await old.waitForExit();
   expect(old.isClosed).toBe(true); expect(state.binding).not.toBe(binding);
-  expect(state.client).not.toBe(old); expect(state.proposalSources).toEqual(["local"]);
+  expect(state.client).not.toBe(old); expect(state.remotePreviews).toEqual([]); expect(queue.hasPendingInvoker).toBe(false);
   expect(result.details).toMatchObject({ droppedRemoteProposals: 2, replacedLiveTransport: true });
   const next = await owner.execute("read", { path: "/remote/after" });
   expect(next.details).toMatchObject({ path: "/remote/after" });

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { RemoteConnectRequest } from "../connect-options.ts";
-import { normalizePathArgument, pathShouldStayLocal } from "../path-domain.ts";
+import { pathShouldStayLocal } from "../path-domain.ts";
 import type { OmpEditMode, RemoteToolName } from "../protocol.ts";
 import { resourceOwnershipTarget } from "../resource-ownership.ts";
 import { resolveLocalAsyncJobManager } from "./async-bash.ts";
@@ -13,7 +13,6 @@ export type ApprovalTargetState = {
   remoteCwd?: string;
   sessionFile?: string;
   editMode?: OmpEditMode;
-  proposalSources: readonly ("local" | "remote")[];
   family?: { connection: RemoteConnectRequest };
 };
 
@@ -29,19 +28,6 @@ function localTargets(name: RemoteToolName, args: Record<string, unknown>, state
       || (resolveLocalAsyncJobManager(state.sessionFile)?.getAllJobs().some(job => job.id === id) ?? false),
   });
   if (owner) return owner === "local";
-  if (name === "write") {
-    const device = /^xd:\/\/([^/?#]+)\/?(?:[?#].*)?$/i.exec(normalizePathArgument(args.path))?.[1]?.toLowerCase();
-    if (device === "resolve" || device === "reject") return (state.proposalSources.at(-1) ?? "local") === "local";
-    if (device && ["lsp", "ast_grep", "ast_edit", "debug"].includes(device)) {
-      let inner: unknown;
-      try { inner = typeof args.content === "string" ? JSON.parse(args.content) : undefined; } catch { return true; }
-      // Actual dispatch also checks device availability asynchronously. A possible
-      // remote dispatch must not reuse a local grant, even if it later stays local.
-      return inner === null || typeof inner !== "object" || Array.isArray(inner)
-        || localTargets(device as RemoteToolName, inner as Record<string, unknown>, state);
-    }
-    if (device) return true;
-  }
   return pathShouldStayLocal(name, args, state.editMode);
 }
 

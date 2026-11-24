@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { resolve as resolvePath } from "node:path";
 import { isMainThread } from "node:worker_threads";
 import type { AgentTool, AgentToolResult, ToolApproval } from "@oh-my-pi/pi-agent-core";
@@ -17,8 +18,13 @@ import {
 } from "./connect-options.ts";
 import { RemoteRuntimeClient, remoteErrorMessage, type RemoteRuntimeClientApi } from "./client.ts";
 import { describeRemoteWorkerCacheAudit, prepareRemoteWorker, type PreparedRemoteWorker, type RemoteWorkerCacheAudit } from "./deploy.ts";
-import { REMOTE_TOOL_NAMES, type RemoteToolName, type ReadyMessage } from "./protocol.ts";
-import { createOmpRuntimeHandshake, captureOmpToolSnapshot } from "./omp/runtime-contract.ts";
+import { isRecord, REMOTE_PREVIEW_RESOLVER, REMOTE_TOOL_NAMES, type OmpEditMode, type RemoteToolName, type ReadyMessage, type ToolCommandCatalog, type ToolCommandSpec } from "./protocol.ts";
+import { toolCommandNames } from "@oh-my-pi/pi-coding-agent/exec/tool-command-host";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { specialToolCommands } from "@oh-my-pi/pi-coding-agent/tools/resolve";
+import { resolveMountedToolCommand } from "@oh-my-pi/pi-coding-agent/tools/tool-commands";
+import { dropRemotePreviews, mirrorRemotePreview, takeRemotePreviews, type RemotePreviewMirror } from "./omp/remote-previews.ts";
+import { createOmpRuntimeHandshake, captureOmpToolSnapshot, toolParametersToWire } from "./omp/runtime-contract.ts";
 import { ompHostCompatibility, resolveOmpHostVersion, type OmpHostCompatibility } from "./omp/host-identity.ts";
 import { createNativeWorkerRuntime } from "./runtime.ts";
 import {
@@ -109,13 +115,6 @@ export function captureOutReplyCapability(approval: ToolApproval | undefined, ta
 }
 
 const REMOTE_TOOL_SET = new Set<string>(REMOTE_TOOL_NAMES);
-const REMOTE_XDEV_TOOLS = new Set<RemoteToolName>([
-  "lsp",
-  "ast_grep",
-  "ast_edit",
-  "debug",
-]);
-const RESOLUTION_DEVICES = new Set(["resolve", "reject"]);
 const LSP_READONLY_ACTIONS = new Set([
   "diagnostics",
   "definition",
@@ -190,7 +189,7 @@ type RemoteWorkspaceStatusInput = {
   remoteCwd?: string;
   owner: boolean;
   wrappedTools: Iterable<RemoteToolName>;
-  proposalSources: Iterable<ExecutionTarget>;
+  pendingRemotePreviews: number;
   hostCompatibility?: OmpHostCompatibility;
   cacheAudit?: RemoteWorkerCacheAudit;
 };
@@ -222,9 +221,7 @@ export function workspaceStatus(
     remoteWorkspaceTools: selected
       ? [...new Set(input.wrappedTools)].sort()
       : [],
-    pendingRemoteAstProposals: [...input.proposalSources].filter(
-      (source) => source === "remote",
-    ).length,
+    pendingRemoteAstProposals: input.pendingRemotePreviews,
     hostCompatibility: {
       installedHostVersion: input.hostCompatibility?.installedHostVersion ?? null,
       compiledHostVersion: input.hostCompatibility?.compiledHostVersion ?? null,
@@ -300,13 +297,16 @@ type RemoteExtensionState = {
   wrappedTools: Set<RemoteToolName>;
   /** Native ToolSession.enableLsp of this session, read from a wrapped native tool. */
   sessionLspEnabled?: boolean;
-  proposalSources: ExecutionTarget[];
+  /** Native bash bound at wrapper registration; its ToolSession owns the host's tool-command mounts. */
+  nativeBash?: unknown;
+  /** Worker previews mirrored into this session's native queue, dropped with their runtime. */
+  remotePreviews: RemotePreviewMirror[];
   selected: boolean;
   owner: boolean;
   family?: RemoteFamily;
   persistIntent?: (remote: boolean) => Promise<void>;
   connectionError?: string;
-  editMode?: EditModeSetting;
+  editMode?: OmpEditMode;
   /** Active tool names of the local session; forwarded so the remote bash interceptor sees the real tool set. */
   activeToolNames: () => string[] | undefined;
   /** Fixed for the process: running OMP versus the release this bundle is verified for. */
@@ -373,12 +373,25 @@ function hostSessionFor(state: RemoteExtensionState, ctx?: ExtensionContext) {
   return resolveLocalHostSession(state.sessionFile, ctx ?? state.hostContext);
 }
 
-function effectiveHostEditMode(state: RemoteExtensionState, ctx?: ExtensionContext): EditModeSetting {
+/** The host's edit.mode setting as resolved for the active model, including `magic`. */
+function hostEditModeSetting(state: RemoteExtensionState, ctx?: ExtensionContext): EditModeSetting {
   const host = hostSessionFor(state, ctx);
   const settings = host?.settings ?? findScopedSettings();
   if (!settings) return state.editMode ?? "hashline";
   const model = ctx?.model ?? host?.model;
   return resolveEditMode({ settings, getActiveModelString: () => model ? `${model.provider}/${model.id}` : undefined });
+}
+
+/** Edit variant governing schemas and routing; `magic` carries replace-shaped batches natively. */
+function effectiveHostEditMode(state: RemoteExtensionState, ctx?: ExtensionContext): OmpEditMode {
+  const mode = hostEditModeSetting(state, ctx);
+  return mode === "magic" ? "replace" : mode;
+}
+
+const MAGIC_EDIT_BOUND_REASON = "edit.mode=magic has a host model write each edit and is unavailable while bound to remote. Choose another edit mode, or /remote-exit first.";
+
+function magicEditBlockReason(state: RemoteExtensionState, ctx?: ExtensionContext): string | undefined {
+  return hostEditModeSetting(state, ctx) === "magic" ? MAGIC_EDIT_BOUND_REASON : undefined;
 }
 
 const AUTORESEARCH_TOOLS = new Set(["init_experiment", "run_experiment", "log_experiment", "update_notes"]);
@@ -591,15 +604,8 @@ export function remoteControlPlaneBlockReason(
   if (["find", "security_scan", "ida"].includes(toolName)) {
     return `${toolName} is not remote-adapted. Disconnect before using it on the local workspace; use remote grep/glob/bash for remote files.`;
   }
-  if ((toolName === "read" || toolName === "write") && typeof asRecord(input).path === "string") {
-    const device = xdevDevice(asRecord(input).path as string);
-    if (device && ["find", "security_scan", "ida"].includes(device)) {
-      return `${device} is not remote-adapted; local workspace execution is blocked while connected.`;
-    }
-  }
-  if (toolName === "github" || (toolName === "write" &&
-      xdevDevice(String(asRecord(input).path ?? "")) === "github")) {
-    const params = toolName === "github" ? asRecord(input) : parseDeviceArgs(asRecord(input).content);
+  if (toolName === "github") {
+    const params = asRecord(input);
     const op = params?.op;
     const apiReads: Readonly<Record<string, true>> = { repo_view: true, file_read: true, search_issues: true, search_prs: true, search_code: true, search_commits: true, search_repos: true, run_watch: true };
     if (typeof op !== "string" || apiReads[op] !== true) {
@@ -620,28 +626,6 @@ export function remoteControlPlaneBlockReason(
     return "Remote async bash requires the local OMP background job manager, which is unavailable in this session.";
   }
   return undefined;
-}
-
-function xdevDevice(path: string): string | undefined {
-  const match = /^xd:\/\/([^/?#]+)\/?(?:[?#].*)?$/i.exec(path);
-  return match?.[1]?.toLowerCase();
-}
-
-function parseDeviceArgs(
-  content: unknown,
-): Record<string, unknown> | undefined {
-  if (typeof content !== "string") return undefined;
-  if (/^\s*(?:\?|help)?\s*$/i.test(content)) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(content);
-    return parsed !== null &&
-      typeof parsed === "object" &&
-      !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function lspTier(args: Record<string, unknown>): "read" | "write" {
@@ -684,81 +668,9 @@ function approvalFor(name: RemoteToolName): ToolApproval {
     };
   }
   if (name === "write") {
-    return (args) => {
-      const input = asRecord(args);
-      const path = normalizePathArgument(input.path);
-      const device = xdevDevice(path);
-      if (device && (RESOLUTION_DEVICES.has(device) || device === "propose"))
-        return "read";
-      if (device === "lsp") {
-        const inner = parseDeviceArgs(input.content);
-        return inner ? lspTier(inner) : "exec";
-      }
-      if (device === "ast_grep") return "read";
-      if (device === "ast_edit") {
-        const inner = parseDeviceArgs(input.content);
-        return inner ? astEditTier(inner) : "exec";
-      }
-      if (isInternalUri(path)) return "exec";
-      return "write";
-    };
+    return (args) => isInternalUri(normalizePathArgument(asRecord(args).path)) ? "exec" : "write";
   }
   return "exec";
-}
-
-function xdevDispatch(
-  result: AgentToolResult,
-): Record<string, unknown> | undefined {
-  const details = result.details;
-  if (!details || typeof details !== "object" || !("xdev" in details))
-    return undefined;
-  const xdev = details.xdev;
-  return xdev && typeof xdev === "object"
-    ? (xdev as Record<string, unknown>)
-    : undefined;
-}
-
-export function stagedProposal(result: AgentToolResult): boolean {
-  if (result.isError === true) return false;
-  const details = asRecord(result.details);
-  if (details.applied === false && Number(details.totalReplacements) > 0)
-    return true;
-  const dispatch = xdevDispatch(result);
-  const inner = asRecord(dispatch?.inner);
-  return (
-    dispatch?.tool === "ast_edit" &&
-    inner.applied === false &&
-    Number(inner.totalReplacements) > 0
-  );
-}
-
-export function consumedResolution(result: AgentToolResult): boolean {
-  const dispatch = xdevDispatch(result);
-  const inner = asRecord(dispatch?.inner);
-  // Native queueResolveHandler consumes a normally returned invocation even
-  // when its business result isError (e.g. stale AST). A thrown apply has no
-  // completed ResolveDetails and retains its pending entry.
-  return (dispatch?.tool === "resolve" || dispatch?.tool === "reject") &&
-    (inner.action === "apply" || inner.action === "discard") &&
-    typeof inner.sourceToolName === "string";
-}
-
-async function localXdevAvailable(
-  device: string,
-  ctx: ExtensionContext,
-  signal?: AbortSignal,
-): Promise<boolean> {
-  if (!ctx.invokeTool) return false;
-  const result = await ctx.invokeTool(
-    { path: `xd://${device}`, content: "?" },
-    { signal },
-  );
-  const dispatch = xdevDispatch(result);
-  return (
-    result.isError !== true &&
-    dispatch?.tool === device &&
-    dispatch.mode === "help"
-  );
 }
 
 function ownershipState(state: RemoteExtensionState, ctx?: ExtensionContext) {
@@ -770,7 +682,7 @@ function ownershipState(state: RemoteExtensionState, ctx?: ExtensionContext) {
 }
 
 /**
- * Native read awaits toolCall.earlierEffectsSettled before reading, but SDK 19.0.1's
+ * Native read awaits toolCall.earlierEffectsSettled before reading, but SDK 19.1.1's
  * ExtensionContext does not expose toolCall, so a remote read cannot wait for an
  * earlier shared remote bash in its batch. Exclusive scheduling restores that order
  * (at the cost of serializing remote reads). Throws count as exclusive natively.
@@ -781,42 +693,17 @@ function readsRemoteWorkspace(params: Record<string, unknown>, state: RemoteExte
   return (owner ?? (pathShouldStayLocal("read", params, effectiveHostEditMode(state)) ? "local" : "remote")) === "remote";
 }
 
-async function executionTarget(
+function executionTarget(
   name: RemoteToolName,
   params: Record<string, unknown>,
   state: RemoteExtensionState,
   ctx: ExtensionContext,
-  signal?: AbortSignal,
-): Promise<ExecutionTarget> {
-  const ownership = ownershipState(state, ctx);
-  const owner = resourceOwnershipTarget(name, params, ownership);
-  let target: ExecutionTarget;
-  if (owner) target = owner;
-  else if (name !== "write") {
-    target = pathShouldStayLocal(name, params, effectiveHostEditMode(state, ctx)) ? "local" : "remote";
-  } else {
-    const path = normalizePathArgument(params.path);
-    const device = xdevDevice(path);
-    if (!device) {
-      target = pathShouldStayLocal(name, params, effectiveHostEditMode(state, ctx)) ? "local" : "remote";
-    } else if (RESOLUTION_DEVICES.has(device)) {
-      target = state.proposalSources.at(-1) ?? "local";
-    } else if (
-      device === "propose" ||
-      !REMOTE_XDEV_TOOLS.has(device as RemoteToolName)
-    ) {
-      target = "local";
-    } else {
-      const inner = parseDeviceArgs(params.content);
-      const innerOwner = inner ? resourceOwnershipTarget(device as RemoteToolName, inner, ownership) : undefined;
-      target = !inner || !(await localXdevAvailable(device, ctx, signal))
-        ? "local"
-        : innerOwner ?? (pathShouldStayLocal(device as RemoteToolName, inner, effectiveHostEditMode(state, ctx)) ? "local" : "remote");
-    }
-  }
+): ExecutionTarget {
+  const target = resourceOwnershipTarget(name, params, ownershipState(state, ctx)) ??
+    (pathShouldStayLocal(name, params, effectiveHostEditMode(state, ctx)) ? "local" : "remote");
   if (target === "remote" && state.family) assertStateFamily(state);
   if (target === "remote" && (name === "read" || name === "edit") &&
-      state.editMode !== effectiveHostEditMode(state, ctx)) {
+      state.editMode !== hostEditModeSetting(state, ctx)) {
     throw new Error("The host edit mode changed after connection. Reconnect before reading or editing the remote workspace.");
   }
 
@@ -832,7 +719,63 @@ async function executionTarget(
   return target;
 }
 
-function hostEvalInvoker(state: RemoteExtensionState, client: RemoteRuntimeClientApi, ctx: ExtensionContext): HostToolInvoker {
+/** The native host ToolSession behind the bound bash tool: where native shells find tool commands. */
+function nativeCommandSession(state: RemoteExtensionState): ToolSession | undefined {
+  const session = (state.nativeBash as { session?: unknown } | undefined)?.session;
+  return session !== null && typeof session === "object" ? session as ToolSession : undefined;
+}
+
+/** Resolves a command name the way the native shell handler does (exec/tool-command-host.ts). */
+function hostCommandTool(session: ToolSession, name: string): AgentTool | undefined {
+  if (!toolCommandNames(session).includes(name)) return undefined;
+  const special = specialToolCommands(session).find(tool => tool.name === name);
+  return special ?? (session.toolCommands ? resolveMountedToolCommand(session.toolCommands, name) : undefined);
+}
+
+/**
+ * OMP hands a `bash` line made only of tool commands to its native host bash (runner
+ * servesToolCommandLine, extension wrapper.ts), assuming a replacement shell cannot run them.
+ * Host bash would set the line up locally: host cwd, the local `.envrc` through direnv, the shell
+ * prefix and `@path` argument files. The remote shell mounts the same commands, so while bound the
+ * replacement keeps every line; unbound, native handback is unchanged.
+ */
+const handbackGuarded = new WeakSet<object>();
+function keepToolCommandLinesRemote(state: RemoteExtensionState): void {
+  const runner = hostSessionFor(state)?.extensionRunner;
+  if (!runner || handbackGuarded.has(runner)) return;
+  handbackGuarded.add(runner);
+  const native = runner.servesToolCommandLine.bind(runner);
+  runner.servesToolCommandLine = (name, params) => !(name === "bash" && state.selected) && native(name, params);
+}
+
+/** Abort signal of the remote shell call whose tool command is executing on the host. */
+const commandCallSignal = new AsyncLocalStorage<AbortSignal>();
+
+/** The host's live command mounts for one remote call; the client forwards only definitions its worker lacks. */
+function toolCommandCatalog(state: RemoteExtensionState): ToolCommandCatalog | undefined {
+  const session = nativeCommandSession(state);
+  if (!session) return undefined;
+  const names = toolCommandNames(session);
+  const specs: ToolCommandSpec[] = [];
+  for (const name of names) {
+    const tool = hostCommandTool(session, name);
+    if (tool) specs.push({ name, description: tool.description, schema: toolParametersToWire(tool.parameters) as Record<string, unknown> });
+  }
+  return { names, specs };
+}
+
+/**
+ * Host side of remote reentry. Eval's `tool.*` calls reach this session's remote wrappers only;
+ * a tool command from a remote shell runs as the host's own shell would run it: the live mount,
+ * validated, through the session's execution decorator and the registry tool, whose wrapper
+ * applies approval and `tool_call` hooks. Remote-adapted commands return to the worker from there.
+ */
+function hostInvoker(
+  state: RemoteExtensionState,
+  client: RemoteRuntimeClientApi,
+  ctx: ExtensionContext,
+  catalog: ToolCommandCatalog | undefined,
+): HostToolInvoker {
   const binding = state.binding;
   const owner = hostSessionFor(state, ctx);
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -842,19 +785,12 @@ function hostEvalInvoker(state: RemoteExtensionState, client: RemoteRuntimeClien
       if (state.family) assertStateFamily(state);
       if (!owner || hostSessionFor(state, ctx) !== owner || ctx.sessionManager.getSessionFile() !== sessionFile ||
           state.client !== client || client.isClosed || state.binding !== binding || invocation.resourceBinding !== binding) {
-        throw new Error("Remote Eval invocation belongs to a closed or changed workspace/session binding");
+        throw new Error(`Remote ${invocation.kind === "command" ? "tool command" : "Eval"} invocation belongs to a closed or changed workspace/session binding`);
       }
     };
     assertCurrent();
-    assertNestedRemoteTool(invocation.tool, invocation.args, binding, effectiveHostEditMode(state, ctx));
-    if (!state.wrappedTools.has(invocation.tool)) throw new Error(`Remote Eval tool.${invocation.tool} is not owned by this remote wrapper`);
-    const tool = owner!.getToolForEvalBridge(invocation.tool);
-    if (!tool) throw new Error(`Remote Eval tool.${invocation.tool} is not enabled by the host`);
-    const args = validateAgentToolArguments(tool, {
-      type: "toolCall", id: invocation.toolCallId, name: invocation.tool, arguments: invocation.args,
-    }, "payload");
     // Fresh native-shaped session context: never inherit a model-loop dispatch
-    // marker or the outer Eval's already-granted approval/provider metadata.
+    // marker or the outer call's already-granted approval/provider metadata.
     const context: ReturnType<ToolContextStore["getContext"]> = {
       sessionManager: ctx.sessionManager, modelRegistry: ctx.modelRegistry,
       model: owner!.model, settings: owner!.settings,
@@ -862,12 +798,70 @@ function hostEvalInvoker(state: RemoteExtensionState, client: RemoteRuntimeClien
       toolNames: owner!.getActiveToolNames(), isIdle: () => ctx.isIdle(),
       hasQueuedMessages: () => ctx.hasPendingMessages(), abort: () => ctx.abort(),
     };
+    if (invocation.kind === "command") {
+      const session = nativeCommandSession(state);
+      // Authority is the intersection of what this call mounted and what the host mounts now.
+      const tool = catalog?.names.includes(invocation.tool) ? session && hostCommandTool(session, invocation.tool) : undefined;
+      if (!session?.toolCommands || !tool) throw new Error(`${invocation.tool}: command is not mounted for this call`);
+      const args = validateAgentToolArguments(tool, {
+        type: "toolCall", id: invocation.toolCallId, name: invocation.tool, arguments: invocation.args,
+      }, "payload");
+      const executable = session.toolCommands.decorateExecution?.(tool) ?? tool;
+      // Native `resolve` drops the signal before calling a preview's invoker; carry it to the worker.
+      // Workspace tools reached this way stay remote, as Eval callbacks do.
+      const result = await nestedDispatchScope.run({ assertCurrent, command: true }, () => commandCallSignal.run(signal, () =>
+        executable.execute(invocation.toolCallId, args, signal, onUpdate, context)));
+      assertCurrent();
+      return result;
+    }
+    assertNestedRemoteTool(invocation.tool, invocation.args, binding, effectiveHostEditMode(state, ctx));
+    if (!state.wrappedTools.has(invocation.tool)) throw new Error(`Remote Eval tool.${invocation.tool} is not owned by this remote wrapper`);
+    const tool = owner!.getToolForEvalBridge(invocation.tool);
+    if (!tool) throw new Error(`Remote Eval tool.${invocation.tool} is not enabled by the host`);
+    const args = validateAgentToolArguments(tool, {
+      type: "toolCall", id: invocation.toolCallId, name: invocation.tool, arguments: invocation.args,
+    }, "payload");
     return nestedDispatchScope.run({ assertCurrent }, async () => {
       const result = await tool.execute(invocation.toolCallId, args, signal, onUpdate, context);
       assertCurrent();
       return result;
     });
   };
+}
+
+/** One remote call's command mounts and the host reentry bound to exactly those mounts. */
+function commandBridge(state: RemoteExtensionState, client: RemoteRuntimeClientApi, ctx: ExtensionContext) {
+  const commands = toolCommandCatalog(state);
+  return { onInvoke: hostInvoker(state, client, ctx, commands), commands };
+}
+
+/**
+ * Puts each preview a remote call staged into the host session's native queue, so native
+ * `resolve`/`reject` and the pending-preview reminder work exactly as for a local preview.
+ * Resolution goes back to the worker that staged it, and only while that worker is current.
+ */
+function mirrorStagedPreviews(state: RemoteExtensionState, ctx: ExtensionContext, result: AgentToolResult): void {
+  const staged = takeRemotePreviews(result);
+  if (staged.length === 0) return;
+  const queue = hostSessionFor(state, ctx)?.toolChoiceQueue;
+  const client = state.client;
+  const binding = state.binding;
+  if (!queue || !client) throw new Error("Remote preview was staged without a host session queue to resolve it from");
+  for (const preview of staged) {
+    mirrorRemotePreview(state.remotePreviews, queue, preview, () =>
+      state.client === client && !client.isClosed && state.binding === binding
+        ? async ({ action, reason }) => {
+          const endMutation = mayMutateLsp(REMOTE_PREVIEW_RESOLVER, { action }) ? state.lspDiagnostics?.beginMutation() : undefined;
+          try {
+            // Cancelling the call that ran `resolve` stops an apply still queued for the worker's
+            // mutation slot; one already applying completes, as a native apply does. As natively, an
+            // Eval `sh` timeout does not cancel the commands it started: they live as long as the cell.
+            return await client.execute(REMOTE_PREVIEW_RESOLVER, `${preview.id}:${action}:${crypto.randomUUID()}`,
+              { id: preview.id, action, reason }, commandCallSignal.getStore());
+          } finally { endMutation?.(); }
+        }
+        : undefined);
+  }
 }
 
 async function executeWithTarget(
@@ -895,7 +889,8 @@ async function executeWithTarget(
     try {
       return await client.execute(name, toolCallId, remoteParams, signal, onUpdate,
         { toolNames: state.activeToolNames(), steeringSignal,
-          ...(name === "eval" ? { onInvoke: hostEvalInvoker(state, client, ctx) } : {}) }) as AgentToolResult;
+          ...(name === "eval" || name === "bash"
+            ? commandBridge(state, client, ctx) : {}) }) as AgentToolResult;
     } finally { endMutation?.(); }
   };
   try {
@@ -968,7 +963,8 @@ function remoteBashJobOptions(
         remoteParams,
         signal,
         onUpdate,
-        { toolNames: state.activeToolNames(), bashScope: scope, onCapture },
+        { toolNames: state.activeToolNames(), bashScope: scope, onCapture,
+          ...commandBridge(state, client, ctx) },
       )) as AgentToolResult;
     },
   };
@@ -983,6 +979,10 @@ function registerWrapper(
 ): void {
   const original = hostSessionFor(state)?.getToolByName(name);
   state.sessionLspEnabled ??= nativeSessionLspEnabled(original);
+  if (name === "bash") {
+    state.nativeBash ??= original;
+    keepToolCommandLinesRemote(state);
+  }
   const approval = remoteWrapperApproval(
     name,
     typeof original?.approval === "function" ? original.approval.bind(original) : original?.approval ?? approvalFor(name),
@@ -1011,7 +1011,7 @@ function registerWrapper(
     strict: original?.strict,
     get customWireName() { return original?.customWireName; },
     get customFormat() { return original?.customFormat; },
-    // xd://<tool>/<topic> resolves through getToolByName; without this the wrapper hides native docs.
+    // help://<tool>/<topic> resolves through getToolByName; without this the wrapper hides native docs.
     docTopics: original?.docTopics ? () => original.docTopics!() : undefined,
     approval: approval.approval,
     approvalCacheTargets: approval.approvalCacheTargets,
@@ -1021,7 +1021,7 @@ function registerWrapper(
         throw new Error("The edit tool is disabled by edit.mode=none");
       const nested = nestedDispatchScope.getStore();
       nested?.assertCurrent();
-      if (nested) assertNestedRemoteTool(name, rawParams as Record<string, unknown>, state.binding, effectiveHostEditMode(state, ctx));
+      if (nested && !nested.command) assertNestedRemoteTool(name, rawParams as Record<string, unknown>, state.binding, effectiveHostEditMode(state, ctx));
       approval.assertBinding(rawParams);
       const params = rawParams as Record<string, unknown>;
       const binding = state.binding;
@@ -1030,9 +1030,10 @@ function registerWrapper(
         if (target === "remote" && state.family) assertStateFamily(state);
         if (state.binding !== binding) throw new Error("Workspace binding changed during this call; execution was not retried in the new workspace. Recheck the current workspace before continuing.");
       };
-      const target = await executionTarget(name, params, state, ctx, signal);
+      const target = executionTarget(name, params, state, ctx);
       ensureCurrent();
-      if (nested && target !== "remote" && !isOutReplyWrite(name, params)) throw new Error(`Eval tool.${name}: host resource unavailable from the remote runtime`);
+      if (nested && target !== "remote" && !isOutReplyWrite(name, params))
+        throw new Error(`${nested.command ? `${name} command` : `Eval tool.${name}`}: host resource unavailable from the remote runtime`);
       const serviceName = name === "bash" && target === "remote" && typeof params.name === "string" ? params.name.trim() || undefined : undefined;
       // No remote channel delivers notify matches. Refuse before any job or service exists so the
       // regex is never silently dropped; blank notify means absent, as natively.
@@ -1085,16 +1086,7 @@ function registerWrapper(
       if (name === "write" && target === "remote" && state.client) {
         completeProcReceipt(state.client, result);
       }
-      if (
-        (name === "ast_edit" ||
-          (name === "write" &&
-            xdevDevice(normalizePathArgument(params.path)) === "ast_edit")) &&
-        stagedProposal(result)
-      ) {
-        state.proposalSources.push(target);
-      }
-      if (name === "write" && consumedResolution(result))
-        state.proposalSources.pop();
+      if (target === "remote") mirrorStagedPreviews(state, ctx, result);
       return result;
     },
   };
@@ -1171,9 +1163,8 @@ function detachRemoteState(
   state.connectionError = restoreLocal
     ? undefined
     : "Remote runtime family disconnected; local fallback is disabled";
-  state.proposalSources = state.proposalSources.filter(
-    (source) => source === "local",
-  );
+  dropRemotePreviews(state.remotePreviews);
+  state.remotePreviews = [];
   const family = state.family;
   if (restoreLocal) {
     if (family) remoteFamilyBroker.detach(family, state);
@@ -1356,12 +1347,14 @@ async function reconnectRemoteRuntime(
   }
   // State errors explain more than a version refusal; check the version before any mutation or SSH.
   assertSupportedHost(state);
+  const magicReason = magicEditBlockReason(state, ctx);
+  if (magicReason) throw new Error(magicReason);
   const previous = state.client;
   state.client = undefined;
   state.binding = crypto.randomUUID();
   previous?.kill();
-  const droppedRemoteProposals = state.proposalSources.filter((source) => source === "remote").length;
-  state.proposalSources = state.proposalSources.filter((source) => source === "local");
+  const droppedRemoteProposals = dropRemotePreviews(state.remotePreviews);
+  state.remotePreviews = [];
   state.connectionError = "Remote runtime reconnect in progress";
   family.cacheAudit = undefined;
   const transaction = beginConnectionTransaction(state, options.signal);
@@ -1444,6 +1437,11 @@ async function attachFamilyMember(
       state.connectionError = `Remote subagent inheritance rejected: local cwd ${state.localCwd ?? "unknown"} differs from owner cwd ${family.localCwd}. Local isolated worktrees are not supported.`;
       return;
     }
+    const magicReason = magicEditBlockReason(state, ctx);
+    if (magicReason) {
+      state.connectionError = `Remote subagent inheritance rejected: ${magicReason}`;
+      return;
+    }
     opened = await openRemoteTransport(pi, family.connection, family.remoteCwd, state, ctx, transaction.signal);
     assertFamilyTransaction(state, family, transaction);
     publishTransport(state, opened, opened.ready.cwd ?? family.remoteCwd);
@@ -1492,8 +1490,12 @@ async function connectOwner(
     if (settings && cfgTaskWorkerThreads.get(settings) > 0) {
       throw new Error("Remote workspaces run subagents on the main thread. Set task.workerThreads to 0 (Settings → Tasks → Subagent Worker Threads → Main thread only, or `task.workerThreads: 0` in config.yml), then connect again.");
     }
-    const cursorReason = cursorBlockReason(state, ctx);
+    const cursorReason = cursorBlockReason(state, ctx) ?? magicEditBlockReason(state, ctx);
     if (cursorReason) throw new Error(cursorReason);
+    // Native `resolve` applies the queue head; once bound, a remote shell must never reach a local preview.
+    if (hostSessionFor(state, ctx)?.toolChoiceQueue?.hasPendingInvoker) {
+      throw new Error("A staged preview is pending in the local workspace. Run `resolve` or `reject` for it, then connect.");
+    }
     if (pi.getActiveTools().some(name => AUTORESEARCH_TOOLS.has(name))) {
       throw new Error("Autoresearch is active locally; run /autoresearch off and wait for experiments to stop before connecting.");
     }
@@ -1592,7 +1594,7 @@ export default async function remoteRuntimeExtension(
   const state: RemoteExtensionState = {
     binding: crypto.randomUUID(),
     wrappedTools: new Set(),
-    proposalSources: [],
+    remotePreviews: [],
     selected: false,
     owner: false,
     activeToolNames: () => {
@@ -1637,7 +1639,7 @@ export default async function remoteRuntimeExtension(
         remoteCwd: state.remoteCwd,
         owner: state.owner,
         wrappedTools: state.wrappedTools,
-        proposalSources: state.proposalSources,
+        pendingRemotePreviews: state.remotePreviews.length,
         hostCompatibility,
         cacheAudit: state.family?.cacheAudit,
       });
@@ -1747,8 +1749,7 @@ export default async function remoteRuntimeExtension(
         const remoteProposalCount = [...family.members].reduce(
           (count, member) =>
             count +
-            member.proposalSources.filter((source) => source === "remote")
-              .length,
+            member.remotePreviews.length,
           0,
         );
         if (remoteProposalCount > 0) {
@@ -1835,7 +1836,7 @@ export default async function remoteRuntimeExtension(
           ? `Remote runtime: unavailable (fail-closed): ${state.connectionError}`
           : state.client?.isClosed
             ? `Remote runtime: connection lost at ${state.remoteCwd} (fail-closed)`
-            : `Remote runtime: ${state.remoteCwd}; role=${state.owner ? "owner" : "subagent"}; tools=${[...state.wrappedTools].join(",")}; pending=${state.proposalSources.length}`;
+            : `Remote runtime: ${state.remoteCwd}; role=${state.owner ? "owner" : "subagent"}; tools=${[...state.wrappedTools].join(",")}; pending=${state.remotePreviews.length}`;
       const build = hostCompatibility.compatible
         ? `plugin built for OMP ${hostCompatibility.compiledHostVersion}`
         : (hostCompatibility.advice ?? "plugin build version unknown");
@@ -1890,8 +1891,7 @@ export default async function remoteRuntimeExtension(
         const remoteProposalCount = [...family.members].reduce(
           (count, member) =>
             count +
-            member.proposalSources.filter((source) => source === "remote")
-              .length,
+            member.remotePreviews.length,
           0,
         );
         if (remoteProposalCount > 0) {
@@ -1973,8 +1973,7 @@ export default async function remoteRuntimeExtension(
           ? [...family.members].reduce(
               (count, member) =>
                 count +
-                member.proposalSources.filter((source) => source === "remote")
-                  .length,
+                member.remotePreviews.length,
               0,
             )
           : 0,
@@ -2023,7 +2022,7 @@ export default async function remoteRuntimeExtension(
   pi.on("user_python", () => state.selected ? { result: { ...blockedUserExecution(), displayOutputs: [], stdinRequested: false } } : undefined);
   pi.on("input", (event, ctx) => remoteInputPolicy(state.selected, event, ctx));
   pi.on("before_agent_start", (_event, ctx) => {
-    const cursorReason = state.selected ? cursorBlockReason(state, ctx) : undefined;
+    const cursorReason = state.selected ? cursorBlockReason(state, ctx) ?? magicEditBlockReason(state, ctx) : undefined;
     if (cursorReason) {
       ctx.ui.notify(cursorReason, "warning");
       // Native abort advances promptGeneration before the preparation commit;

@@ -24,7 +24,7 @@ test.each(["replace", "none"] as const)("missing edit metadata preserves effecti
     const pi = { getAllTools: () => Object.values(runtime.tools).filter(tool => tool.name !== "edit") } as unknown as ExtensionAPI;
     const state = {
       localCwd: cwd, selected: false, owner: false, binding: "fallback-test", wrappedTools: new Set(),
-      proposalSources: [], activeToolNames: () => [],
+      remotePreviews: [], activeToolNames: () => [],
     } as Parameters<typeof captureOmpHandshake>[1];
     const handshake = await withActiveSettings(settings, () => captureOmpHandshake(pi, state));
     expect(handshake.editMode).toBe(editMode);

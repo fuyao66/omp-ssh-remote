@@ -10,6 +10,8 @@ import {
   type ReadyMessage,
   type Request,
   type InvokeMessage,
+  type ToolCommandCatalog,
+  type ToolCommandSpec,
 } from "./protocol.ts";
 import type { RemoteRuntimeHandshake } from "./runtime-contract.ts";
 import type { RemoteExecutionSettings } from "./omp/execution-settings.ts";
@@ -43,6 +45,8 @@ export interface RemoteExecuteOptions {
   bashScope?: "job" | "session";
   onCapture?: (capture: JobCapturePayload) => void;
   onInvoke?: HostToolInvoker;
+  /** Host tool commands the remote shell mounts (bash and Eval `sh`), with every definition; the client forwards only those its worker lacks. */
+  commands?: ToolCommandCatalog;
 }
 
 export interface RemoteRuntimeClientApi {
@@ -283,6 +287,7 @@ export class RemoteRuntimeClient implements RemoteRuntimeClientApi {
       }
     };
     signal?.addEventListener("abort", abortHandler, { once: true });
+    const commands = options.commands && this.#unsentCommandSpecs(options.commands);
     try {
       this.#send({
         type: "execute",
@@ -293,7 +298,10 @@ export class RemoteRuntimeClient implements RemoteRuntimeClientApi {
         ...(options.toolNames ? { toolNames: [...options.toolNames] } : {}),
         ...(options.steeringSignal ? { steering: true } : {}),
         ...(options.bashScope ? { bashScope: options.bashScope } : {}),
+        ...(commands ? { commands: commands.catalog } : {}),
       });
+      // Recorded only once the frame is written: a frame that failed to encode sent nothing.
+      for (const [name, digest] of commands?.digests ?? []) this.#sentCommandSpecs.set(name, digest);
       options.steeringSignal?.addEventListener("abort", steerHandler, { once: true });
       if (options.steeringSignal?.aborted) steerHandler();
       return await promise;
@@ -347,6 +355,22 @@ export class RemoteRuntimeClient implements RemoteRuntimeClientApi {
 
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
     this.#terminate(new Error("Remote runtime killed"), signal);
+  }
+
+  /** Command definitions this worker has received, by name; specs accumulate worker-side. */
+  readonly #sentCommandSpecs = new Map<string, string>();
+
+  /** The catalog with only definitions not yet sent to this worker, plus their digests to record once sent. */
+  #unsentCommandSpecs(catalog: ToolCommandCatalog): { catalog: ToolCommandCatalog; digests: [string, string][] } {
+    const specs: ToolCommandSpec[] = [];
+    const digests: [string, string][] = [];
+    for (const spec of catalog.specs ?? []) {
+      const digest = JSON.stringify(spec);
+      if (this.#sentCommandSpecs.get(spec.name) === digest) continue;
+      specs.push(spec);
+      digests.push([spec.name, digest]);
+    }
+    return { catalog: specs.length > 0 ? { names: catalog.names, specs } : { names: catalog.names }, digests };
   }
 
   #send(message: Request): void {
@@ -550,7 +574,9 @@ export class RemoteRuntimeClient implements RemoteRuntimeClientApi {
     const current = () => !this.#closed && this.#pending.get(message.parentId) === parent;
     const token = { parentId: message.parentId, controller };
     try {
-      if (this.#closed || !parent || parent.tool !== "eval" || !parent.onInvoke) throw new Error("Remote Eval invocation has no authorized active host parent");
+      // Eval reenters tools and its `sh` runs commands; a remote shell reenters only commands.
+      const authorized = parent?.tool === "eval" || (parent?.tool === "bash" && message.kind === "command");
+      if (this.#closed || !parent || !authorized || !parent.onInvoke) throw new Error("Remote invocation has no authorized active host parent");
       // Replays are a transport violation, not a second result for the same
       // correlation id. Never replace/delete the original cancellation token.
       const seen = parent.invocationIds ??= new Set<string>();

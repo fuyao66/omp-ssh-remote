@@ -13,7 +13,7 @@ export type ResourceOwnershipState = {
 /**
  * Shared host approval/dispatch ownership composition. Validate bound namespaces
  * before local-mode routing, then resolve process owners before returning a bound
- * conflict's remote owner. Undefined leaves ordinary paths and xdev policy to the
+ * conflict's remote owner. Undefined leaves ordinary paths and tool-command policy to the
  * caller; it never means that a bound or process operand was skipped.
  */
 export function resourceOwnershipTarget(

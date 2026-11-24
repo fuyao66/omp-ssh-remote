@@ -140,6 +140,7 @@
     "attachment",
     "cfg",
     "conflict",
+    "help",
     "history",
     "issue",
     "local",
@@ -154,8 +155,7 @@
     "security",
     "skill",
     "ssh",
-    "vault",
-    "xd"
+    "vault"
   ],
   "lspActions": [
     "capabilities",

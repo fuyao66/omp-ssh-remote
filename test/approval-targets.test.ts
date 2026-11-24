@@ -7,7 +7,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 
 describe("workspace approval targets", () => {
   test("keeps native local targets but never derives remote targets against local files", () => {
-    const state: ApprovalTargetState = { selected: false, binding: "local", proposalSources: [] };
+    const state: ApprovalTargetState = { selected: false, binding: "local" };
     const targets = ["/local/file"];
     let calls = 0;
     const metadata = remoteWrapperApproval("read", "read", () => { calls++; return targets; }, () => state);
@@ -26,7 +26,7 @@ describe("workspace approval targets", () => {
 
   test("isolates binding, host/user, port, identity, cwd and tool while keeping stable exact requests", () => {
     const state: ApprovalTargetState = {
-      selected: true, binding: "binding-a", remoteCwd: "/remote", proposalSources: [],
+      selected: true, binding: "binding-a", remoteCwd: "/remote",
       family: { connection: { target: "alice@host-a", displayTarget: "alias", port: 22, identityFile: "/keys/a" } },
     };
     const metadata = remoteWrapperApproval("read", "read", undefined, () => state);
@@ -51,7 +51,7 @@ describe("workspace approval targets", () => {
   });
 
   test("remote grant keys do not retain file contents or grow with payload size", () => {
-    const state: ApprovalTargetState = { selected: true, binding: "remote", proposalSources: [] };
+    const state: ApprovalTargetState = { selected: true, binding: "remote" };
     const metadata = remoteWrapperApproval("write", "write", undefined, () => state);
     const secret = "private-file-content-".repeat(10_000);
     const key = metadata.approvalCacheTargets({ path: "file", content: secret })?.[0];
@@ -61,7 +61,7 @@ describe("workspace approval targets", () => {
   });
 
   test("selector-bearing local processes never mint a grant for a later remote name", () => {
-    const state: ApprovalTargetState = { selected: true, binding: "unchanged", proposalSources: [] };
+    const state: ApprovalTargetState = { selected: true, binding: "unchanged" };
     let live = true;
     const registry = spyOn(AgentRegistry, "global").mockReturnValue({ list: () => live ? [{ id: "bg_1" }] : [] } as never);
     try {
@@ -75,21 +75,8 @@ describe("workspace approval targets", () => {
     } finally { registry.mockRestore(); }
   });
 
-  test("scopes forwarded xdev requests and remote proposal resolutions without mixing domains", () => {
-    const state: ApprovalTargetState = { selected: true, binding: "remote", proposalSources: ["remote"] };
-    const native = ["xd://native"];
-    const metadata = remoteWrapperApproval("write", "write", () => native, () => state);
-    expect(metadata.approvalCacheTargets({ path: "xd://ast_edit", content: JSON.stringify({ paths: ["/remote/file"] }) })).not.toBe(native);
-    expect(metadata.approvalCacheTargets({ path: "xd://ast_edit", content: JSON.stringify({ paths: ["artifact://local"] }) })).toBe(native);
-    expect(metadata.approvalCacheTargets({ path: "xd://resolve", content: "yes" })).not.toBe(native);
-    state.proposalSources = ["local"];
-    expect(metadata.approvalCacheTargets({ path: "xd://resolve", content: "yes" })).toBe(native);
-    const search = remoteWrapperApproval("grep", "read", undefined, () => state);
-    expect(() => search.approvalCacheTargets({ path: "/remote;artifact://local" })).toThrow("cannot mix");
-  });
-
   test("native cached mode accepts exact remote grants but not local or other-binding grants", async () => {
-    const state: ApprovalTargetState = { selected: true, binding: "host-a", remoteCwd: "/remote", proposalSources: [] };
+    const state: ApprovalTargetState = { selected: true, binding: "host-a", remoteCwd: "/remote" };
     const metadata = remoteWrapperApproval("read", "read", () => ["/remote/file"], () => state);
     const tool = { name: "read", ...metadata };
     const args = { path: "/remote/file" };
@@ -116,7 +103,7 @@ describe("workspace approval targets", () => {
   });
 
   test("a workspace switch during native approve cannot record or execute the old request", async () => {
-    const state: ApprovalTargetState = { selected: true, binding: "host-a", proposalSources: [] };
+    const state: ApprovalTargetState = { selected: true, binding: "host-a" };
     const metadata = remoteWrapperApproval("read", "read", undefined, () => state);
     const tool = { name: "read", ...metadata };
     const args = { path: "file" };
@@ -140,7 +127,7 @@ describe("workspace approval targets", () => {
 
   test("pins all approval modes before awaiting UI and rejects stale record or execution", () => {
     for (const selected of [false, true]) {
-      const state: ApprovalTargetState = { selected, binding: "before", proposalSources: [] };
+      const state: ApprovalTargetState = { selected, binding: "before" };
       const metadata = remoteWrapperApproval("read", "read", () => ["/native"], () => state);
       const tool = { name: "read", ...metadata };
       for (const mode of ["always-ask", "always-ask-cached", "write", "yolo"] as const) {
@@ -158,7 +145,7 @@ describe("workspace approval targets", () => {
     }
   });
   test("classifies bound conflicts identically for approval and execution", () => {
-    const state: ApprovalTargetState = { selected: true, binding: "remote-one", proposalSources: [] };
+    const state: ApprovalTargetState = { selected: true, binding: "remote-one" };
     const metadata = remoteWrapperApproval("write", "write", () => ["native-local"], () => state);
     expect(metadata.approvalCacheTargets({ path: "conflict://1", content: "@ours" })).toEqual(["native-local"]);
     expect(metadata.approvalCacheTargets({ path: "remote-conflict://remote-one/1", content: "@ours" })?.[0]).toStartWith("remote-request\0");
@@ -168,7 +155,7 @@ describe("workspace approval targets", () => {
   });
 
   test("approval and cache selection reject mixed bound conflicts and local processes in either order", () => {
-    const state: ApprovalTargetState = { selected: true, binding: "current", sessionFile: "/tmp/approval-resource-session.jsonl", proposalSources: [] };
+    const state: ApprovalTargetState = { selected: true, binding: "current", sessionFile: "/tmp/approval-resource-session.jsonl" };
     const registry = spyOn(AgentRegistry, "global").mockReturnValue({ list: () => [
       { id: "Main", sessionFile: state.sessionFile, session: { sessionManager: { getSessionFile: () => state.sessionFile }, asyncJobManager: { getAllJobs: () => [{ id: "bg_1" }] } } },
       { id: "Scout" },
@@ -199,7 +186,7 @@ describe("workspace approval targets", () => {
   });
 
   test("native conflict aliases cannot acquire remote approval targets after reconnect", () => {
-    const state: ApprovalTargetState = { selected: true, binding: "remote-current", proposalSources: [] };
+    const state: ApprovalTargetState = { selected: true, binding: "remote-current" };
     for (const name of ["read", "write"] as const) {
       const metadata = remoteWrapperApproval(name, "write", () => ["native-local"], () => state);
       for (const path of ["file:conflict://1", "[conflict://1#ABCD]", "[file:conflict://1#ABCD]", "remote-conflict://old-binding/1:conflict://1"]) {
@@ -211,7 +198,7 @@ describe("workspace approval targets", () => {
   });
 
   test("uses native effective edit mode and rejects cross-domain move grants", () => {
-    const state: ApprovalTargetState = { selected: true, binding: "remote", proposalSources: [], editMode: "replace" };
+    const state: ApprovalTargetState = { selected: true, binding: "remote", editMode: "replace" };
     const metadata = remoteWrapperApproval("edit", "write", () => ["native-local"], () => state);
     expect(metadata.approvalCacheTargets({ path: "local://a", old_string: "a", new_string: "b" })).toEqual(["native-local"]);
     expect(metadata.approvalCacheTargets({ path: "file", old_string: "a", new_string: "b" })?.[0]).toStartWith("remote-request\0");
@@ -225,7 +212,7 @@ describe("workspace approval targets", () => {
   });
 
   test("keeps native approval details and names the remote workspace a routed call runs in", () => {
-    const state = { selected: false, binding: "local", proposalSources: [], remoteCwd: "/srv/app",
+    const state = { selected: false, binding: "local", remoteCwd: "/srv/app",
       family: { connection: { displayTarget: "user@example.invalid" } } } as unknown as ApprovalTargetState;
     const native = (args: unknown) => [`Command: ${(args as { command: string }).command}`];
     const metadata = remoteWrapperApproval("bash", "exec", undefined, () => state, native);

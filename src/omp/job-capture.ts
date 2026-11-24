@@ -11,6 +11,9 @@ export interface RemotePipeInfo {
   consumer: string;
   total: number;
   open: boolean;
+  file?: false;
+  modified: number;
+  node?: string;
 }
 
 export type JobCapturePayload =
@@ -55,12 +58,20 @@ export function parseJobCapturePayload(value: unknown): JobCapturePayload {
   if (data.kind === "pipe") {
     const info = record(data.info);
     if (typeof info.producer !== "string" || typeof info.consumer !== "string" || info.producer.length > CAPTURE_STAGE_LABEL_UNITS || info.consumer.length > CAPTURE_STAGE_LABEL_UNITS) throw new Error("Invalid capture stage label");
+    if (info.file !== undefined && info.file !== false) throw new Error("Invalid capture pipe file flag");
+    if (typeof info.modified !== "number" || !Number.isFinite(info.modified)) throw new Error("Invalid capture pipe modified time");
+    if (info.node !== undefined && typeof info.node !== "string") throw new Error("Invalid capture pipe node");
     if (typeof data.dataBase64 !== "string" || data.dataBase64.length > 4 * Math.ceil(CAPTURE_PIPE_CHUNK_BYTES / 3)) throw new Error("Invalid capture byte payload");
     const bytes = Buffer.from(data.dataBase64, "base64");
     if (bytes.length > CAPTURE_PIPE_CHUNK_BYTES || bytes.length !== end - start || bytes.toString("base64") !== data.dataBase64) throw new Error("Invalid capture base64 or byte length");
     const total = offset(info.total);
     if (total < end) throw new Error("Invalid capture pipe total");
-    return { kind: "pipe", start, end, dataBase64: data.dataBase64, info: { id: offset(info.id, 1), producer: info.producer, consumer: info.consumer, total, open: flag(info.open) } };
+    return { kind: "pipe", start, end, dataBase64: data.dataBase64, info: {
+      id: offset(info.id, 1), producer: info.producer, consumer: info.consumer, total, open: flag(info.open),
+      ...(info.file !== undefined ? { file: info.file } : {}),
+      modified: info.modified,
+      ...(info.node !== undefined ? { node: info.node } : {}),
+    } };
   }
   throw new Error("Unknown capture kind");
 }

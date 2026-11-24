@@ -69,7 +69,7 @@ function capturePump(job: AsyncJob, send: JobCaptureSender): (final: boolean) =>
     }
 
     const streams = job.process?.streams;
-    const infos = streams?.list() ?? [];
+    const infos = streams?.list().filter((info) => !info.file) ?? [];
     const ids = infos.map((info) => info.id);
     const nextMembership = ids.join(",");
     if (nextMembership !== membership) {
@@ -87,6 +87,9 @@ function capturePump(job: AsyncJob, send: JobCaptureSender): (final: boolean) =>
         consumer: nativeInfo.consumer.slice(0, CAPTURE_STAGE_LABEL_UNITS),
         total: Math.max(nativeInfo.total, chunk.end, previous?.info.total ?? 0),
         open: chunk.open && !final,
+        file: false,
+        modified: nativeInfo.modified,
+        ...(nativeInfo.node !== undefined ? { node: nativeInfo.node } : {}),
       };
       for (let offset = 0; offset < chunk.data.length; offset += CAPTURE_PIPE_CHUNK_BYTES) {
         const data = chunk.data.subarray(offset, offset + CAPTURE_PIPE_CHUNK_BYTES);

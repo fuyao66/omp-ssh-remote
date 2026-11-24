@@ -62,7 +62,7 @@ describe("native workspace parity", () => {
       const tools = [writer, reader].map(original => {
         const definition = harness.definitions.get(original.name)!;
         return wrapRegisteredTool({ definition, extensionPath: "parity" } as never, {
-          getNativeDelegationGuidance: () => undefined,
+          getNativeDelegationGuidance: () => undefined, servesToolCommandLine: () => false,
           createContext: () => ({ ...harness.ctx, invokeTool: (params: { path: string; content: string }) => original.execute("delegated", params) }),
         } as never);
       });
@@ -105,7 +105,7 @@ describe("native workspace parity", () => {
 
   test("native single-slash and prefixed local aliases share approval and execution ownership", () => {
     const router = InternalUrlRouter.instance();
-    const metadata = remoteWrapperApproval("read", "read", () => ["local-target"], () => ({ selected: true, binding: "remote", proposalSources: [] }));
+    const metadata = remoteWrapperApproval("read", "read", () => ["local-target"], () => ({ selected: true, binding: "remote" }));
     for (const path of ["local:/x", "local://x", "/repo/local://x"]) {
       expect(normalizePathArgument(path)).toBe(router.normalize(path));
       expect(pathShouldStayLocal("read", { path })).toBe(true);
@@ -128,7 +128,7 @@ describe("native workspace parity", () => {
     const bash = new BashTool({ cwd: process.cwd(), settings: Settings.isolated({ "bashInterceptor.enabled": true,
       "bashInterceptor.patterns": [{ pattern: "^cat ", tool: "read", message: "Use read instead" }],
     }) } as ToolSession);
-    const metadata = remoteWrapperApproval("bash", bash.approval.bind(bash), undefined, () => ({ selected: true, binding: "remote", proposalSources: [] }));
+    const metadata = remoteWrapperApproval("bash", bash.approval.bind(bash), undefined, () => ({ selected: true, binding: "remote" }));
     const context = { toolNames: ["read", "bash"] } as AgentToolContext;
     expect((metadata.approval as typeof bash.approval)({ command: "cat file" }, context)).toEqual(bash.approval({ command: "cat file" }, context));
     expect((metadata.approval as typeof bash.approval)({ command: "cat file" }, context)).toMatchObject({ policy: "deny" });
@@ -164,13 +164,13 @@ describe("native workspace parity", () => {
     } finally { await runtime.dispose(); await manager.dispose(); await rm(cwd, { recursive: true, force: true }); }
   });
 
-  test("native Eval apply_patch and xd aliases dispatch the canonical edit tool", async () => {
+  test("native Eval apply_patch alias dispatches the canonical edit tool", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-parity-alias-"));
     const runtime = await createNativeWorkerRuntime(cwd, { editMode: "apply_patch", settings: { "lsp.diagnosticsOnEdit": false },
-      invokeTool: async (name, ...args) => { expect(name).toBe("edit"); return runtime.tools.edit.execute(...args); },
+      invokeTool: async (name, id, params, signal, onUpdate, context) => { expect(name).toBe("edit"); return runtime.tools.edit.execute(id, params, signal, onUpdate, context); },
     });
     try {
-      for (const [index, name] of ["apply_patch", "xd://apply_patch", "XD://edit"].entries()) {
+      for (const [index, name] of ["apply_patch", "edit"].entries()) {
         const result = await callSessionTool(name, { input: `*** Begin Patch\n*** Add File: alias-${index}.txt\n+created\n*** End Patch` }, { session: runtime.session });
         expect(JSON.stringify(result)).not.toContain('"hasError":true');
         expect(await readFile(join(cwd, `alias-${index}.txt`), "utf8")).toBe("created\n");
@@ -201,7 +201,7 @@ describe("native workspace parity", () => {
     } finally { await store.dispose(); await runtime.dispose(); await rm(cwd, { recursive: true, force: true }); }
   });
 
-  test("wrapped read keeps native xd:// doc topics reachable", async () => {
+  test("wrapped read keeps native help:// doc topics reachable", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-parity-doc-topics-"));
     const session = { cwd, settings: Settings.isolated({ "lsp.enabled": false }), getSessionFile: () => null } as unknown as ToolSession;
     const nativeRead = new ReadTool(session);
@@ -210,7 +210,7 @@ describe("native workspace parity", () => {
       const wrapped = wrapRegisteredTool({ definition: harness.definitions.get("read")!, extensionPath: "parity" } as never, {} as never);
       session.getToolByName = (name: string) => (name === "read" ? wrapped : undefined);
       expect(Object.keys(wrapped.docTopics?.() ?? {})).toEqual(Object.keys(nativeRead.docTopics()));
-      const result = JSON.stringify(await nativeRead.execute("topic", { path: "xd://read/sources" }));
+      const result = JSON.stringify(await nativeRead.execute("topic", { path: "help://read/sources" }));
       expect(result).not.toContain("has no doc topics");
       expect(result).toContain(nativeRead.docTopics().sources!.split("\n")[0]!.slice(0, 40).replace(/"/g, '\\"'));
     } finally { await harness.close(); await rm(cwd, { recursive: true, force: true }); }

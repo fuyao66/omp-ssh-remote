@@ -53,7 +53,7 @@ describe("execution settings whitelist", () => {
       "bash.patterns",
       "bash.allowCompoundCommands",
       "worktree.clone",
-      "tools.xdev",
+      "tools.commands",
     ]) {
       expect(FORWARDED_SETTING_KEYS).not.toContain(key);
     }

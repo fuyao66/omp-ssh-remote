@@ -14,7 +14,9 @@ import { executeOwnedRemoteService } from "../src/omp/service-lifecycle.ts";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { bashToolRenderer, type BashToolDetails } from "@oh-my-pi/pi-tui/tools/bash";
-import { PROTOCOL_VERSION, TOOL_RUNTIME_VERSION, encodeMessage, decodeFrames } from "../src/protocol.ts";
+import { formatMinimizedMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { takeRemotePreviews } from "../src/omp/remote-previews.ts";
+import { PROTOCOL_VERSION, REMOTE_PREVIEW_RESOLVER, TOOL_RUNTIME_VERSION, encodeMessage, decodeFrames } from "../src/protocol.ts";
 
 test("worker bootstrap isolates native re-entry imports and installs signal ownership first", async () => {
   const entry = await readFile(join(import.meta.dir, "../src/worker.ts"), "utf8");
@@ -97,29 +99,28 @@ describe("native worker round trip", () => {
     expect(artifact.details?.rowPrefixes).toBe(false);
   });
 
-  test("a remote spill does not resolve to the host session's local://1.log", async () => {
+  test("a remote spill does not resolve to the host session's same-numbered local://N.log", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "omp-spill-collision-"));
     const hostLocal = join(temporary, "local");
     const worker = new RemoteRuntimeClient({ command: [process.execPath, join(import.meta.dir, "../src/worker.ts")] });
     try {
+      await worker.initialize(temporary, OMP_RUNTIME_HANDSHAKE);
+      const result = await worker.execute("bash", "spill", { command: "echo remote-only-sentinel; seq 1 20000" });
+      const serialized = JSON.stringify(result);
+      const [uri, index] = serialized.match(/remote-artifact:\/\/[a-f0-9-]+\/(\d+)\b/) ?? [];
+      expect(uri).toBeDefined();
+      expect(serialized).not.toContain(`local://${index}.log`);
+      // The host session holds a different file under the very same spill number.
       await mkdir(hostLocal);
-      await writeFile(join(hostLocal, "1.log"), "host-only collision sentinel\n");
-      const host = await InternalUrlRouter.instance().resolve("local://1.log", {
+      await writeFile(join(hostLocal, `${index}.log`), "host-only collision sentinel\n");
+      const host = await InternalUrlRouter.instance().resolve(`local://${index}.log`, {
         localProtocolOptions: { getArtifactsDir: () => temporary },
       });
       expect(host.content).toBe("host-only collision sentinel\n");
-      await worker.initialize(temporary, OMP_RUNTIME_HANDSHAKE);
-      // Native Bash reserves spill 0 even for the short first command.
-      await worker.execute("bash", "reserve-zero", { command: "true" });
-      const result = await worker.execute("bash", "spill-one", { command: "echo remote-only-sentinel; seq 1 20000" });
-      const serialized = JSON.stringify(result);
-      const uri = serialized.match(/remote-artifact:\/\/[a-f0-9-]+\/1\b/)?.[0];
-      expect(uri).toBeDefined();
-      expect(serialized).not.toContain("local://1.log");
-      const remote = await worker.execute("read", "read-spill-one", { path: `${uri}:1-2` });
+      const remote = await worker.execute("read", "read-spill", { path: `${uri}:1-2` });
       expect(JSON.stringify(remote)).toContain("remote-only-sentinel");
       expect(JSON.stringify(remote)).not.toContain("host-only collision sentinel");
-      const bash = await worker.execute("bash", "bash-spill-one", { command: `head -1 '${uri}'` });
+      const bash = await worker.execute("bash", "bash-spill", { command: `head -1 '${uri}'` });
       expect(JSON.stringify(bash)).toContain("remote-only-sentinel");
     } finally {
       await worker.close();
@@ -151,9 +152,10 @@ describe("native worker round trip", () => {
     const options = { expanded: true, isPartial: false };
     const rendered = Bun.stripANSI(bashToolRenderer.renderResult(result, options, theme, args).render(240).join("\n"));
     expect(rendered).toContain(uri);
-    expect(rendered).toContain("Minimized");
+    expect(rendered).toContain(formatMinimizedMeta(minimized!));
     const view = JSON.stringify(bashToolRenderer.describeResult(result, options, args));
     expect(view).toContain(uri);
+    expect(view).toContain("Minimized");
     expect(view).not.toMatch(/(?<!remote-)artifact:\/\//);
   });
 
@@ -175,9 +177,9 @@ describe("native worker round trip", () => {
       expect(await readFile(join(cwd, path), "utf8")).toBe("replacement\n");
     });
   }
-  test("debug device executes in the worker", async () => {
-    const result = await client.execute("write", "debug-device", { path: "xd://debug", content: JSON.stringify({ action: "sessions" }) });
-    expect(result).toMatchObject({ details: { xdev: { tool: "debug", mode: "execute", inner: { success: true } } } });
+  test("debug executes in the worker", async () => {
+    const result = await client.execute("debug", "debug-sessions", { action: "sessions" });
+    expect(result).not.toMatchObject({ isError: true });
   });
   test("native workspace tools share one filesystem and snapshot state", async () => {
     const writeResult = await client.execute("write", "write-1", {
@@ -223,29 +225,28 @@ describe("native worker round trip", () => {
     expect(bashText).toContain("edited remotely");
   });
 
-  test("native xdev AST edit stages and resolves in the same ToolSession", async () => {
+  test("a staged AST preview crosses the wire and resolves by id in the same worker", async () => {
     await client.execute("write", "ast-write", {
       path: "ast.ts",
       content: "const value = oldApi(1);\n",
     });
-    const preview = await client.execute("write", "ast-preview", {
-      path: "xd://ast_edit",
-      content: JSON.stringify({
-        ops: [{ pat: "oldApi($$$ARGS)", out: "newApi($$$ARGS)" }],
-        paths: ["ast.ts"],
-      }),
+    const preview = await client.execute("ast_edit", "ast-preview", {
+      ops: [{ pat: "oldApi($$$ARGS)", out: "newApi($$$ARGS)" }],
+      paths: ["ast.ts"],
     });
     expect(JSON.stringify(preview)).toContain("files NOT modified yet");
     expect(await readFile(join(cwd, "ast.ts"), "utf8")).toContain("oldApi");
+    const [staged] = takeRemotePreviews(preview);
+    expect(staged).toMatchObject({ sourceToolName: "ast_edit" });
 
-    const applied = await client.execute("write", "ast-resolve", {
-      path: "xd://resolve",
-      content: "Apply the verified structural rewrite",
+    const applied = await client.execute(REMOTE_PREVIEW_RESOLVER, "ast-resolve", {
+      id: staged!.id, action: "apply", reason: "Apply the verified structural rewrite",
     });
     expect(JSON.stringify(applied)).toContain("Applied");
     expect(await readFile(join(cwd, "ast.ts"), "utf8")).toContain("newApi");
+    await expect(client.execute(REMOTE_PREVIEW_RESOLVER, "ast-resolve-again", { id: staged!.id, action: "apply", reason: "again" }))
+      .rejects.toThrow("no longer pending");
   });
-
   test("native Python eval keeps kernel state in the remote ToolSession", async () => {
     const first = await client.execute("eval", "eval-setup", {
       language: "py",

@@ -90,9 +90,7 @@ try {
   );
 
   const lspStatus = summary(await sample(3, (index) =>
-    client.execute("write", `benchmark-lsp-${index}`, {
-      path: "xd://lsp", content: JSON.stringify({ action: "status" }),
-    }),
+    client.execute("lsp", `benchmark-lsp-${index}`, { action: "status" }),
   ));
 
   console.log(

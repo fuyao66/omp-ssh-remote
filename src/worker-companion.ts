@@ -5,12 +5,13 @@ import { disposeAllKernelSessions } from "@oh-my-pi/pi-coding-agent/eval/py/exec
 import { shutdownAll as shutdownAllLspClients } from "@oh-my-pi/pi-coding-agent/lsp/client";
 import { closeDaemonClient } from "@oh-my-pi/pi-coding-agent/daemon/client";
 import { ensureTheme } from "@oh-my-pi/pi-tui/theme";
-import { createNativeWorkerRuntime, type NativeWorkerRuntime } from "./runtime.ts";
+import { createNativeWorkerRuntime, HOST_COMMAND_INVOKER, type NativeWorkerRuntime } from "./runtime.ts";
 import { stopOwnedRemoteDaemons } from "./omp/hub-cleanup.ts";
 import { mountRemoteArtifactScheme } from "./omp/artifacts.ts";
 import { executeOwnedRemoteService, stopRemoteServiceInstance } from "./omp/service-lifecycle.ts";
 import {
   PROTOCOL_VERSION,
+  REMOTE_PREVIEW_RESOLVER,
   TOOL_RUNTIME_VERSION,
   decodeFrames,
   encodeMessage,
@@ -172,8 +173,8 @@ async function initialize(request: InitializeRequest): Promise<void> {
 }
 
 function hostInvoker(parentId: string): NonNullable<Parameters<typeof createNativeWorkerRuntime>[1]>["invokeTool"] {
-  return async (tool, toolCallId, args, signal, onUpdate) => {
-    if (!runtime || !active.has(parentId) || cleanupPromise) throw new Error("Remote Eval invocation has no active parent binding");
+  return async (tool, toolCallId, args, signal, onUpdate, _context, kind) => {
+    if (!runtime || !active.has(parentId) || cleanupPromise) throw new Error("Remote invocation has no active parent binding");
     signal?.throwIfAborted();
     const id = `invoke_${nextInvocation++}`;
     const deferred = Promise.withResolvers<unknown>();
@@ -185,7 +186,7 @@ function hostInvoker(parentId: string): NonNullable<Parameters<typeof createNati
     };
     signal?.addEventListener("abort", abort, { once: true });
     try {
-      send({ type: "invoke", id, parentId, tool, toolCallId, args, resourceBinding: runtime.resourceBinding });
+      send({ type: "invoke", id, parentId, tool, toolCallId, args, resourceBinding: runtime.resourceBinding, ...(kind ? { kind } : {}) });
       return await deferred.promise;
     } finally {
       signal?.removeEventListener("abort", abort);
@@ -199,7 +200,8 @@ function startExecute(request: ExecuteRequest): void {
   const current = runtime;
   const tool = request.bashScope
     ? current?.createJobBash(capture => sendCapture({ type: "capture", id: request.id, capture }), request.bashScope === "session")
-    : toolName === "eval" && current ? { execute: (...args: Parameters<NativeWorkerRuntime["tools"]["eval"]["execute"]>) => current.executeEval(hostInvoker(request.id)!, ...args) } : current?.tools[toolName];
+    : toolName === "eval" && current ? { execute: (...args: Parameters<NativeWorkerRuntime["tools"]["eval"]["execute"]>) => current.executeEval(hostInvoker(request.id)!, ...args) }
+    : request.tool === REMOTE_PREVIEW_RESOLVER ? current?.resolvePreview : current?.tools[toolName];
   if (!tool) {
     send({
       type: "error",
@@ -211,12 +213,15 @@ function startExecute(request: ExecuteRequest): void {
     });
     return;
   }
+  if (request.commands) current?.mountToolCommands(request.commands);
   const controller = new AbortController();
   const steering = new AbortController();
   // Steering ends only the native readiness wait; cancellation still aborts
   // the operation. No host UI, credentials or model state enters this context.
   const context = {
     ...(request.toolNames ? { toolNames: request.toolNames } : {}),
+    // The shell's tool commands return to the host under this call's own authority.
+    ...(request.tool === "bash" ? { [HOST_COMMAND_INVOKER]: hostInvoker(request.id) } : {}),
     hasUI: false,
     ...(request.steering ? { toolCall: { steeringSignal: steering.signal } } : {}),
   };

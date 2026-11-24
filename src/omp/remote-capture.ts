@@ -58,7 +58,7 @@ export class RemoteJobCapture {
 
   constructor() {
     this.streams = {
-      list: () => [...this.#pipes.values()].map(pipe => ({ ...pipe.info })),
+      list: () => [...this.#pipes.values()].map(pipe => ({ ...pipe.info, file: false })),
       read: (id: number, from?: number | null) => {
         const pipe = this.#pipes.get(id);
         if (!pipe) return null;

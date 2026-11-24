@@ -326,7 +326,6 @@ describe("remote native input policy", () => {
     try {
       for (const op of ["search_issues", "search_prs", "search_code", "search_commits"]) {
         expect(await h.tool("github", { op, query: "needle" })).toEqual({ block: true, reason: expect.stringContaining("explicit repo") });
-        expect(await h.tool("write", { path: "xd://github", content: JSON.stringify({ op, query: "needle" }) })).toEqual({ block: true, reason: expect.stringContaining("explicit repo") });
         expect(await h.tool("github", { op, repo: "example/project", query: "needle" })).toBeUndefined();
         for (const scope of ["repo:example/project", "org:example", "user:example", "owner:example", "-repo:example/excluded"]) {
           expect(await h.tool("github", { op, query: `${scope} needle` })).toBeUndefined();

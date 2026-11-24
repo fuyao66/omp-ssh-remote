@@ -25,6 +25,10 @@ export function assertNestedRemoteTool(name: string, args: Record<string, unknow
   }
 }
 
-export type NestedDispatchScope = { assertCurrent(): void };
+/**
+ * Remote code reentering host dispatch: an Eval `tool.*` callback, or (`command`) a tool command run
+ * by a remote shell. Either way a workspace tool must stay in the remote domain.
+ */
+export type NestedDispatchScope = { assertCurrent(): void; command?: boolean };
 /** Retained through the native permission/tool_call chain, including rewritten arguments. */
 export const nestedDispatchScope = new AsyncLocalStorage<NestedDispatchScope>();

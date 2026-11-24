@@ -50,7 +50,7 @@ describe("negotiated native edit language", () => {
     }, 30_000);
   }
 
-  test("none preserves native reads and leaves edit unavailable to direct, Eval, and xdev calls", async () => {
+  test("none preserves native reads and leaves edit unavailable to direct and Eval calls", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-edit-none-"));
     const client = new RemoteRuntimeClient({
       command: [process.execPath, join(import.meta.dir, "../src/worker.ts")],
@@ -65,10 +65,6 @@ describe("negotiated native edit language", () => {
       expect(runtime.session.isToolActive?.("edit")).toBe(false);
       expect(runtime.session.isToolActive?.("bash")).toBe(true);
       expect(runtime.session.getToolByName?.("edit")).toBeUndefined();
-      expect(runtime.session.getToolByName?.("xd://edit")).toBeUndefined();
-      const xdev = runtime.session.xdev;
-      if (!xdev?.resolve) throw new Error("Expected native xdev resolver");
-      expect(xdev.resolve("edit")).toBeUndefined();
       const native = new ReadTool({
         cwd, settings: Settings.isolated({ "edit.mode": "none" }), hasEditTool: false,
       } as ToolSession);
@@ -87,13 +83,6 @@ describe("negotiated native edit language", () => {
       }, undefined, undefined, { onInvoke: async () => { nestedInvocations++; throw new Error("Disabled edit reached host"); } });
       expect(nested).toMatchObject({ isError: true });
       expect(nestedInvocations).toBe(0);
-      const xdevResult = await client.execute("write", "xdev-none", {
-        path: "xd://edit", content: JSON.stringify({ path: "probe.txt", old_string: "original", new_string: "forbidden" }),
-      });
-      expect(xdevResult).toMatchObject({
-        isError: true,
-        content: [{ type: "text", text: expect.stringContaining("No such tool: xd://edit") }],
-      });
       expect(await readFile(join(cwd, "probe.txt"), "utf8")).toBe("original value\n");
       const written = await client.execute("write", "write-none", { path: "written.txt", content: "write remains available\n" });
       expect(written).not.toMatchObject({ isError: true });

@@ -1,5 +1,6 @@
 import type { DeferredDiagnosticsEntry } from "@oh-my-pi/pi-coding-agent/tools";
 import { LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { REMOTE_PREVIEW_RESOLVER } from "../protocol.ts";
 
 export type LspMutation = { sessionId: string; resourceBinding: string; path: string; version: number };
 export type LspDiagnostics = LspMutation & Omit<DeferredDiagnosticsEntry, "isStale">;
@@ -20,6 +21,8 @@ export function parseLspEvent(value: Record<string, unknown>, diagnostics: boole
 
 export function mayMutateLsp(tool: string, args: Record<string, unknown>): boolean {
   return tool === "write" || tool === "edit" || tool === "ast_edit" ||
+    // Applying a staged preview writes the files its source tool previewed.
+    (tool === REMOTE_PREVIEW_RESOLVER && args.action === "apply") ||
     (tool === "lsp" && ["rename", "rename_file", "code_actions", "request"].includes(String(args.action)));
 }
 

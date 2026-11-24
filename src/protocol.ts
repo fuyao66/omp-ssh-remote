@@ -14,7 +14,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 export const PROTOCOL_VERSION = 1 as const;
-export const TOOL_RUNTIME_VERSION = "0.16.0" as const;
+export const TOOL_RUNTIME_VERSION = "0.17.0" as const;
 export const OMP_HOST_CONTRACT_VERSION = "1" as const;
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export const REMOTE_TOOL_NAMES = [
@@ -31,6 +31,12 @@ export const REMOTE_TOOL_NAMES = [
   "debug",
 ] as const;
 export type RemoteToolName = (typeof REMOTE_TOOL_NAMES)[number];
+
+/** Execute target that applies or discards one staged worker preview, by id. */
+export const REMOTE_PREVIEW_RESOLVER = "resolve" as const;
+/** Result key naming the previews an execution staged; the host removes it before anyone sees the result. */
+export const REMOTE_PREVIEWS_KEY = "remotePreviews" as const;
+export type RemotePreview = { id: string; sourceToolName: string };
 
 export const OMP_EDIT_MODES = ["replace", "patch", "apply_patch", "hashline", "sloppy", "none"] as const;
 export type OmpEditMode = (typeof OMP_EDIT_MODES)[number];
@@ -85,7 +91,14 @@ export type ExecuteRequest = {
   steering?: boolean;
   /** Job shells are isolated; session scope preserves foreground shell state. */
   bashScope?: "job" | "session";
+  /** Host tool commands the remote shell mounts for this call (bash and Eval `sh`). */
+  commands?: ToolCommandCatalog;
 };
+
+/** One host tool command: the worker renders its help and parses argv; the host executes it. */
+export type ToolCommandSpec = { name: string; description: string; schema: Record<string, unknown> };
+/** Mounted names for one call; `specs` carries only definitions the worker has not seen yet. */
+export type ToolCommandCatalog = { names: string[]; specs?: ToolCommandSpec[] };
 
 export type InvokeMessage = {
   type: "invoke";
@@ -95,6 +108,8 @@ export type InvokeMessage = {
   tool: string;
   toolCallId: string;
   args: Record<string, unknown>;
+  /** `command`: a tool command run inside a remote shell, dispatched as the host shell would. */
+  kind?: "command";
 };
 export type InvokeReply =
   | { type: "invoke-result" | "invoke-update"; id: string; result: unknown }
@@ -174,6 +189,19 @@ function numberField(value: Record<string, unknown>, key: string): number {
 }
 
 
+function parseToolCommandCatalog(raw: unknown): ToolCommandCatalog {
+  const value = asRecord(raw, "commands");
+  if (!Array.isArray(value.names) || !value.names.every(name => typeof name === "string"))
+    throw new Error("Protocol field commands.names must be a string array");
+  if (value.specs === undefined) return { names: value.names };
+  if (!Array.isArray(value.specs)) throw new Error("Protocol field commands.specs must be an array");
+  const specs = value.specs.map(entry => {
+    const spec = asRecord(entry, "commands.specs[]");
+    return { name: stringField(spec, "name"), description: stringField(spec, "description"), schema: asRecord(spec.schema, "schema") };
+  });
+  return { names: value.names, specs };
+}
+
 export function parseRequest(raw: unknown): Request {
   const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
   const value = asRecord(parsed, "Request");
@@ -248,6 +276,7 @@ export function parseRequest(raw: unknown): Request {
       ...(toolNames === undefined ? {} : { toolNames: toolNames as string[] }),
       ...(value.steering === undefined ? {} : { steering: value.steering as boolean }),
       ...(value.bashScope === "job" || value.bashScope === "session" ? { bashScope: value.bashScope } : {}),
+      ...(value.commands === undefined ? {} : { commands: parseToolCommandCatalog(value.commands) }),
     };
   }
   if (type === "invoke-result" || type === "invoke-update") {
@@ -340,6 +369,8 @@ export function parseMessage(line: string): Message {
       resourceBinding: parseResourceBinding(value.resourceBinding),
       tool: stringField(value, "tool"), toolCallId: stringField(value, "toolCallId"),
       args: asRecord(value.args, "args"),
+      ...(value.kind === undefined ? {} : value.kind === "command" ? { kind: "command" as const }
+        : (() => { throw new Error("Protocol invoke kind must be \"command\""); })()),
     };
   }
   if (type === "invoke-cancel") return { type, id: stringField(value, "id") };

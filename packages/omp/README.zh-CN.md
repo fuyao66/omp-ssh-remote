@@ -40,7 +40,7 @@ OMP 18.12.3 审批保留本机原生文件／目录授权。远端使用哈希�
 
 组件遵循宿主 `async.widgets` 和 `widget` 模型角色配置。任务需要正在展示、运行足够久且有足够输出，短任务可能只有回退状态文字。生成规则可能增加本机模型请求，可用 `async.widgets: false` 关闭；不会在远端创建模型凭据或对话循环。
 
-远端 eval 跟随原生 19.0.1，使用 `print` 或 JS `console.log`，不再使用已移除的 `display`。较大或多行的普通对象生成 JSON 视图，小对象仍是文本。表格、Markdown 和图像数据交给本机原生 renderer，不需要远端 UI；pandas 等库须已安装在远端。JSON 值、表头／单元格、Markdown、输出锚点和回显代码都是应用数据，原样保留；artifact 发布只适配原生拥有的输出元数据及精确生成的尾注，区分完整输出与有上限的首尾样本。URI 解析只针对 read／grep 的资源路径及已有 Bash 路径简写，不插值 write 正文、eval 源码或搜索模式。
+远端 eval 跟随原生 19.1.1，使用 `print` 或 JS `console.log`，不再使用已移除的 `display`。较大或多行的普通对象生成 JSON 视图，小对象仍是文本。表格、Markdown 和图像数据交给本机原生 renderer，不需要远端 UI；pandas 等库须已安装在远端。JSON 值、表头／单元格、Markdown、输出锚点和回显代码都是应用数据，原样保留；artifact 发布只适配原生拥有的输出元数据及精确生成的尾注，区分完整输出与有上限的首尾样本。URI 解析只针对 read／grep 的资源路径及已有 Bash 路径简写，不插值 write 正文、eval 源码或搜索模式。
 
 Eval 本身就执行任意 JavaScript／Python，不是只读沙箱，也不是 `bash.patterns` 命令沙箱。原生 JS 的 `await sh(command, { cwd, timeout })` 和 Python 的 `sh(command, cwd=..., timeout=...)` 直接调用 worker 的内嵌 shell，不改写成 `tool.bash`，也不逐条请求宿主 Bash 审批。它们阻塞到命令完成，在独立于 Bash 工具的 session shell 中保留变量／函数；每次从远端 session cwd 或显式 cwd 开始，返回合并的 stdout／stderr，不做 Bash 输出精简或自动转后台。非零退出和命令超时抛出携带已捕获输出的 `ShellError`；取消 cell 会终止本次执行。原生破坏性 Git 操作保护仍然生效。helper 的准入限制不构成操作系统或进程级安全边界。
 
@@ -50,13 +50,15 @@ Eval 本身就执行任意 JavaScript／Python，不是只读沙箱，也不是 
 
 远端 Bash 的 `> out://`，以及前台 Eval 内的 `tool.write({path:"out://", ...})`／`tool.bash` 回复，使用原生 transcript 回复通道。连接时读取宿主的有效回复权限，包含显式 `out.enabled` 和原生 session 的实际 TUI 能力；子代理仍被拒绝。回复通过原生 `details.replies` 传输，不写入远端文件系统。`local://`、`skill://` 等其他本机资源不桥接到远端执行环境。远端 runtime 未提供的 extension／MCP 工具仍在本机执行，不作一刀切拦截。
 
-连接期间明确拒绝用户直接 shell（`!`/`!!`）和 Python 快捷入口，避免静默执行本机命令；请使用远端 `bash`/`eval`，或退出连接后使用本机快捷入口。未适配的 `find`、`security_scan`、`ida`（包括 xdev 入口）仍明确拒绝。原生 `checkpoint`、`rewind` 留在本机并允许使用：只修改对话历史，不回滚远端项目文件或内核状态。远端 eval 支持计算、原生 `sh` 和远端工作区工具回调，不桥接本机 agent/workpool、judge/completion、archive、browser、todo；固定工作区说明解释此边界，本机编排请用顶层工具。
+连接期间明确拒绝用户直接 shell（`!`/`!!`）和 Python 快捷入口，避免静默执行本机命令；请使用远端 `bash`/`eval`，或退出连接后使用本机快捷入口。未适配的 `find`、`security_scan`、`ida`（包括其 bash 工具命令）仍明确拒绝。原生 `checkpoint`、`rewind` 留在本机并允许使用：只修改对话历史，不回滚远端项目文件或内核状态。远端 eval 支持计算、原生 `sh` 和远端工作区工具回调，不桥接本机 agent/workpool、judge/completion、archive、browser、todo；固定工作区说明解释此边界，本机编排请用顶层工具。
+
+OMP 19.1 把不常用的工具（`ast_grep`、`ast_edit`、`debug`、`resolve` 等）改为 bash 工具命令。连接期间所有 shell 行都在远端执行，包括只由工具命令组成的行：原生 OMP 会把这类行交给宿主 bash，在本机准备执行环境（宿主 cwd、经 direnv 加载本机 `.envrc`、shell 前缀、`@path` 参数文件），因此插件让它们留在远端 shell。Eval `sh` 也挂载同一组命令。远端 shell 运行工具命令时，由 companion 解析参数，宿主按本机 shell 的方式分发：注册表工具经过原生审批、`tool_call` hook 和本插件的路由，已远端适配的工具在服务器执行，参数中的本机 URI（包括 hook 添加的）与 Eval 回调中一样失败，被拦截的工具与直接调用以相同方式失败；特殊命令 `resolve`、`reject`、`propose` 与本机一样不经过审批。只有发起调用时挂载、且宿主仍挂载的命令才会执行。暂存的 `ast_edit` 预览会镜像到宿主原生队列，`resolve`／`reject` 按 id 作用于远端预览；每个镜像在发往 worker 前即被认领，重叠的处理不会把同一预览应用两次。原生 `resolve` 作用于队首预览，因此本机有待处理预览时拒绝连接。取消执行 `resolve` 的调用（bash 调用或 Eval 单元）会停止仍在等待 worker 的应用；已开始的应用会完成，与原生一致。与原生相同，Eval `sh` 超时只结束这次 shell 运行，不结束其中启动的工具命令：它们仍归属该单元，远端时其中一条可能仍排在另一个修改操作之后。
 
 选中远端 runtime 时，原生 input hook 会拒绝 `/git`、`/commit`、`/security`、`/wt`（含 `/worktree`）、`/move`、`/add-dir`、`/remove-dir`、`/review`、`/annotate`、`/green`、`/tan`、`/cleanse`、带原生 `--until` 或 `--while` shell 条件（含 `=` 写法）的 `/loop`，以及原生 `@path` 文件引用，因为这些入口会使用本机工作区或 shell。内置命令的冒号语法，以及启用 `input.bareSlashCommands` 后的裸命令词也在防护范围内。请改用远端 `bash`／`read`，文件路径去掉 `@`；不带 shell 条件的 `/loop` 仍可使用。此防护覆盖会发出原生 input 事件的 TUI 和 RPC 提交，不覆盖启动参数、print 模式或子代理 prompt，并非完整的本机执行隔离边界。只管理宿主侧状态的命令保持可用：`/export`、`/dump`、user 或 project 作用域的 `/ssh`／`/mcp` 配置、`/omfg` 规则保存、`/advisor configure`、计划文件，以及本地 skill 或 `AGENTS.md` 指令。`/restart` 只恢复远端意图、不恢复活动连接，因此工作区工具会失败关闭，直到再次 `/remote-connect`。
 
 GitHub 仅保留明确的 API 查询操作；非搜索查询必须显式给出 `repo`，不从本机目录推断仓库。`pr_create`、`pr_checkout`、`pr_push` 和未知操作在远端模式下拒绝。
 
-截断输出保存在远端 `~/.cache/omp-ssh-remote/artifacts/<namespace>/local`。companion 在发送结果前，将生成的 `local://N.log` 链接改为 `remote-artifact://<namespace>/N`。连接到同一主机后，可用 `read` selector 或 `grep` 读取返回的 `remote-artifact://<namespace>/<id>`。远端 `bash` 经内嵌 shell 的只读 URL 文件系统解析这些引用：已审批的命令文本从不改写，外部程序拿到真实路径，写入会被拒绝。只有 worker 挂载该 scheme，宿主从不解析它。companion 正常退出时删除自己的 namespace，启动时清扫超过一小时且所属 worker 已不存在的 namespace；因此 transport 丢失遗留的 artifact 会过期，但永远不会复制到本机。本机 `local://` 仍保持本机语义。`xd://debug` 与直接 debug 一样在远端执行。
+截断输出保存在远端 `~/.cache/omp-ssh-remote/artifacts/<namespace>/local`。companion 在发送结果前，将生成的 `local://N.log` 链接改为 `remote-artifact://<namespace>/N`。连接到同一主机后，可用 `read` selector 或 `grep` 读取返回的 `remote-artifact://<namespace>/<id>`。远端 `bash` 经内嵌 shell 的只读 URL 文件系统解析这些引用：已审批的命令文本从不改写，外部程序拿到真实路径，写入会被拒绝。只有 worker 挂载该 scheme，宿主从不解析它。companion 正常退出时删除自己的 namespace，启动时清扫超过一小时且所属 worker 已不存在的 namespace；因此 transport 丢失遗留的 artifact 会过期，但永远不会复制到本机。本机 `local://` 仍保持本机语义。`debug` 工具命令与直接 debug 一样在远端执行。
 
 远端 read 登记的 Git 冲突返回 `remote-conflict://<binding>/<id>` 引用，可读取 `/ours`、`/theirs`、`/base`，或写入该引用解决远端冲突；批量写使用同一 binding 下的 `*`。裸 `conflict://` 仍属于本机会话。重连或退出后旧远端引用失效，须重新读取文件。edit 的执行域检查包含移动目的路径，跨域 `MV` 同样拒绝。
 
@@ -74,7 +76,7 @@ flowchart LR
 
 ## 环境要求
 
-- 本机 Linux 或 WSL，OMP `>=19.0.1`，并安装 Bun `1.4.4+`、npm、tar、OpenSSH 和 SCP；
+- 本机 Linux 或 WSL，OMP `>=19.1.1`，并安装 Bun `1.4.4+`、npm、tar、OpenSSH 和 SCP；
 - 远端为 glibc Linux `x86_64` 或 `aarch64`；
 - 公钥 SSH 可在 batch mode 下登录；
 - 远端项目目录已存在；
@@ -105,7 +107,7 @@ packages/omp/dist/worker-linux-arm64.sha256
 
 链接后重启 OMP。更新时重新构建 extension 和双架构 worker。停用、暂停或 reload 插件前，必须先执行 `/remote-exit`。OMP 18.12.6 的动态暂停不发送 shutdown，也没有暂停前回调；连接中直接暂停会恢复本机工具但可能保留旧 worker，插件无法在自己的 hook 一起被暂停后保证拦截或清理。
 
-当前 companion 基于 OMP 19.0.1 构建，runtime contract 为 0.16.0。daemon 完成事件改为携带原生 unit 快照；旧 companion 会重新部署，不会直接复用。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。宿主 OMP 版本与构建时验证的 SDK 版本不一致时，connect 和 reconnect 在任何 SSH 操作之前直接拒绝；用 `bun run upgrade <版本>` 完成适配。
+当前 companion 基于 OMP 19.1.1 构建，runtime contract 为 0.17.0。远端 shell 每次调用都会收到宿主挂载的工具命令，旧 companion 会重新部署，不会直接复用。构建版本来自实际安装的源码及原生依赖，不取 PATH 中的 OMP 版本。更新 runtime 依赖或采集协议时，即使工具 schema 不变也需要重建双架构 worker。原生 addon 以逐文件 zstd 形式嵌入，首次使用时解包；构建缓存按架构、版本隔离。握手失败报告具体版本、编辑语言和 schema 差异。宿主 OMP 版本与构建时验证的 SDK 版本不一致时，connect 和 reconnect 在任何 SSH 操作之前直接拒绝；用 `bun run upgrade <版本>` 完成适配。
 
 上传显式使用 `scp -O`（SCP 协议），与远端目标路径的 shell 转义保持一致；OpenSSH 9+ 默认的 SFTP 会把这些引号当作文件名字符。本机 SCP 客户端须支持 `-O`。
 
@@ -170,7 +172,7 @@ bun run build:worker:all
 
 后续连接完整校验并复用，不重复上传。原型每次复用仍计算本机 archive 和远端全部文件哈希，有额外 I/O，不宣称 sidecar 快速路径。Pack **暂不自动 GC**，不参与 worker 的“两代”回收。损坏最终目录只拒绝，不覆盖、不递归删除；需要修复时停止使用者后由操作者仅处理报错的具体目录。
 
-原生 LSP 的项目标记、惰性启动、定义／引用、编辑诊断与 reload 保持不变。项目本地／PATH server 优先；仅原生默认 Pyright 缺失时补充私有 launcher。显式 Pyright `command`、`disabled`、fileTypes／rootMarkers 不覆盖；显式选择的其他 Python 语义 server 即使命令缺失也不额外补 Pyright，已安装 basedpyright／pylsp／其他 Python 语义 server 同样优先，Ruff 单独存在不阻止补充。仅修改 Pyright settings 可使用 fallback。Worker 构建对 SDK **19.0.1** 的 config loader 做小范围编译期适配，版本或源码锚点变化即构建失败；不编辑安装的 OMP 源码、不 monkeypatch 运行时导出。
+原生 LSP 的项目标记、惰性启动、定义／引用、编辑诊断与 reload 保持不变。项目本地／PATH server 优先；仅原生默认 Pyright 缺失时补充私有 launcher。显式 Pyright `command`、`disabled`、fileTypes／rootMarkers 不覆盖；显式选择的其他 Python 语义 server 即使命令缺失也不额外补 Pyright，已安装 basedpyright／pylsp／其他 Python 语义 server 同样优先，Ruff 单独存在不阻止补充。仅修改 Pyright settings 可使用 fallback。Worker 构建对 SDK **19.1.1** 的 config loader 做小范围编译期适配，版本或源码锚点变化即构建失败；不编辑安装的 OMP 源码、不 monkeypatch 运行时导出。
 
 分析环境由远端已有 `pyrightconfig.json`／`pyproject.toml` 决定。需要显式指定远端解释器时，可自行在项目原生 `lsp.json` 中配置 settings，不设置 `command`：
 
@@ -204,7 +206,7 @@ bun scripts/prepare-typescript-lsp.ts arm64  # 或 x64
 
 写入／编辑的迟到诊断通过宿主原生 yield queue 交付，严格绑定所属会话和连接。保留原生去重，消费时根据版本拒绝过期结果。修改类工具串行执行至实际操作完成，并以文件内容修订覆盖原生 LSP／AST 未更新 mutation counter 的情况。取消仍会协作传递，但须等进行中的原生修改实际完成，才释放诊断交付屏障。
 
-Worker 构建仅对 SDK 19.0.1 做严格锚点匹配的配置后备与修改完成适配，同时修正原生单文件／批量 writethrough 的完成判定：只承载格式化状态、尚未验证的诊断占位结果不能取消迟到诊断等待；已验证的行内正常／错误结果仍按原生方式完成。源码漂移即构建失败，不修改已安装的宿主 SDK。
+Worker 构建仅对 SDK 19.1.1 做严格锚点匹配的配置后备与修改完成适配，同时修正原生单文件／批量 writethrough 的完成判定：只承载格式化状态、尚未验证的诊断占位结果不能取消迟到诊断等待；已验证的行内正常／错误结果仍按原生方式完成。源码漂移即构建失败，不修改已安装的宿主 SDK。
 
 ## 可选私有 C/C++ LSP Pack
 
@@ -286,15 +288,15 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 ## 限制
 
 - 仅支持 Linux glibc x86_64 和 ARM64；
-- OMP `>=19.0.1`，且 companion schema 匹配；
+- OMP `>=19.1.1`，且 companion schema 匹配；
 - 会话以 `edit.mode=none` 启动时不暴露 Edit；之后启用须重启会话，既有未绑定工具门控会阻止执行，不回退本机；
 - 远端须有 util-linux 的 `flock`，用于保护活跃 worker 可执行文件；
 - 支持显式 async Bash 和符合条件的自动后台化，不桥接交互 Bash PTY；
 - 不支持远端图像问答（`?q=`）；请直接读取图像，将像素交给模型；
 - `tools.restrictedFolders` 适用于原生本机资源，尚未实现远端文件系统的目录限制审批；
-- 保留原生宿主审批及 enabled-tool 门控，但 SDK 19.0.1 的公开 AgentSession API 不暴露有效 `ToolSession.lspReadOnly`／`deviceOnlyWrite` 策略，无法镜像这些字段的显式会话级覆盖；不要将此版本当作只读沙箱。AgentRef 的只读历史元数据不是执行策略。
+- 保留原生宿主审批及 enabled-tool 门控，但 SDK 19.1.1 的公开 AgentSession API 不暴露有效 `ToolSession.lspReadOnly`／`deviceOnlyWrite` 策略，无法镜像这些字段的显式会话级覆盖；不要将此版本当作只读沙箱。AgentRef 的只读历史元数据不是执行策略。
 - Bash 的 `notify`（SDK 19.0 新增）没有远端投递通道。远端 Bash 调用只要带非空 `notify`，就在创建任何 job 或服务之前报错 “notify is unavailable in remote workspaces.”；请改为轮询 `proc://` 或 job。
-- SDK 19.0.1 不向注册工具传递 `toolCall`，远端 read 无法等待原生 `earlierEffectsSettled`。因此路由到远端的 read 按 exclusive 调度：等同批次中先前的调用结束再执行，多个远端 read 之间也会串行。本机 read 保持原生 shared 调度。
+- SDK 19.1.1 不向注册工具传递 `toolCall`，远端 read 无法等待原生 `earlierEffectsSettled`。因此路由到远端的 read 按 exclusive 调度：等同批次中先前的调用结束再执行，多个远端 read 之间也会串行。本机 read 保持原生 shared 调度。
 - 不支持 `task isolated:true` 远端 worktree；
 - 不支持远端到本机 artifact bridge；
 - 白名单之外的 settings 在 companion 中保持编译默认值，不提供任意 settings 透传；
@@ -307,6 +309,7 @@ runner 先通过 RPC `get_available_commands` 验证扩展命令注册，再在�
 - 原生 hooks 和 `pi.exec` 在本机执行；
 - 远端 Bash 自动转入后台后仍可能接受 `out://`，与原生后台执行不同；
 - 远端 AST 预览不执行原生待处理预览的提醒和升级约束；
+- `edit.mode=magic`（SDK 19.1 新增）由宿主模型代写每次编辑；选中时拒绝 connect、reconnect 和子代理继承，并在每轮开始前阻止。请改用其他编辑模式，或先 `/remote-exit`。
 - 连接和每轮开始前会拒绝 Cursor 模型及当前使用 Cursor 的 advisor。经 `tool_call` 的 advisor 工作区调用会被阻止，但 Cursor advisor 的直接操作绕过该 hook；后续 advisor 模型变化不受持续门控，绑定期间不支持此类用法；
 - 启用 autoresearch 工具时拒绝连接；原生未暴露私有的实验运行状态，请先关闭 autoresearch 并等待已有实验停止；
 - browser、desktop、模型凭据、memory 和本机 session 控制面不进入远端。

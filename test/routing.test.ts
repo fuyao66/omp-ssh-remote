@@ -4,7 +4,6 @@ import {
   remoteControlPlaneBlockReason,
   remoteSessionNavigationBlockReason,
   sessionBelongsToFamily,
-  stagedProposal,
   taskRequestsIsolation,
 } from "../src/extension.ts";
 
@@ -189,7 +188,6 @@ describe("remote session boundaries", () => {
   test("keeps native conversation checkpoints local while blocking workspace scans", () => {
     for (const name of ["checkpoint", "rewind"]) {
       expect(remoteControlPlaneBlockReason(name, {})).toBeUndefined();
-      expect(remoteControlPlaneBlockReason("write", { path: `xd://${name}` })).toBeUndefined();
     }
     for (const name of ["find", "security_scan", "ida"]) expect(remoteControlPlaneBlockReason(name, {})).toContain("not remote-adapted");
   });
@@ -242,7 +240,7 @@ describe("remote workspace status", () => {
         clientClosed: false,
         owner: false,
         wrappedTools: [],
-        proposalSources: [],
+        pendingRemotePreviews: 0,
       }),
     ).toMatchObject({
       mode: "local",
@@ -269,7 +267,7 @@ describe("remote workspace status", () => {
         remoteCwd: "/srv/project",
         owner: true,
         wrappedTools: ["bash", "read", "write"],
-        proposalSources: ["remote", "local", "remote"],
+        pendingRemotePreviews: 2,
       }),
     ).toMatchObject({
       mode: "remote",
@@ -300,7 +298,7 @@ describe("remote workspace status", () => {
         remoteCwd: "/srv/project",
         owner: false,
         wrappedTools: ["read"],
-        proposalSources: [],
+        pendingRemotePreviews: 0,
       }),
     ).toMatchObject({
       mode: "unavailable",
@@ -317,37 +315,9 @@ describe("remote workspace status", () => {
   test("status returns only the supplied last-deployment snapshot and hides it in local mode", async () => {
     const { workspaceStatus } = await import("../src/extension.ts");
     const cacheAudit = { available: false as const, observedAt: "2026-10-01T00:00:00.000Z", warning: "Worker cache audit unavailable" };
-    const input = { selected: true, clientPresent: true, clientClosed: false, owner: true, wrappedTools: [], proposalSources: [], cacheAudit };
+    const input = { selected: true, clientPresent: true, clientClosed: false, owner: true, wrappedTools: [], pendingRemotePreviews: 0, cacheAudit };
     expect(workspaceStatus(input).cacheAudit).toEqual(cacheAudit);
     expect(workspaceStatus({ ...input, cacheAudit: undefined }).cacheAudit).toBeNull();
     expect(workspaceStatus({ ...input, selected: false }).cacheAudit).toBeNull();
-  });
-});
-
-describe("AST proposal tracking", () => {
-  test("recognizes top-level and xdev-wrapped native AST previews", () => {
-    expect(
-      stagedProposal({
-        content: [],
-        details: { applied: false, totalReplacements: 1 },
-      }),
-    ).toBe(true);
-    expect(
-      stagedProposal({
-        content: [],
-        details: {
-          xdev: {
-            tool: "ast_edit",
-            inner: { applied: false, totalReplacements: 2 },
-          },
-        },
-      }),
-    ).toBe(true);
-    expect(
-      stagedProposal({
-        content: [],
-        details: { applied: true, totalReplacements: 1 },
-      }),
-    ).toBe(false);
   });
 });

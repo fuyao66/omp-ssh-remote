@@ -167,8 +167,8 @@ export default async function lifecycleSmoke(pi: ExtensionAPI) {
       for await (const event of batch) if (event.type === "tool_execution_end" && event.toolName === "read") batchRead = { text: text(event.result), isError: event.isError };
       assert(batchRead && !batchRead.isError && batchRead.text.includes("new") && !batchRead.text.includes("old"), `same-batch read saw ${JSON.stringify(batchRead)}`);
       console.log("BATCH_READ_AFTER_BASH_PASS");
-      assert(text(await invoke("read", { path: "xd://read/sources" })).length > 0);
-      console.log("XD_DOC_TOPICS_PASS");
+      assert(text(await invoke("read", { path: "help://read/sources" })).length > 0);
+      console.log("HELP_DOC_TOPICS_PASS");
       for (const language of ["js", "py"]) assert(text(await invoke("eval", { language, code: "print(6 * 7)", title: "upgrade compute" })).includes("42"));
       assert(text(await invoke("lsp", { action: "status" })).length > 0);
       const output = text(await invoke("bash", { command: "seq 1 20000" }));

@@ -256,10 +256,10 @@ describe("remote async bash job bridge", () => {
     update(textResult("rendered preview, not bytes"));
     expect(job.widgetInputs?.sources()[0]?.read(0).text).toBe("");
     capture({ kind: "output", start: 0, end: 3, text: "raw", open: true });
-    capture({ kind: "pipe", info: { id: 7, producer: "printf raw", consumer: "cat", total: 3, open: true }, start: 0, end: 3, dataBase64: Buffer.from("raw").toString("base64") });
+    capture({ kind: "pipe", info: { id: 7, producer: "printf raw", consumer: "cat", total: 3, open: true, modified: 0 }, start: 0, end: 3, dataBase64: Buffer.from("raw").toString("base64") });
     expect(scope).toBe("job");
     expect(job.process).toMatchObject({ command: "printf raw | cat", cwd: "/srv" });
-    expect(job.process?.streams?.list()).toEqual([{ id: 7, producer: "printf raw", consumer: "cat", total: 3, open: true }]);
+    expect(job.process?.streams?.list()).toEqual([{ id: 7, producer: "printf raw", consumer: "cat", total: 3, open: true, file: false, modified: 0 }]);
     expect(job.process?.streams?.read(7, 0)?.data.toString()).toBe("raw");
     expect(job.widgetInputs?.sources()[0]?.read(0)).toMatchObject({ text: "raw", start: 0, end: 3, open: true });
     expect(job.widgetInputs?.sources()).toHaveLength(2);

@@ -15,19 +15,26 @@ import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { GlobTool } from "@oh-my-pi/pi-coding-agent/tools/glob";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
-import { createXdevState, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import type { Tool, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { specialToolCommands } from "@oh-my-pi/pi-coding-agent/tools/resolve";
+import type { ToolCommandState } from "@oh-my-pi/pi-coding-agent/tools/tool-commands";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import type { DaemonCompletionEvent } from "@oh-my-pi/pi-coding-agent/daemon/protocol";
 import { drainAbortedShells, releaseShellSessions } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
-import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
+import type { EditModeSetting } from "@oh-my-pi/pi-coding-agent/edit/settings";
 import {
+  REMOTE_PREVIEW_RESOLVER,
+  REMOTE_PREVIEWS_KEY,
   REMOTE_TOOL_NAMES,
   parseResourceBinding,
   isRecord,
+  type RemotePreview,
   type RemoteToolName,
   type OmpEditMode,
   type ToolManifest,
+  type ToolCommandCatalog,
 } from "./protocol.ts";
 import { assertNestedRemoteTool, NESTED_TOOL_NAMES } from "./nested-dispatch.ts";
 import { createRemoteArtifacts } from "./omp/artifacts.ts";
@@ -71,27 +78,77 @@ const WORKER_OVERRIDES = {
   "memory.backend": "off",
   "eval.py": true,
   "eval.js": true,
-  "tools.xdev": false,
+  "tools.commands": false,
   "debug.enabled": true,
   // `git worktree add` would otherwise be rewritten into `<worker binary>
   // worktree add ...`, which the companion binary does not implement.
   "worktree.clone": false,
 } as const;
 
+/**
+ * Native preview handlers indexed by id. The host mirrors each staged preview into its own
+ * ToolChoiceQueue, so native `resolve`/`reject` there must reach exactly this entry, never
+ * whichever worker preview happens to be newest.
+ */
+class RemotePreviewQueue extends ToolChoiceQueue {
+  readonly #handlers = new Map<string, (input: unknown) => unknown>();
+  readonly #staging = new AsyncLocalStorage<RemotePreview[]>();
+  override registerPendingInvoker(id: string, sourceToolName: string, onInvoked: (input: unknown) => unknown): void {
+    super.registerPendingInvoker(id, sourceToolName, onInvoked);
+    this.#handlers.set(id, onInvoked);
+    this.#staging.getStore()?.push({ id, sourceToolName });
+  }
+  override removePendingInvoker(id: string): void {
+    super.removePendingInvoker(id);
+    this.#handlers.delete(id);
+  }
+  override clearPendingInvokers(): void {
+    super.clearPendingInvokers();
+    this.#handlers.clear();
+  }
+  override clear(): void {
+    super.clear();
+    this.#handlers.clear();
+  }
+  async staging<T>(run: () => Promise<T>): Promise<[T, RemotePreview[]]> {
+    const staged: RemotePreview[] = [];
+    return [await this.#staging.run(staged, run), staged];
+  }
+  /** Native onInvoked consumes the entry, or keeps it pending after a failed apply. */
+  resolveStaged(id: string, input: unknown): unknown {
+    const handler = this.#handlers.get(id);
+    if (!handler) throw new Error("This staged preview is no longer pending in the remote runtime.");
+    return handler(input);
+  }
+}
+
 export type NativeWorkerRuntime = {
   cwd: string;
   /** Effective native process owner, resolved once for this runtime. */
   sessionId: string;
   tools: Readonly<Record<RemoteToolName, RemoteNativeTool>>;
+  /** Applies or discards one staged preview by worker id; never staged itself. */
+  resolvePreview: RemoteNativeTool;
   editMode: OmpEditMode;
   resourceBinding: string;
   session: ToolSession;
   executeEval: (invoke: NonNullable<NativeWorkerRuntimeOptions["invokeTool"]>, ...args: Parameters<RemoteNativeTool["execute"]>) => Promise<unknown>;
   createJobBash: (onCapture: JobCaptureSender, foreground?: boolean) => RemoteNativeTool;
   stopService: (name: string, id: string) => Promise<ServiceStopReceipt>;
+  /** Replaces the host tool commands remote shells mount; specs accumulate across calls. */
+  mountToolCommands: (catalog: ToolCommandCatalog) => void;
   /** Native session teardown for this owner: tool dispose callbacks, cancelled-shell drain, shells, artifacts. Idempotent. */
   dispose: () => Promise<void>;
 };
+
+/**
+ * Host-authorized reentry from a running remote call: a nested Eval tool call, or with
+ * `kind: "command"` a tool command that a remote shell (bash, Eval `sh`) invoked.
+ */
+export type HostInvoke = (name: string, ...args: [...Parameters<RemoteNativeTool["execute"]>, kind?: "command"]) => Promise<unknown>;
+
+/** Call-context key carrying a remote bash call's {@link HostInvoke} to the tool commands its shell runs. */
+export const HOST_COMMAND_INVOKER = "remoteHostCommandInvoker" as const;
 
 export type NativeWorkerRuntimeOptions = {
   /** Owner identity for remote supervised processes (local OMP session id). */
@@ -114,8 +171,7 @@ export type NativeWorkerRuntimeOptions = {
   /** Shared workspace resource namespace; independent runtimes get a fresh id. */
   resourceBinding?: string;
   /** Host-authorized invocation; omitted in frontend schema-only snapshots. */
-  invokeTool?: RemoteNativeTool["execute"] extends (...args: infer A) => infer R
-    ? (name: RemoteToolName, ...args: A) => R : never;
+  invokeTool?: HostInvoke;
   /** Worker-only daemon adapter; frontend schema snapshots do not need it. */
   serviceLifecycle?: {
     execute: typeof executeOwnedRemoteService;
@@ -156,15 +212,33 @@ export async function createNativeWorkerRuntime(
     if (!entry.isStale()) options.onDeferredDiagnostics?.({ sessionId, resourceBinding, path: entry.path,
       version: mutationVersions.get(entry.path) ?? 0, summary: entry.summary, messages: entry.messages, errored: entry.errored });
   });
-  const pendingInvokers = new ToolChoiceQueue();
-  const xdevTools = new Map<string, Tool>();
-  const xdevMountedNames = new Set<string>(["lsp", "ast_grep", "ast_edit", "debug"]);
+  const previews = new RemotePreviewQueue();
   const callableTools = new Map<string, RemoteNativeTool>();
   type EvalLease = { invoke: NonNullable<NativeWorkerRuntimeOptions["invokeTool"]>; active: boolean };
   let evalLease: EvalLease | undefined;
   let evalQueue: Promise<void> = Promise.resolve();
   const disposeCallbacks = new Set<() => void>();
   const conflictHistory = new RemoteConflictHistory();
+  // Host tool commands mounted in remote shells. The worker renders help and parses argv
+  // natively; execution always returns to the host, as a host shell would dispatch it.
+  const commandSpecs = new Map<string, Tool>();
+  const forwardCommand = (tool: Tool): Tool => Object.assign(Object.create(tool) as Tool, {
+    execute: (...args: Parameters<RemoteNativeTool["execute"]>) => {
+      const context = isRecord(args[4]) ? args[4] : {};
+      const callerInvoke = context[HOST_COMMAND_INVOKER];
+      const invoke = typeof callerInvoke === "function" ? callerInvoke as HostInvoke
+        : evalLease?.active ? evalLease.invoke : undefined;
+      if (!invoke) throw new ToolError(`${tool.name}: tool commands need an active host call`);
+      return invoke(tool.name, ...args, "command");
+    },
+  });
+  const toolCommands: ToolCommandState = {
+    tools: new Map(),
+    mountedNames: new Set(),
+    builtInNames: new Set(),
+    isActive: () => false,
+    decorateExecution: forwardCommand,
+  };
   const session: ToolSession = {
     cwd: absoluteCwd,
     hasUI: false,
@@ -173,6 +247,7 @@ export async function createNativeWorkerRuntime(
     enableMCP: false,
     hasEditTool: resolveEditMode({ settings }) !== "none",
     restrictToolNames: true,
+    toolCommands,
     settings,
     taskDepth: options.taskDepth ?? 0,
     state: { conflictHistory },
@@ -214,8 +289,7 @@ export async function createNativeWorkerRuntime(
       (name !== "lsp" || cfgLspEnabled.get(settings)) &&
       REMOTE_TOOL_NAMES.includes(name as (typeof REMOTE_TOOL_NAMES)[number]),
     getToolByName: name => {
-      const bareName = stripXdUrlPrefix(name);
-      const tool = callableTools.get(bareName) ?? [...callableTools.values()].find(tool => tool.customWireName === bareName);
+      const tool = callableTools.get(name) ?? [...callableTools.values()].find(tool => tool.customWireName === name);
       if (!tool) return undefined;
       // Native JS/Python resolve ordinary tools synchronously while their
       // per-run registration is still active. Snapshot ownership at lookup,
@@ -226,23 +300,25 @@ export async function createNativeWorkerRuntime(
         async execute(...args: Parameters<RemoteNativeTool["execute"]>) {
           args[2]?.throwIfAborted();
           if (lease && (!lease.active || evalLease !== lease)) throw new Error("Remote Eval invocation lease is no longer active");
-          assertNestedRemoteTool(tool.name, args[1], resourceBinding, resolveEditMode(session));
+          assertNestedRemoteTool(tool.name, args[1], resourceBinding, editMode);
           const invoke = lease?.invoke ?? options.invokeTool;
           if (!invoke) throw new Error("Remote Eval nested tools require the host invocation bridge");
           return invoke(tool.name as RemoteToolName, ...args);
         },
       } as unknown as ReturnType<NonNullable<ToolSession["getToolByName"]>>;
     },
-    getToolChoiceQueue: () => pendingInvokers,
-    peekPendingInvoker: () => pendingInvokers.peekPendingInvoker(),
-    clearPendingInvokers: () => pendingInvokers.clearPendingInvokers(),
+    getToolChoiceQueue: () => previews,
+    peekPendingInvoker: () => previews.peekPendingInvoker(),
+    clearPendingInvokers: () => previews.clearPendingInvokers(),
   };
-  session.xdev = createXdevState(session, xdevTools, new Set(xdevMountedNames), xdevMountedNames);
-  const editMode = resolveEditMode(session);
-  if (options.editMode !== undefined && editMode !== options.editMode) {
+  const resolvedEditMode: EditModeSetting = resolveEditMode(session);
+  if (resolvedEditMode === "magic" || (options.editMode !== undefined && resolvedEditMode !== options.editMode)) {
     await artifacts.dispose();
-    throw new Error(`Remote edit mode ${editMode} conflicts with negotiated ${options.editMode}; pin PI_EDIT_VARIANT before creating the worker runtime`);
+    throw new Error(resolvedEditMode === "magic"
+      ? "edit.mode=magic needs a host model and is unavailable in the remote runtime"
+      : `Remote edit mode ${resolvedEditMode} conflicts with negotiated ${options.editMode}; pin PI_EDIT_VARIANT before creating the worker runtime`);
   }
+  const editMode: OmpEditMode = resolvedEditMode;
 
   // The fixed handshake inventory retains metadata for setting-gated tools.
   // Native EditTool already uses replace metadata while edit.mode=none; keep
@@ -305,14 +381,15 @@ export async function createNativeWorkerRuntime(
       const serviceName = tool.name === "bash" && typeof resolved.name === "string" ? resolved.name.trim() : "";
       const callContext = isRecord(context) ? context : {};
       const toolCall = isRecord(callContext.toolCall) ? callContext.toolCall : {};
-      const result = artifacts.publish(
-        serviceName && options.serviceLifecycle
-          ? await options.serviceLifecycle.execute(absoluteCwd, sessionId, serviceName, (steeringSignal) =>
-            executeMutation(id, resolved, undefined, update, { ...callContext, toolCall: { ...toolCall, steeringSignal } }),
-            signal, toolCall.steeringSignal instanceof AbortSignal ? toolCall.steeringSignal : undefined)
-          : await executeMutation(id, resolved, signal, update, context),
-        tool.name,
-      );
+      const run = () => serviceName && options.serviceLifecycle
+        ? options.serviceLifecycle.execute(absoluteCwd, sessionId, serviceName, (steeringSignal) =>
+          executeMutation(id, resolved, undefined, update, { ...callContext, toolCall: { ...toolCall, steeringSignal } }),
+          signal, toolCall.steeringSignal instanceof AbortSignal ? toolCall.steeringSignal : undefined)
+        : executeMutation(id, resolved, signal, update, context);
+      // A failed apply re-registers its own entry inside the resolver: that is not a new preview.
+      const [raw, staged] = tool.name === REMOTE_PREVIEW_RESOLVER ? [await run(), []] : await previews.staging(run);
+      const result = artifacts.publish(raw, tool.name);
+      if (staged.length > 0 && isRecord(result)) result[REMOTE_PREVIEWS_KEY] = staged;
       // Bind only after native artifact footers have been published. Eval's
       // tool.read(...).text then carries owned references without metadata.
       return tool.name === "read"
@@ -331,8 +408,29 @@ export async function createNativeWorkerRuntime(
       execute: async () => { throw new Error("Eval callable tools must resolve an invocation lease"); },
     });
   }
-  for (const name of xdevMountedNames)
-    xdevTools.set(name, tools[name as RemoteToolName] as Tool);
+  const resolvePreview = publishTool({
+    name: REMOTE_PREVIEW_RESOLVER,
+    description: "Apply or discard one staged preview by its remote id.",
+    parameters: {},
+    execute: async (_id, params) => previews.resolveStaged(String(params.id), { action: params.action, reason: params.reason }),
+  });
+  const workerSpecials = new Set(specialToolCommands(session).map(tool => tool.name));
+  const mountToolCommands = (catalog: ToolCommandCatalog) => {
+    for (const spec of catalog.specs ?? []) {
+      commandSpecs.set(spec.name, {
+        name: spec.name, label: spec.name, description: spec.description, parameters: spec.schema,
+        execute: async () => { throw new ToolError(`${spec.name} runs only through host dispatch`); },
+      } as unknown as Tool);
+    }
+    // Native resolve/reject/propose run here and forward through the same decorator.
+    const names = catalog.names.filter(name => !workerSpecials.has(name) && commandSpecs.has(name));
+    toolCommands.tools.clear();
+    toolCommands.mountedNames.clear();
+    for (const name of names) {
+      toolCommands.tools.set(name, commandSpecs.get(name)!);
+      toolCommands.mountedNames.add(name);
+    }
+  };
   let disposed: Promise<void> | undefined;
   // Mirrors the execution-side part of native AgentSession.dispose: registered
   // tool callbacks (service completion subscriptions), then the delayed TERM→KILL
@@ -348,7 +446,7 @@ export async function createNativeWorkerRuntime(
     await artifacts.dispose();
   })());
   return {
-    cwd: absoluteCwd, sessionId, tools, session, editMode, resourceBinding, dispose,
+    cwd: absoluteCwd, sessionId, tools, resolvePreview, session, editMode, resourceBinding, dispose, mountToolCommands,
     executeEval: async (invoke, ...args) => {
       // Eval is natively exclusive. Serialize only Eval runs, never the native
       // workspace requests that a leased Eval reenters through the host.

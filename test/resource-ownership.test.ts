@@ -58,7 +58,6 @@ describe("shared host resource ownership", () => {
     expect(() => resourceOwnershipTarget("read", { path: conflict, file: "proc://bg_1" }, state)).toThrow("Mixed local and remote");
     expect(() => resourceOwnershipTarget("read", { paths: ["proc://bg_1", conflict] }, state)).toThrow("Mixed local and remote");
     expect(resourceOwnershipTarget("write", { path: conflict, content: "proc://bg_1" }, state)).toBe("remote");
-    expect(resourceOwnershipTarget("write", { path: "xd://resolve", content: conflict }, state)).toBeUndefined();
   });
 
   test("native edit inspection exposes destinations without guessing path syntax", () => {

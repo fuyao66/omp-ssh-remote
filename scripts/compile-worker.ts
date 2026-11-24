@@ -92,7 +92,8 @@ for (const [index, file] of addonFiles.entries()) {
   await Bun.write(zstdPath, Bun.zstdCompressSync(addon));
   imports.push(`import zstdPath${index} from ${JSON.stringify(zstdPath)} with { type: "file" };`);
   fileSpecs.push(
-    `{ variant: ${JSON.stringify(file.variant)}, filename: ${JSON.stringify(file.filename)}, size: ${addon.byteLength}, zstdPath: zstdPath${index} }`,
+    // The native loader extracts into `embedded-<hash>/`; this mirrors upstream embed-native.ts.
+    `{ variant: ${JSON.stringify(file.variant)}, filename: ${JSON.stringify(file.filename)}, size: ${addon.byteLength}, hash: ${JSON.stringify(Bun.hash.xxHash64(addon).toString(16).padStart(16, "0"))}, zstdPath: zstdPath${index} }`,
   );
 }
 await writeFile(

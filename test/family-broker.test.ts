@@ -77,7 +77,7 @@ function makeFamily(ownerSessionFile: string): Family {
 function makeMember(family: Family, sessionFile: string, owner = false): Member {
   return {
     binding: crypto.randomUUID(), sessionFile, localCwd: family.localCwd, remoteCwd: family.remoteCwd,
-    selected: true, owner, family, wrappedTools: new Set(), proposalSources: [], activeToolNames: () => [],
+    selected: true, owner, family, wrappedTools: new Set(), remotePreviews: [], activeToolNames: () => [],
   };
 }
 

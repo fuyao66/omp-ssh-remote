@@ -21,7 +21,6 @@ import { createNativeWorkerRuntime, type RemoteNativeTool } from "../src/runtime
 import { getRemoteFamilyBroker } from "../src/family-broker.ts";
 import remoteRuntimeExtension, {
   closeRemoteFamily,
-  consumedResolution,
   type RemoteWorkspaceStatus,
 } from "../src/extension.ts";
 
@@ -446,7 +445,7 @@ describe("extension workspace architecture", () => {
       owner,
       family,
       wrappedTools: new Set(),
-      proposalSources: [],
+      remotePreviews: [],
       activeToolNames: () => [],
       client: {
         isClosed: false,
@@ -489,31 +488,19 @@ describe("extension workspace architecture", () => {
 
       for (const op of ["pr_checkout", "pr_push", "pr_create", "unknown_operation"]) {
         const params = { op, repo: "owner/repo" };
-        for (const call of [
-          { toolName: "github", input: params },
-          { toolName: "write", input: { path: "xd://github", content: JSON.stringify(params) } },
-        ]) {
+        for (const call of [{ toolName: "github", input: params }]) {
           expect(await grandchild.emit("tool_call", call)).toMatchObject({
             block: true,
             reason: expect.stringContaining("not remote-adapted"),
           });
         }
       }
-      for (const call of [
-        { toolName: "github", input: { op: "repo_view" } },
-        { toolName: "write", input: { path: "xd://github", content: JSON.stringify({ op: "repo_view" }) } },
-      ]) {
+      for (const call of [{ toolName: "github", input: { op: "repo_view" } }]) {
         expect(await grandchild.emit("tool_call", call)).toMatchObject({ block: true });
       }
-      expect(await grandchild.emit("tool_call", { toolName: "read", input: { path: "xd://github" } }))
-        .toBeUndefined();
       expect(await grandchild.emit("tool_call", {
         toolName: "github",
         input: { op: "repo_view", repo: "owner/repo" },
-      })).toBeUndefined();
-      expect(await grandchild.emit("tool_call", {
-        toolName: "write",
-        input: { path: "xd://github", content: JSON.stringify({ op: "repo_view", repo: "owner/repo" }) },
       })).toBeUndefined();
       expect((await grandchild.status()).mode).toBe("unavailable");
       expect(child.selected).toBe(true);
@@ -544,29 +531,3 @@ describe("extension workspace architecture", () => {
   });
 });
 
-describe("native resolution consumption", () => {
-  test("returned apply/discard details consume pending entries even for business errors", () => {
-    for (const [tool, action] of [["resolve", "apply"], ["reject", "discard"]]) {
-      for (const isError of [false, true]) {
-        expect(consumedResolution({
-          content: [],
-          isError,
-          details: { xdev: { tool, inner: { action, sourceToolName: "ast_edit" } } },
-        })).toBe(true);
-      }
-    }
-  });
-
-  test("help, empty queues, incomplete details, and unrelated devices do not consume", () => {
-    for (const result of [
-      { content: [] },
-      { content: [], details: { xdev: { tool: "resolve", inner: { action: "help" } } } },
-      { content: [], details: { xdev: { tool: "reject", inner: { action: "none", pending: 0 } } } },
-      { content: [], isError: true, details: { xdev: { tool: "resolve", inner: {} } } },
-      { content: [], details: { xdev: { tool: "resolve", inner: { action: "apply" } } } },
-      { content: [], details: { xdev: { tool: "ast_edit", inner: { action: "apply", sourceToolName: "ast_edit" } } } },
-    ]) {
-      expect(consumedResolution(result)).toBe(false);
-    }
-  });
-});

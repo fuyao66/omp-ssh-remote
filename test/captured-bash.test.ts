@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
@@ -47,7 +47,6 @@ function session(overrides: Partial<ToolSession> = {}): ToolSession {
       "memory.backend": "off",
       "eval.py": true,
       "eval.js": true,
-      "tools.xdev": false,
       "debug.enabled": true,
       "worktree.clone": false,
     }),
@@ -181,6 +180,27 @@ describe.each([false, true])("private native BashTool capture foreground=%s", (f
     assertCaptureContracts(captures);
   });
 
+  test("excludes redirected files from pipe membership and chunks", async () => {
+    const captures: JobCapturePayload[] = [];
+    const file = `redirect-${randomUUID()}.txt`;
+    const tool = createCapturedBashTool(session(), async (capture) => { captures.push(capture); }, foreground);
+    await tool.execute("redirected-pipeline", { command: `printf 'PIPE_FIRST\\nFILE_LAST\\n' | tail -n 1 > ${file}` });
+    expect(await readFile(join(cwd, file), "utf8")).toBe("FILE_LAST\n");
+
+    const pipes = captures.filter((capture) => capture.kind === "pipe");
+    const pipe = pipes.find((capture) => capture.info.consumer.startsWith("tail -n 1"));
+    expect(pipe).toBeDefined();
+    expect(pipe!.info.file).toBe(false);
+    expect(pipe!.info.modified).toBeGreaterThan(0);
+    const ids = captures.filter((capture) => capture.kind === "pipes").flatMap((capture) => capture.ids);
+    expect({
+      membership: [...new Set(ids)],
+      chunks: [...new Set(pipes.map((capture) => capture.info.id))],
+    }).toEqual({ membership: [pipe!.info.id], chunks: [pipe!.info.id] });
+    expect(Buffer.concat(pipes.map((capture) => Buffer.from(capture.dataBase64, "base64"))).toString())
+      .toBe("PIPE_FIRST\nFILE_LAST\n");
+  });
+
   test("preserves binary pipe bytes that cannot be reconstructed from a text preview", async () => {
     const captures: JobCapturePayload[] = [];
     const bytes = Buffer.from([0, 255, 128, 13, 10, 27, 65]);
@@ -298,17 +318,19 @@ describe.each([false, true])("private native BashTool capture foreground=%s", (f
     assertCaptureContracts(captures);
   }, 15_000);
 
-  test("uses manager errorText when artifact allocation fails before terminal progress", async () => {
+  test("preserves native spill allocation failure metadata without failing the command", async () => {
     const captures: JobCapturePayload[] = [];
-    const updates: unknown[] = [];
     const tool = createCapturedBashTool(session({
       allocateOutputArtifact: async () => { throw new Error("allocation failure sentinel"); },
     }), async (capture) => { captures.push(capture); }, foreground);
-    const result = await tool.execute("allocation-failure", { command: "printf 'NEVER_RUN'" }, undefined,
-      (update) => { updates.push(update); }) as AgentToolResult;
-    expect(result.isError).toBe(true);
-    expect(text(result)).toContain("allocation failure sentinel");
-    expect(updates).toHaveLength(0);
+    // OMP allocates the spill lazily once output exceeds the inline budget.
+    const result = await tool.execute("allocation-failure", {
+      command: "seq 1 20000; printf 'SPILL_FINISHED\\n'",
+    }) as AgentToolResult;
+    expect(result.isError).not.toBe(true);
+    expect(result.details).toMatchObject({ meta: { artifactError: "open" } });
+    expect(captures.filter((capture) => capture.kind === "output").map((capture) => capture.text).join(""))
+      .toEndWith("SPILL_FINISHED\n");
     assertCaptureContracts(captures);
   });
 

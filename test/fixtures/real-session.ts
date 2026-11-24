@@ -180,6 +180,7 @@ type FixtureOptions = {
   beforeStart?: (session: AgentSession) => void;
   settings?: Parameters<typeof Settings.isolated>[0];
   approve?: NonNullable<Parameters<typeof initializeExtensions>[1]["uiContext"]>["approve"];
+  beforeExecute?: (tool: string, args: Parameters<RemoteRuntimeClient["execute"]>) => Promise<void>;
   afterExecute?: (tool: string, result: unknown) => Promise<void>;
 };
 
@@ -214,6 +215,7 @@ export async function createRealSession(root: string, options: FixtureOptions = 
     }),
     spyOn(RemoteRuntimeClient.prototype, "execute").mockImplementation(async function (this: RemoteRuntimeClient, ...args) {
       calls.push(args);
+      await options.beforeExecute?.(args[0], args);
       const result = await execute.apply(this, args);
       await options.afterExecute?.(args[0], result);
       return result;

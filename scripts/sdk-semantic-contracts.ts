@@ -137,6 +137,14 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     coveredBy: [{ path: "scripts/smoke-compiled-worker.ts", name: "PASS Eval ${fallback ? \"fallback thread\" : \"process\"}" }],
   },
   {
+    id: "compiled-worker-embedded-addon",
+    plugin: ["scripts/compile-worker.ts"],
+    native: ["../../pi-natives/native/embedded-addon.js", "../../pi-natives/native/loader-state.js"],
+    assumption: "A compiled worker replaces embedded-addon.js with a manifest of { variant, filename, size, hash, zstdPath } per addon, where hash is the 16-digit hex xxHash64 of the decompressed bytes; the loader extracts each frame to embedded-<hash>/<filename> and trusts a file there at the manifest size.",
+    // Run by `bun run upgrade:gate` after both worker builds, not by `bun test`. Every selector loads the addon first.
+    coveredBy: [{ path: "scripts/smoke-compiled-worker.ts", name: "PASS daemon: compiled selector authenticated and answered ping" }],
+  },
+  {
     id: "service-readiness-steering",
     plugin: ["src/runtime.ts", "src/omp/readiness-steering.ts"],
     native: ["tools/bash.ts", "launch/services.ts"],
@@ -175,7 +183,7 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
     coveredBy: [
       { path: "test/worker.test.ts", name: "truncated bash output is recoverable through remote artifact selectors" },
       { path: "test/worker.test.ts", name: "minimized bash metadata and rendered output recover the same bound remote artifact" },
-      { path: "test/worker.test.ts", name: "a remote spill does not resolve to the host session's local://1.log" },
+      { path: "test/worker.test.ts", name: "a remote spill does not resolve to the host session's same-numbered local://N.log" },
     ],
   },
   {
@@ -416,9 +424,9 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "wrapper-doc-topics",
     plugin: ["src/extension.ts"],
-    native: ["extensibility/tool-proxy.ts", "extensibility/extensions/wrapper.ts", "internal-urls/xd-protocol.ts", "tools/read.ts", "tools/eval.ts"],
-    assumption: "applyToolProxy copies every definition key, including the undeclared docTopics, onto RegisteredToolAdapter and ExtensionToolWrapper; xd://<tool>/<topic> resolves through session.getToolByName, so a wrapper without docTopics hides native read/eval documentation even in local mode.",
-    coveredBy: [{ path: "test/native-parity.test.ts", name: "wrapped read keeps native xd:// doc topics reachable" }],
+    native: ["extensibility/tool-proxy.ts", "extensibility/extensions/wrapper.ts", "internal-urls/help-protocol.ts", "tools/read.ts", "tools/eval.ts"],
+    assumption: "applyToolProxy copies every definition key, including the undeclared docTopics, onto RegisteredToolAdapter and ExtensionToolWrapper; help://<tool>/<topic> resolves through session.getToolByName, so a wrapper without docTopics hides native read/eval documentation even in local mode.",
+    coveredBy: [{ path: "test/native-parity.test.ts", name: "wrapped read keeps native help:// doc topics reachable" }],
   },
   {
     id: "remote-read-batch-ordering",
@@ -457,10 +465,23 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   },
   {
     id: "worker-native-preview-queue",
-    plugin: ["src/runtime.ts"],
+    plugin: ["src/runtime.ts", "src/omp/remote-previews.ts"],
     native: ["session/tool-choice-queue.ts", "tools/resolve.ts", "tools/index.ts"],
-    assumption: "Native ToolChoiceQueue stacks preview handlers by unique id, resolution devices consume exactly their handler, and createXdevState resolves mounted tools from the canonical map.",
-    coveredBy: [{ path: "test/proposal-consumption.test.ts", name: "native preview queue resolves stacked actions independently through resolution devices" }],
+    assumption: "Native ToolChoiceQueue stacks preview handlers by unique id, resolution devices consume exactly their handler, and the host mirror registers each remote preview in the session's native queue.",
+    coveredBy: [{ path: "test/proposal-consumption.test.ts", name: "host mirrors resolve newest first, each reaching its own worker preview" }],
+  },
+  {
+    id: "remote-shell-tool-commands",
+    plugin: ["src/runtime.ts", "src/worker-companion.ts", "src/client.ts", "src/extension.ts"],
+    native: ["exec/tool-command-host.ts", "tools/tool-commands.ts", "tools/resolve.ts", "tools/bash.ts", "eval/shell-bridge.ts", "session/session-tools.ts", "extensibility/extensions/wrapper.ts", "extensibility/extensions/runner.ts", "exec/bash-executor.ts"],
+    assumption: "Native shells mount toolCommandNames(session) and run each through createToolCommandHandler: session specials first, then the mounted map through dispatchToolCommand and state.decorateExecution, spreading the shell call's context into the executed tool's context (Eval sh passes none). The bound native bash keeps its host ToolSession on `session`; that session's decorateExecution is the native permission wrapper, and the registry tool's extension wrapper emits tool_call for calls the loop did not emit. Special commands run without that wrapper, locally as well. A command-only bash line reaches native host bash only through ExtensionRunner.servesToolCommandLine, which Remote overrides per session while bound; native `resolve` calls a preview's invoker within the shell call's async context but without its signal.",
+    coveredBy: [
+      { path: "test/real-session-tool-commands.test.ts", name: "tool commands run in the remote shell and dispatch through the host" },
+      { path: "test/real-session-tool-commands.test.ts", name: "a remote shell's tool command never selects a host workspace target" },
+      { path: "test/real-session-tool-commands.test.ts", name: "a preview staged inside a remote shell resolves through native resolve" },
+      { path: "test/real-session-tool-commands.test.ts", name: "cancelling the shell that ran resolve stops an apply not yet at the worker" },
+      { path: "test/real-session-tool-commands.test.ts", name: "resolve from a remote shell meets the same approval policy as from a local one" },
+    ],
   },
   {
     id: "wrapper-native-concurrency",
@@ -489,11 +510,11 @@ export const SEMANTIC_SDK_CONTRACTS: readonly SemanticSdkContract[] = [
   {
     id: "native-eval-callback-schema-aliases",
     plugin: ["src/runtime.ts"],
-    native: ["eval/js/tool-bridge.ts", "session/session-tools.ts", "tools/bash.ts", "../../pi-tui/src/tools/xd-url.ts"],
-    assumption: "Eval validates callbacks before host dispatch; native Bash's open schema retains host-owned async input, and wire/xd aliases resolve to canonical tool names before guards.",
+    native: ["eval/js/tool-bridge.ts", "session/session-tools.ts", "tools/bash.ts"],
+    assumption: "Eval validates callbacks before host dispatch; native Bash's open schema retains host-owned async input, and wire aliases resolve to canonical tool names before guards.",
     coveredBy: [
       { path: "test/native-parity.test.ts", name: "native Eval callback validation preserves async Bash and returns a host job" },
-      { path: "test/native-parity.test.ts", name: "native Eval apply_patch and xd aliases dispatch the canonical edit tool" },
+      { path: "test/native-parity.test.ts", name: "native Eval apply_patch alias dispatches the canonical edit tool" },
     ],
   },
   {
